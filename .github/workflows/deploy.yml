@@ -1,0 +1,113 @@
+name: Deploy Xianyu App to 1Panel
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-xianyu-production
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      APP_DIR: /opt/1panel/apps/xianyu-auto-reply
+      RELEASE_ARCHIVE: release.tgz
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build release bundle
+        run: |
+          set -e
+          rm -f "$RELEASE_ARCHIVE"
+
+          tar \
+            --exclude='./.git' \
+            --exclude='./.github' \
+            --exclude='./frontend/node_modules' \
+            --exclude='./frontend/dist' \
+            --exclude='./frontend/.vite' \
+            --exclude='./frontend/coverage' \
+            --exclude='./backend/__pycache__' \
+            --exclude='./backend/data' \
+            --exclude='./backend/logs' \
+            --exclude='./backend/backups' \
+            --exclude='./backend/trajectory_history' \
+            --exclude='./data' \
+            --exclude='./logs' \
+            --exclude='./backups' \
+            --exclude='./.env' \
+            --exclude='./.env.*' \
+            -czf "$RELEASE_ARCHIVE" \
+            frontend \
+            backend \
+            Dockerfile \
+            docker-compose.yml \
+            .dockerignore
+
+      - name: Upload release bundle to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT }}
+          source: ${{ env.RELEASE_ARCHIVE }}
+          target: ${{ env.APP_DIR }}
+
+      - name: Deploy on server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT }}
+          script_stop: true
+          script: |
+            set -e
+
+            APP_DIR="${{ env.APP_DIR }}"
+            ARCHIVE="$APP_DIR/${{ env.RELEASE_ARCHIVE }}"
+            ENV_FILE="$APP_DIR/.env"
+            ENV_BACKUP="$APP_DIR/.env.backup"
+
+            mkdir -p "$APP_DIR"
+            mkdir -p "$APP_DIR/data" "$APP_DIR/logs" "$APP_DIR/backups"
+
+            if [ ! -f "$ARCHIVE" ]; then
+              echo "发布包不存在：$ARCHIVE"
+              exit 1
+            fi
+
+            if [ -f "$ENV_FILE" ]; then
+              cp "$ENV_FILE" "$ENV_BACKUP"
+            fi
+
+            rm -rf "$APP_DIR/frontend" "$APP_DIR/backend"
+            rm -f "$APP_DIR/Dockerfile" "$APP_DIR/docker-compose.yml" "$APP_DIR/.dockerignore"
+
+            tar -xzf "$ARCHIVE" -C "$APP_DIR"
+            rm -f "$ARCHIVE"
+
+            if [ -f "$ENV_BACKUP" ]; then
+              mv "$ENV_BACKUP" "$ENV_FILE"
+            fi
+
+            if [ ! -f "$ENV_FILE" ]; then
+              echo "缺少 $ENV_FILE，请先在服务器创建环境变量文件"
+              exit 1
+            fi
+
+            cd "$APP_DIR"
+
+            docker compose --env-file .env down || true
+            docker compose --env-file .env up -d --build
+
+            docker compose ps
+            docker compose logs --tail=120 xianyu-app | cat || docker compose logs --tail=120 | cat
