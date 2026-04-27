@@ -9,6 +9,9 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_DEFAULT_TIMEOUT=120 \
     PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn \
+    NPM_CONFIG_REGISTRY=https://registry.npmmirror.com \
+    PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright \
     DEBIAN_FRONTEND=noninteractive \
     TZ=Asia/Shanghai \
     DOCKER_ENV=true \
@@ -70,16 +73,8 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         curl \
         ca-certificates \
-        gnupg \
+        xz-utils \
         tzdata \
-        && mkdir -p /etc/apt/keyrings \
-        && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
-           | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
-        && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" \
-           > /etc/apt/sources.list.d/nodesource.list \
-        && apt-get update && \
-    apt-get install -y --no-install-recommends \
-        nodejs \
         # 图像处理依赖
         libjpeg-dev \
         libpng-dev \
@@ -123,6 +118,17 @@ RUN apt-get update && \
         && apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 ENV NODE_PATH=/usr/lib/node_modules
+
+# Install Node.js from a China mirror to speed up downloads in CI.
+RUN set -e; \
+    NODE_DIST_URL="https://npmmirror.com/mirrors/node/latest-v20.x"; \
+    NODE_TARBALL="$(curl -fsSL "$NODE_DIST_URL/SHASUMS256.txt" | awk '/node-v[0-9.]+-linux-x64\\.tar\\.xz$/{print $2; exit}')"; \
+    curl -fsSLO "$NODE_DIST_URL/$NODE_TARBALL"; \
+    curl -fsSL "$NODE_DIST_URL/SHASUMS256.txt" | grep " $NODE_TARBALL$" | sha256sum -c -; \
+    tar -xJf "$NODE_TARBALL" -C /usr/local --strip-components=1; \
+    rm -f "$NODE_TARBALL"; \
+    node --version; \
+    npm --version
 
 # 设置时区        
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
