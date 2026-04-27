@@ -11,21 +11,6 @@ ENV PYTHONUNBUFFERED=1 \
 # 设置工作目录
 WORKDIR /app
 
-# ==================== Frontend Builder Stage ====================
-FROM node:20-alpine AS frontend-builder
-
-WORKDIR /frontend
-
-# 复制前端依赖文件
-COPY frontend/package.json ./
-
-# 安装前端依赖
-RUN npm install
-
-# 复制前端源码并构建
-COPY frontend/ ./
-RUN npm run build
-
 # ==================== Python Builder Stage ====================
 FROM base AS builder
 
@@ -45,11 +30,8 @@ ENV PATH="$VIRTUAL_ENV/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bi
 COPY backend/requirements.txt ./backend/requirements.txt
 RUN pip install --no-cache-dir -r backend/requirements.txt
 
-# 复制项目文件（排除 frontend 目录）
+# 复制项目文件
 COPY . .
-
-# 复制前端构建产物到 static 目录
-COPY --from=frontend-builder /frontend/dist /app/backend/static
 
 # 项目已完全开源，无需编译二进制模块
 

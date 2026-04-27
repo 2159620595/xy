@@ -30,10 +30,6 @@ jobs:
           tar \
             --exclude='./.git' \
             --exclude='./.github' \
-            --exclude='./frontend/node_modules' \
-            --exclude='./frontend/dist' \
-            --exclude='./frontend/.vite' \
-            --exclude='./frontend/coverage' \
             --exclude='./backend/__pycache__' \
             --exclude='./backend/data' \
             --exclude='./backend/logs' \
@@ -45,7 +41,6 @@ jobs:
             --exclude='./.env' \
             --exclude='./.env.*' \
             -czf "$RELEASE_ARCHIVE" \
-            frontend \
             backend \
             Dockerfile \
             docker-compose.yml \
