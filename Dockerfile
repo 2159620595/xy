@@ -4,6 +4,8 @@ FROM python:3.11-slim-bookworm AS base
 # 设置环境变量
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    DEBIAN_FRONTEND=noninteractive \
     TZ=Asia/Shanghai \
     DOCKER_ENV=true \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
@@ -48,15 +50,20 @@ LABEL maintainer="zhinianboke" \
       build-date="" \
       vcs-ref=""
 
-ENV NODE_PATH=/usr/lib/node_modules
-
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        nodejs \
-        npm \
-        tzdata \
         curl \
         ca-certificates \
+        gnupg \
+        tzdata \
+        && mkdir -p /etc/apt/keyrings \
+        && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+           | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+        && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" \
+           > /etc/apt/sources.list.d/nodesource.list \
+        && apt-get update && \
+    apt-get install -y --no-install-recommends \
+        nodejs \
         # 图像处理依赖
         libjpeg-dev \
         libpng-dev \
@@ -99,6 +106,8 @@ RUN apt-get update && \
         libglib2.0-0 \
         && apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
+ENV NODE_PATH=/usr/lib/node_modules
+
 # 设置时区        
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
@@ -112,8 +121,8 @@ ENV PATH="$VIRTUAL_ENV/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bi
 
 RUN npm ci --prefix /app/backend/judian/scripts --omit=dev --no-audit --no-fund
 
-RUN playwright install chromium && \
-    playwright install-deps chromium
+# Browser shared libraries are installed above; only download Chromium here.
+RUN playwright install chromium
 
 # 创建必要的目录并设置权限
 RUN mkdir -p /app/backend/logs /app/backend/data /app/backend/backups /app/backend/static/uploads/images && \
