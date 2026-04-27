@@ -5,7 +5,6 @@ import hashlib
 import time
 import json
 import random
-import secrets
 import string
 import re
 import aiohttp
@@ -164,7 +163,6 @@ class DBManager:
             logger.info("SQL日志已关闭，如需排查可设置 SQL_LOG_ENABLED=true")
 
         self.init_db()
-        self._ensure_pg_admin_user()
 
     def _resolve_pg_auth_url(self) -> str:
         """解析用户认证使用的 PostgreSQL 连接串。"""
@@ -188,72 +186,6 @@ class DBManager:
         except Exception as e:
             logger.error(f"连接用户认证PostgreSQL失败，回退SQLite: {e}")
             return None
-
-    def _ensure_pg_admin_user(self):
-        """当用户认证走 PostgreSQL 时，确保远程库存在 admin 用户。"""
-        pg_conn = self._connect_pg_auth()
-        if pg_conn is None:
-            return
-        try:
-            with pg_conn:
-                with pg_conn.cursor() as cursor:
-                    cursor.execute("SELECT id FROM users WHERE username = %s", ("admin",))
-                    admin_row = cursor.fetchone()
-                    if admin_row:
-                        return
-
-                    initial_admin_password = self._get_initial_admin_password()
-                    default_password_hash = hashlib.sha256(initial_admin_password.encode()).hexdigest()
-                    # 修正 PostgreSQL 自增序列，避免历史导入后序列落后导致主键冲突
-                    cursor.execute("SELECT pg_get_serial_sequence('users', 'id')")
-                    seq_row = cursor.fetchone()
-                    seq_name = seq_row[0] if seq_row else None
-                    if seq_name:
-                        cursor.execute(
-                            f"SELECT setval('{seq_name}', COALESCE((SELECT MAX(id) FROM users), 1), true)"
-                        )
-                    cursor.execute(
-                        """
-                        INSERT INTO users (username, email, password_hash, is_active)
-                        VALUES (%s, %s, %s, TRUE)
-                        """,
-                        ("admin", "admin@localhost", default_password_hash),
-                    )
-                    logger.warning("PostgreSQL用户库缺少admin，已自动创建")
-        except Exception as e:
-            logger.error(f"确保PostgreSQL admin用户失败: {e}")
-        finally:
-            try:
-                pg_conn.close()
-            except Exception:
-                pass
-
-    def _get_initial_admin_password(self) -> str:
-        """获取初始管理员密码，优先环境变量，其次生成一次性本地密码。"""
-        configured_password = os.getenv('ADMIN_PASSWORD', '').strip()
-        if configured_password:
-            return configured_password
-
-        db_dir = os.path.dirname(self.db_path) or '.'
-        password_file = os.path.join(db_dir, 'initial_admin_password.txt')
-        if os.path.exists(password_file):
-            try:
-                with open(password_file, 'r', encoding='utf-8') as f:
-                    saved_password = f.read().strip()
-                if saved_password:
-                    return saved_password
-            except Exception as e:
-                logger.warning(f"读取初始管理员密码文件失败: {e}")
-
-        generated_password = secrets.token_urlsafe(16)
-        try:
-            with open(password_file, 'w', encoding='utf-8') as f:
-                f.write(generated_password)
-            logger.warning(f"未设置 ADMIN_PASSWORD，已生成一次性管理员密码并写入: {password_file}")
-        except Exception as e:
-            logger.error(f"写入初始管理员密码文件失败: {e}")
-
-        return generated_password
 
     def _create_sqlite_connection(self) -> sqlite3.Connection:
         """创建并初始化 SQLite 连接。"""
@@ -405,6 +337,7 @@ class DBManager:
 
         columns_to_ensure = [
             ("users", "nickname", "TEXT"),
+            ("users", "is_admin", "BOOLEAN DEFAULT FALSE"),
             ("cookies", "auto_confirm", "INTEGER DEFAULT 1"),
             ("cookies", "auto_reply_once_per_customer", "INTEGER DEFAULT 0"),
             ("cookies", "remark", "TEXT DEFAULT ''"),
@@ -629,6 +562,7 @@ class DBManager:
                 email TEXT UNIQUE NOT NULL,
                 nickname TEXT UNIQUE,
                 password_hash TEXT NOT NULL,
+                is_admin BOOLEAN DEFAULT FALSE,
                 is_active BOOLEAN DEFAULT TRUE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -1228,13 +1162,20 @@ class DBManager:
             logger.info("delivery_rules 表 description 列添加完成")
 
     def _ensure_users_nickname_schema(self, cursor):
-        """确保 users 表存在 nickname 字段和唯一索引"""
+        """确保 users 表存在昵称和管理员字段。"""
         try:
             self._execute_sql(cursor, "SELECT nickname FROM users LIMIT 1")
         except sqlite3.OperationalError:
             logger.info("正在为 users 表添加 nickname 列...")
             self._execute_sql(cursor, "ALTER TABLE users ADD COLUMN nickname TEXT")
             logger.info("users 表 nickname 列添加完成")
+
+        try:
+            self._execute_sql(cursor, "SELECT is_admin FROM users LIMIT 1")
+        except sqlite3.OperationalError:
+            logger.info("正在为 users 表添加 is_admin 列...")
+            self._execute_sql(cursor, "ALTER TABLE users ADD COLUMN is_admin BOOLEAN DEFAULT FALSE")
+            logger.info("users 表 is_admin 列添加完成")
 
         self._execute_sql(
             cursor,
@@ -1393,41 +1334,36 @@ class DBManager:
         except Exception as e:
             logger.error(f"数据库版本检查或升级失败: {e}")
             raise
+
+    def _get_fallback_user_id(self, cursor) -> int:
+        """获取默认归属用户，优先首个管理员，否则首个普通用户。"""
+        self._execute_sql(cursor, "SELECT id FROM users WHERE is_admin = 1 ORDER BY id ASC LIMIT 1")
+        target_user = cursor.fetchone()
+        if not target_user:
+            self._execute_sql(cursor, "SELECT id FROM users ORDER BY id ASC LIMIT 1")
+            target_user = cursor.fetchone()
+        return int(target_user[0]) if target_user else 1
             
     def update_admin_user_id(self, cursor):
-        """更新admin用户ID"""
+        """兼容旧版本数据库，把历史空 user_id 记录绑定到首个管理员或首个用户。"""
         try:
-            logger.info("开始更新admin用户ID...")
-            # 创建默认admin用户（只在首次初始化时创建）
-            cursor.execute('SELECT COUNT(*) FROM users WHERE username = ?', ('admin',))
-            admin_exists = cursor.fetchone()[0] > 0
+            logger.info("开始迁移历史 user_id 数据...")
+            self._execute_sql(cursor, "SELECT id FROM users WHERE is_admin = 1 ORDER BY id ASC LIMIT 1")
+            target_user = cursor.fetchone()
+            if not target_user:
+                self._execute_sql(cursor, "SELECT id FROM users ORDER BY id ASC LIMIT 1")
+                target_user = cursor.fetchone()
+            if target_user:
+                target_user_id = target_user[0]
 
-            if not admin_exists:
-                # 首次创建admin用户，优先使用环境变量中的密码，否则生成一次性本地密码
-                initial_admin_password = self._get_initial_admin_password()
-                default_password_hash = hashlib.sha256(initial_admin_password.encode()).hexdigest()
-                cursor.execute('''
-                INSERT INTO users (username, email, password_hash) VALUES
-                ('admin', 'admin@localhost', ?)
-                ''', (default_password_hash,))
-                logger.info("创建admin用户成功，请通过环境变量或本地密码文件获取初始密码")
-
-            # 获取admin用户ID，用于历史数据绑定
-            self._execute_sql(cursor, "SELECT id FROM users WHERE username = 'admin'")
-            admin_user = cursor.fetchone()
-            if admin_user:
-                admin_user_id = admin_user[0]
-
-                # 将历史cookies数据绑定到admin用户（如果user_id列不存在）
+                # 将历史 cookies 数据绑定到目标用户（如果 user_id 列不存在）
                 try:
                     self._execute_sql(cursor, "SELECT user_id FROM cookies LIMIT 1")
                 except sqlite3.OperationalError:
-                    # user_id列不存在，需要添加并更新历史数据
                     self._execute_sql(cursor, "ALTER TABLE cookies ADD COLUMN user_id INTEGER")
-                    self._execute_sql(cursor, "UPDATE cookies SET user_id = ? WHERE user_id IS NULL", (admin_user_id,))
+                    self._execute_sql(cursor, "UPDATE cookies SET user_id = ? WHERE user_id IS NULL", (target_user_id,))
                 else:
-                    # user_id列存在，更新NULL值
-                    self._execute_sql(cursor, "UPDATE cookies SET user_id = ? WHERE user_id IS NULL", (admin_user_id,))
+                    self._execute_sql(cursor, "UPDATE cookies SET user_id = ? WHERE user_id IS NULL", (target_user_id,))
 
                 # 为cookies表添加auto_confirm字段（如果不存在）
                 try:
@@ -1444,12 +1380,10 @@ class DBManager:
                 try:
                     self._execute_sql(cursor, "SELECT user_id FROM delivery_rules LIMIT 1")
                 except sqlite3.OperationalError:
-                    # user_id列不存在，需要添加并更新历史数据
                     self._execute_sql(cursor, "ALTER TABLE delivery_rules ADD COLUMN user_id INTEGER")
-                    self._execute_sql(cursor, "UPDATE delivery_rules SET user_id = ? WHERE user_id IS NULL", (admin_user_id,))
+                    self._execute_sql(cursor, "UPDATE delivery_rules SET user_id = ? WHERE user_id IS NULL", (target_user_id,))
                 else:
-                    # user_id列存在，更新NULL值
-                    self._execute_sql(cursor, "UPDATE delivery_rules SET user_id = ? WHERE user_id IS NULL", (admin_user_id,))
+                    self._execute_sql(cursor, "UPDATE delivery_rules SET user_id = ? WHERE user_id IS NULL", (target_user_id,))
 
                 # 为delivery_rules表添加item_id字段（如果不存在）
                 try:
@@ -1462,12 +1396,10 @@ class DBManager:
                 try:
                     self._execute_sql(cursor, "SELECT user_id FROM notification_channels LIMIT 1")
                 except sqlite3.OperationalError:
-                    # user_id列不存在，需要添加并更新历史数据
                     self._execute_sql(cursor, "ALTER TABLE notification_channels ADD COLUMN user_id INTEGER")
-                    self._execute_sql(cursor, "UPDATE notification_channels SET user_id = ? WHERE user_id IS NULL", (admin_user_id,))
+                    self._execute_sql(cursor, "UPDATE notification_channels SET user_id = ? WHERE user_id IS NULL", (target_user_id,))
                 else:
-                    # user_id列存在，更新NULL值
-                    self._execute_sql(cursor, "UPDATE notification_channels SET user_id = ? WHERE user_id IS NULL", (admin_user_id,))
+                    self._execute_sql(cursor, "UPDATE notification_channels SET user_id = ? WHERE user_id IS NULL", (target_user_id,))
 
                 # 为email_verifications表添加type字段（如果不存在）
                 try:
@@ -1518,10 +1450,12 @@ class DBManager:
                 # 由于SQLite不支持直接修改约束，我们需要重建表
                 self._migrate_keywords_table_constraints(cursor)
 
-            self.conn.commit()
-            logger.info(f"admin用户ID更新完成")
+                self.conn.commit()
+                logger.info("历史 user_id 数据迁移完成")
+            else:
+                logger.warning("未找到可用于接管历史数据的用户，跳过历史 user_id 迁移")
         except Exception as e:
-            logger.error(f"更新admin用户ID失败: {e}")
+            logger.error(f"迁移历史 user_id 数据失败: {e}")
             raise
             
     def upgrade_notification_channels_table(self, cursor):
@@ -1966,17 +1900,14 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
 
-                # 如果没有提供user_id，尝试从现有记录获取，否则使用admin用户ID
+                # 如果没有提供 user_id，尝试从现有记录获取，否则回退到首个管理员/首个用户
                 if user_id is None:
                     self._execute_sql(cursor, "SELECT user_id FROM cookies WHERE id = ?", (cookie_id,))
                     existing = cursor.fetchone()
                     if existing:
                         user_id = existing[0]
                     else:
-                        # 获取admin用户ID作为默认值
-                        self._execute_sql(cursor, "SELECT id FROM users WHERE username = 'admin'")
-                        admin_user = cursor.fetchone()
-                        user_id = admin_user[0] if admin_user else 1
+                        user_id = self._get_fallback_user_id(cursor)
 
                 self._execute_sql(cursor,
                     "INSERT OR REPLACE INTO cookies (id, value, user_id) VALUES (?, ?, ?)",
@@ -2219,12 +2150,9 @@ class DBManager:
                         logger.warning(f"账号 {cookie_id} 不存在，且未提供cookie_value，无法创建新记录")
                         return False
                     
-                    # 如果没有提供user_id，尝试从现有记录获取，否则使用admin用户ID
+                    # 如果没有提供 user_id，则回退到首个管理员/首个用户
                     if user_id is None:
-                        # 获取admin用户ID作为默认值
-                        self._execute_sql(cursor, "SELECT id FROM users WHERE username = 'admin'")
-                        admin_user = cursor.fetchone()
-                        user_id = admin_user[0] if admin_user else 1
+                        user_id = self._get_fallback_user_id(cursor)
                     
                     # 构建插入语句
                     insert_fields = ['id', 'value', 'user_id']
@@ -3512,8 +3440,8 @@ class DBManager:
                     with pg_conn:
                         with pg_conn.cursor() as cursor:
                             cursor.execute('''
-                            INSERT INTO users (username, email, nickname, password_hash)
-                            VALUES (%s, %s, %s, %s)
+                            INSERT INTO users (username, email, nickname, password_hash, is_admin)
+                            VALUES (%s, %s, %s, %s, FALSE)
                             ''', (username, email, nickname, password_hash))
                     logger.info(f"创建用户成功(PostgreSQL): {username} ({email})")
                     return True
@@ -3533,8 +3461,8 @@ class DBManager:
                 password_hash = hashlib.sha256(password.encode()).hexdigest()
 
                 cursor.execute('''
-                INSERT INTO users (username, email, nickname, password_hash)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO users (username, email, nickname, password_hash, is_admin)
+                VALUES (?, ?, ?, ?, 0)
                 ''', (username, email, nickname, password_hash))
 
                 self.conn.commit()
@@ -3557,7 +3485,7 @@ class DBManager:
                 try:
                     with pg_conn.cursor() as cursor:
                         cursor.execute('''
-                        SELECT id, username, email, nickname, password_hash, is_active, created_at, updated_at
+                        SELECT id, username, email, nickname, password_hash, is_admin, is_active, created_at, updated_at
                         FROM users WHERE username = %s
                         ''', (username,))
                         row = cursor.fetchone()
@@ -3568,9 +3496,10 @@ class DBManager:
                             'email': row[2],
                             'nickname': row[3],
                             'password_hash': row[4],
-                            'is_active': row[5],
-                            'created_at': row[6],
-                            'updated_at': row[7]
+                            'is_admin': bool(row[5]),
+                            'is_active': row[6],
+                            'created_at': row[7],
+                            'updated_at': row[8]
                         }
                     return None
                 except Exception as e:
@@ -3583,7 +3512,7 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT id, username, email, nickname, password_hash, is_active, created_at, updated_at
+                SELECT id, username, email, nickname, password_hash, is_admin, is_active, created_at, updated_at
                 FROM users WHERE username = ?
                 ''', (username,))
 
@@ -3595,9 +3524,10 @@ class DBManager:
                         'email': row[2],
                         'nickname': row[3],
                         'password_hash': row[4],
-                        'is_active': row[5],
-                        'created_at': row[6],
-                        'updated_at': row[7]
+                        'is_admin': bool(row[5]),
+                        'is_active': row[6],
+                        'created_at': row[7],
+                        'updated_at': row[8]
                     }
                 return None
             except Exception as e:
@@ -3613,7 +3543,7 @@ class DBManager:
                 try:
                     with pg_conn.cursor() as cursor:
                         cursor.execute('''
-                        SELECT id, username, email, nickname, password_hash, is_active, created_at, updated_at
+                        SELECT id, username, email, nickname, password_hash, is_admin, is_active, created_at, updated_at
                         FROM users WHERE email = %s
                         ''', (email,))
                         row = cursor.fetchone()
@@ -3624,9 +3554,10 @@ class DBManager:
                             'email': row[2],
                             'nickname': row[3],
                             'password_hash': row[4],
-                            'is_active': row[5],
-                            'created_at': row[6],
-                            'updated_at': row[7]
+                            'is_admin': bool(row[5]),
+                            'is_active': row[6],
+                            'created_at': row[7],
+                            'updated_at': row[8]
                         }
                     return None
                 except Exception as e:
@@ -3639,7 +3570,7 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT id, username, email, nickname, password_hash, is_active, created_at, updated_at
+                SELECT id, username, email, nickname, password_hash, is_admin, is_active, created_at, updated_at
                 FROM users WHERE email = ?
                 ''', (email,))
 
@@ -3651,9 +3582,10 @@ class DBManager:
                         'email': row[2],
                         'nickname': row[3],
                         'password_hash': row[4],
-                        'is_active': row[5],
-                        'created_at': row[6],
-                        'updated_at': row[7]
+                        'is_admin': bool(row[5]),
+                        'is_active': row[6],
+                        'created_at': row[7],
+                        'updated_at': row[8]
                     }
                 return None
             except Exception as e:
@@ -3669,7 +3601,7 @@ class DBManager:
                 try:
                     with pg_conn.cursor() as cursor:
                         cursor.execute('''
-                        SELECT id, username, email, nickname, password_hash, is_active, created_at, updated_at
+                        SELECT id, username, email, nickname, password_hash, is_admin, is_active, created_at, updated_at
                         FROM users WHERE nickname = %s
                         ''', (nickname,))
                         row = cursor.fetchone()
@@ -3680,9 +3612,10 @@ class DBManager:
                             'email': row[2],
                             'nickname': row[3],
                             'password_hash': row[4],
-                            'is_active': row[5],
-                            'created_at': row[6],
-                            'updated_at': row[7]
+                            'is_admin': bool(row[5]),
+                            'is_active': row[6],
+                            'created_at': row[7],
+                            'updated_at': row[8]
                         }
                     return None
                 except Exception as e:
@@ -3695,7 +3628,7 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT id, username, email, nickname, password_hash, is_active, created_at, updated_at
+                SELECT id, username, email, nickname, password_hash, is_admin, is_active, created_at, updated_at
                 FROM users WHERE nickname = ?
                 ''', (nickname,))
 
@@ -3707,9 +3640,10 @@ class DBManager:
                         'email': row[2],
                         'nickname': row[3],
                         'password_hash': row[4],
-                        'is_active': row[5],
-                        'created_at': row[6],
-                        'updated_at': row[7]
+                        'is_admin': bool(row[5]),
+                        'is_active': row[6],
+                        'created_at': row[7],
+                        'updated_at': row[8]
                     }
                 return None
             except Exception as e:
@@ -6155,10 +6089,40 @@ class DBManager:
     def get_all_users(self):
         """获取所有用户信息（管理员专用）"""
         with self.lock:
+            pg_conn = self._connect_pg_auth()
+            if pg_conn is not None:
+                try:
+                    with pg_conn.cursor() as cursor:
+                        cursor.execute('''
+                        SELECT id, username, email, nickname, is_admin, created_at, updated_at
+                        FROM users
+                        ORDER BY created_at DESC
+                        ''')
+                        rows = cursor.fetchall()
+
+                    users = []
+                    for row in rows:
+                        users.append({
+                            'id': row[0],
+                            'username': row[1],
+                            'email': row[2],
+                            'nickname': row[3],
+                            'is_admin': bool(row[4]),
+                            'created_at': row[5],
+                            'updated_at': row[6]
+                        })
+                    return users
+                except Exception as e:
+                    logger.error(f"获取所有用户失败(PostgreSQL): {e}")
+                finally:
+                    try:
+                        pg_conn.close()
+                    except Exception:
+                        pass
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT id, username, email, nickname, created_at, updated_at
+                SELECT id, username, email, nickname, is_admin, created_at, updated_at
                 FROM users
                 ORDER BY created_at DESC
                 ''')
@@ -6170,8 +6134,9 @@ class DBManager:
                         'username': row[1],
                         'email': row[2],
                         'nickname': row[3],
-                        'created_at': row[4],
-                        'updated_at': row[5]
+                        'is_admin': bool(row[4]),
+                        'created_at': row[5],
+                        'updated_at': row[6]
                     })
 
                 return users
@@ -6187,7 +6152,7 @@ class DBManager:
                 try:
                     with pg_conn.cursor() as cursor:
                         cursor.execute('''
-                        SELECT id, username, email, nickname, created_at, updated_at
+                        SELECT id, username, email, nickname, is_admin, is_active, created_at, updated_at
                         FROM users
                         WHERE id = %s
                         ''', (user_id,))
@@ -6199,8 +6164,10 @@ class DBManager:
                             'username': row[1],
                             'email': row[2],
                             'nickname': row[3],
-                            'created_at': row[4],
-                            'updated_at': row[5]
+                            'is_admin': bool(row[4]),
+                            'is_active': row[5],
+                            'created_at': row[6],
+                            'updated_at': row[7]
                         }
                     return None
                 except Exception as e:
@@ -6213,7 +6180,7 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT id, username, email, nickname, created_at, updated_at
+                SELECT id, username, email, nickname, is_admin, is_active, created_at, updated_at
                 FROM users
                 WHERE id = ?
                 ''', (user_id,))
@@ -6225,17 +6192,65 @@ class DBManager:
                         'username': row[1],
                         'email': row[2],
                         'nickname': row[3],
-                        'created_at': row[4],
-                        'updated_at': row[5]
+                        'is_admin': bool(row[4]),
+                        'is_active': row[5],
+                        'created_at': row[6],
+                        'updated_at': row[7]
                     }
                 return None
             except Exception as e:
                 logger.error(f"获取用户信息失败: {e}")
                 return None
 
+    def set_user_admin(self, user_id: int, is_admin: bool) -> bool:
+        """设置用户管理员状态。"""
+        with self.lock:
+            pg_conn = self._connect_pg_auth()
+            if pg_conn is not None:
+                try:
+                    with pg_conn:
+                        with pg_conn.cursor() as cursor:
+                            cursor.execute(
+                                '''
+                                UPDATE users
+                                SET is_admin = %s, updated_at = CURRENT_TIMESTAMP
+                                WHERE id = %s
+                                ''',
+                                (is_admin, user_id),
+                            )
+                            affected_rows = cursor.rowcount
+                    return affected_rows > 0
+                except Exception as e:
+                    logger.error(f"设置用户管理员状态失败(PostgreSQL): {e}")
+                    return False
+                finally:
+                    try:
+                        pg_conn.close()
+                    except Exception:
+                        pass
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    '''
+                    UPDATE users
+                    SET is_admin = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    ''',
+                    (1 if is_admin else 0, user_id),
+                )
+                if cursor.rowcount > 0:
+                    self.conn.commit()
+                    return True
+                return False
+            except Exception as e:
+                logger.error(f"设置用户管理员状态失败: {e}")
+                self.conn.rollback()
+                return False
+
     def delete_user_and_data(self, user_id: int):
         """删除用户及其所有相关数据"""
         with self.lock:
+            cursor = None
             try:
                 cursor = self.conn.cursor()
 
@@ -6255,36 +6270,43 @@ class DBManager:
                 # 4. 删除用户的通知渠道
                 cursor.execute('DELETE FROM notification_channels WHERE user_id = ?', (user_id,))
 
-                # 5. 删除用户的Cookie
-                cursor.execute('DELETE FROM cookies WHERE user_id = ?', (user_id,))
-
-                # 6. 删除用户的关键字
+                # 5. 先删除依赖 cookie_id 的关联数据
                 cursor.execute('DELETE FROM keywords WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
-
-                # 7. 删除用户的默认回复
                 cursor.execute('DELETE FROM default_replies WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
-
-                # 8. 删除用户的商品图片
                 cursor.execute('DELETE FROM item_images WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
-
-                # 9. 删除用户的AI回复设置
                 cursor.execute('DELETE FROM ai_reply_settings WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
-
-                # 10. 删除用户的消息通知
                 cursor.execute('DELETE FROM message_notifications WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
 
-                # 11. 最后删除用户本身
+                # 6. 删除用户的 Cookie
+                cursor.execute('DELETE FROM cookies WHERE user_id = ?', (user_id,))
+
+                # 7. 删除本地 users 表中的用户记录（如果存在）
                 cursor.execute('DELETE FROM users WHERE id = ?', (user_id,))
 
-                # 提交事务
-                cursor.execute('COMMIT')
+                self.conn.commit()
+
+                # 8. 删除远程认证库中的用户记录，避免账号残留
+                pg_conn = self._connect_pg_auth()
+                if pg_conn is not None:
+                    try:
+                        with pg_conn:
+                            with pg_conn.cursor() as pg_cursor:
+                                pg_cursor.execute('DELETE FROM users WHERE id = %s', (user_id,))
+                    finally:
+                        try:
+                            pg_conn.close()
+                        except Exception:
+                            pass
 
                 logger.info(f"用户及相关数据删除成功: user_id={user_id}")
                 return True
 
             except Exception as e:
-                # 回滚事务
-                cursor.execute('ROLLBACK')
+                if cursor is not None:
+                    try:
+                        self.conn.rollback()
+                    except Exception:
+                        pass
                 logger.error(f"删除用户及相关数据失败: {e}")
                 return False
 

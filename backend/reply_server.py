@@ -527,11 +527,10 @@ except ImportError:
 KEYWORDS_FILE = Path(__file__).parent / "回复关键字.txt"
 
 # 简单的用户认证配置
-ADMIN_USERNAME = "admin"
 DEFAULT_ADMIN_PASSWORD = ""  # 不再保留固定默认密码
 SESSION_TOKENS = {}  # 存储会话token: {token: {'user_id': int, 'username': str, 'timestamp': float}}
 TOKEN_EXPIRE_TIME = 24 * 60 * 60  # token过期时间：24小时
-LOCAL_ONLY_MODE = (os.getenv("LOCAL_ONLY_MODE") or "true").strip().lower() == "true"
+LOCAL_ONLY_MODE = (os.getenv("LOCAL_ONLY_MODE") or "false").strip().lower() == "true"
 LOCAL_ONLY_ALLOW_CIDR = (os.getenv("LOCAL_ONLY_ALLOW_CIDR") or "127.0.0.1/32,::1/128,172.16.0.0/12,192.168.65.0/24,192.168.99.0/24").strip()
 _LOCAL_ONLY_NETWORKS = []
 for _cidr in [p.strip() for p in LOCAL_ONLY_ALLOW_CIDR.split(",") if p.strip()]:
@@ -692,6 +691,13 @@ def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(s
         del SESSION_TOKENS[token]
         return None
 
+    current_user = db_manager.get_user_by_id(token_data['user_id'])
+    if not current_user or not current_user.get('is_active', True):
+        del SESSION_TOKENS[token]
+        return None
+
+    token_data['username'] = current_user['username']
+    token_data['is_admin'] = bool(current_user.get('is_admin'))
     return token_data
 
 
@@ -701,8 +707,7 @@ def verify_admin_token(credentials: Optional[HTTPAuthorizationCredentials] = Dep
     if not user_info:
         raise HTTPException(status_code=401, detail="未授权访问")
 
-    # 检查是否是管理员
-    if user_info['username'] != ADMIN_USERNAME:
+    if not user_info.get('is_admin'):
         raise HTTPException(status_code=403, detail="需要管理员权限")
 
     return user_info
@@ -734,7 +739,7 @@ def get_user_log_prefix(user_info: Dict[str, Any] = None) -> str:
 
 def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     """要求管理员权限"""
-    if current_user['username'] != 'admin':
+    if not current_user.get('is_admin'):
         raise HTTPException(status_code=403, detail="需要管理员权限")
     return current_user
 
@@ -835,6 +840,9 @@ logger.info("Web服务器启动，文件日志收集器已初始化")
 
 @app.on_event("startup")
 async def startup_item_automation():
+    logger.info(f"LOCAL_ONLY_MODE={'true' if LOCAL_ONLY_MODE else 'false'}")
+    if LOCAL_ONLY_MODE:
+        logger.warning(f"已启用仅本机访问模式，允许网段: {LOCAL_ONLY_ALLOW_CIDR}")
     global item_automation_task
     if item_automation_task is None or item_automation_task.done():
         item_automation_task = asyncio.create_task(item_automation_loop())
@@ -1036,12 +1044,11 @@ async def login(request: LoginRequest):
                 SESSION_TOKENS[token] = {
                     'user_id': user['id'],
                     'username': user['username'],
-                    'is_admin': user.get('is_admin', False) or user['username'] == ADMIN_USERNAME,
+                    'is_admin': bool(user.get('is_admin')),
                     'timestamp': time.time()
                 }
 
-                # 区分管理员和普通用户的日志
-                if user['username'] == ADMIN_USERNAME:
+                if user.get('is_admin'):
                     logger.info(f"【{user['username']}#{user['id']}】登录成功（管理员）")
                 else:
                     logger.info(f"【{user['username']}#{user['id']}】登录成功")
@@ -1052,7 +1059,7 @@ async def login(request: LoginRequest):
                     message="登录成功",
                     user_id=user['id'],
                     username=user['username'],
-                    is_admin=(user['username'] == ADMIN_USERNAME)
+                    is_admin=bool(user.get('is_admin'))
                 )
 
         logger.warning(f"【{request.username}】登录失败：用户名或密码错误")
@@ -1072,7 +1079,7 @@ async def login(request: LoginRequest):
             SESSION_TOKENS[token] = {
                 'user_id': user['id'],
                 'username': user['username'],
-                'is_admin': user.get('is_admin', False) or user['username'] == ADMIN_USERNAME,
+                'is_admin': bool(user.get('is_admin')),
                 'timestamp': time.time()
             }
 
@@ -1084,7 +1091,7 @@ async def login(request: LoginRequest):
                 message="登录成功",
                 user_id=user['id'],
                 username=user['username'],
-                is_admin=(user['username'] == ADMIN_USERNAME)
+                is_admin=bool(user.get('is_admin'))
             )
 
         logger.warning(f"【{request.email}】邮箱登录失败：邮箱或密码错误")
@@ -1119,7 +1126,7 @@ async def login(request: LoginRequest):
         SESSION_TOKENS[token] = {
             'user_id': user['id'],
             'username': user['username'],
-            'is_admin': user.get('is_admin', False) or user['username'] == ADMIN_USERNAME,
+            'is_admin': bool(user.get('is_admin')),
             'timestamp': time.time()
         }
 
@@ -1131,7 +1138,7 @@ async def login(request: LoginRequest):
             message="登录成功",
             user_id=user['id'],
             username=user['username'],
-            is_admin=(user['username'] == ADMIN_USERNAME)
+            is_admin=bool(user.get('is_admin'))
         )
 
     else:
@@ -1149,7 +1156,7 @@ async def verify(user_info: Optional[Dict[str, Any]] = Depends(verify_token)):
             "authenticated": True,
             "user_id": user_info['user_id'],
             "username": user_info['username'],
-            "is_admin": user_info['username'] == ADMIN_USERNAME
+            "is_admin": bool(user_info.get('is_admin'))
         }
     return {"authenticated": False}
 
@@ -1168,15 +1175,18 @@ async def change_admin_password(request: ChangePasswordRequest, admin_user: Dict
     from db_manager import db_manager
 
     try:
-        # 验证当前密码（使用用户表验证）
-        if not db_manager.verify_user_password('admin', request.current_password):
+        username = admin_user.get('username')
+        if not username:
+            return {"success": False, "message": "无法获取管理员信息"}
+
+        # 验证当前密码（使用当前管理员账号）
+        if not db_manager.verify_user_password(username, request.current_password):
             return {"success": False, "message": "当前密码错误"}
 
-        # 更新密码（使用用户表更新）
-        success = db_manager.update_user_password('admin', request.new_password)
+        success = db_manager.update_user_password(username, request.new_password)
 
         if success:
-            logger.info(f"【admin#{admin_user['user_id']}】管理员密码修改成功")
+            logger.info(f"【{username}#{admin_user['user_id']}】管理员密码修改成功")
             return {"success": True, "message": "密码修改成功"}
         else:
             return {"success": False, "message": "密码修改失败"}
@@ -2684,10 +2694,9 @@ async def get_account_face_verification_screenshot(
         
         # 检查账号是否属于当前用户
         user_id = current_user['user_id']
-        username = current_user['username']
         
-        # 如果是管理员，允许访问所有账号
-        is_admin = username == 'admin'
+        # 管理员可访问所有账号，普通用户只能访问自己的账号
+        is_admin = bool(current_user.get('is_admin'))
         
         if not is_admin:
             cookie_info = db_manager.get_cookie_details(account_id)
