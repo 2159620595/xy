@@ -158,6 +158,41 @@ def _check_and_install_playwright():
     # 检查Playwright浏览器是否存在
     playwright_installed = False
     possible_paths = []
+    detected_executable_path = None
+
+    # Docker/Linux 环境优先复用系统 chromium，避免启动时重复下载
+    executable_candidates = []
+    configured_executable = os.getenv('PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH')
+    if configured_executable:
+        executable_candidates.append(Path(configured_executable))
+
+    for binary_name in ('chromium', 'chromium-browser'):
+        binary_path = shutil.which(binary_name)
+        if binary_path:
+            executable_candidates.append(Path(binary_path))
+
+    if sys.platform.startswith('linux'):
+        executable_candidates.extend([
+            Path('/usr/bin/chromium'),
+            Path('/usr/bin/chromium-browser'),
+            Path('/snap/bin/chromium'),
+        ])
+
+    seen_executable_paths = set()
+    for candidate in executable_candidates:
+        candidate_str = str(candidate)
+        if not candidate_str or candidate_str in seen_executable_paths:
+            continue
+        seen_executable_paths.add(candidate_str)
+        try:
+            if candidate.exists() and candidate.is_file() and candidate.stat().st_size > 0:
+                detected_executable_path = candidate
+                os.environ['PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH'] = candidate_str
+                print(f"{_OK} 找到系统Chromium浏览器: {candidate}")
+                playwright_installed = True
+                return True
+        except OSError:
+            continue
     
     # 如果是打包后的exe，优先检查exe同目录
     if getattr(sys, 'frozen', False):
@@ -226,7 +261,10 @@ def _check_and_install_playwright():
             from playwright.sync_api import sync_playwright
             with sync_playwright() as p:
                 try:
-                    browser = p.chromium.launch(headless=True)
+                    launch_kwargs = {'headless': True}
+                    if detected_executable_path:
+                        launch_kwargs['executable_path'] = str(detected_executable_path)
+                    browser = p.chromium.launch(**launch_kwargs)
                     browser.close()
                     print(f"{_OK} Playwright浏览器已安装（通过API检测）")
                     playwright_installed = True
