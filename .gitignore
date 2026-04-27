@@ -163,6 +163,7 @@ docker-compose.override.yml
 # Large or generated artifacts
 *.zip
 *.tar.gz
+*.tgz
 *.rar
 *.7z
 *.iso
