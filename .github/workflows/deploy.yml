@@ -76,6 +76,7 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT }}
+          timeout: 30m
           source: ${{ env.RELEASE_ARCHIVE }}
           target: ${{ env.APP_DIR }}
 
@@ -86,6 +87,7 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT }}
+          command_timeout: 60m
           script_stop: true
           script: |
             set -e
