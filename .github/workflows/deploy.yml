@@ -11,113 +11,92 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  deploy:
+  # ==================== 第一步：在 CI 构建镜像并推送到 GHCR ====================
+  build-and-push:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # 允许推送到 ghcr.io
 
-    env:
-      APP_DIR: /opt/1panel/apps/xianyu-auto-reply
-      RELEASE_ARCHIVE: release.tgz
+    outputs:
+      image: ${{ steps.meta.outputs.tags }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build release bundle
-        run: |
-          set -e
-          rm -f "$RELEASE_ARCHIVE"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-          tar \
-            --exclude='./.git' \
-            --exclude='./.github' \
-            --exclude='./backend/__pycache__' \
-            --exclude='./backend/.pytest_cache' \
-            --exclude='./backend/.mypy_cache' \
-            --exclude='./backend/data' \
-            --exclude='./backend/logs' \
-            --exclude='./backend/backups' \
-            --exclude='./backend/trajectory_history' \
-            --exclude='./data' \
-            --exclude='./logs' \
-            --exclude='./backups' \
-            --exclude='./.env' \
-            --exclude='./.env.*' \
-            -czf "$RELEASE_ARCHIVE" \
-            backend \
-            Dockerfile \
-            docker-compose.yml \
-            .dockerignore
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-          echo "Release archive size:"
-          ls -lh "$RELEASE_ARCHIVE"
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-
 
-          echo "Validate required files in release archive..."
-          required_files=(
-            "backend/requirements.txt"
-            "backend/entrypoint.sh"
-            "backend/judian/scripts/package.json"
-            "backend/judian/scripts/package-lock.json"
-            "Dockerfile"
-            "docker-compose.yml"
-            ".dockerignore"
-          )
-          for file in "${required_files[@]}"; do
-            if ! tar -tzf "$RELEASE_ARCHIVE" "$file" >/dev/null 2>&1; then
-              echo "发布包缺少关键文件: $file"
-              exit 1
-            fi
-          done
-          echo "Release archive validation passed."
+      # 利用 GitHub Actions 缓存加速 Docker 层复用
+      # 第一次构建仍需完整构建，之后只重建变化的层（通常只有 COPY . . 之后的层）
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Upload release bundle to server
+  # ==================== 第二步：服务器只拉镜像，不再本地 build ====================
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    env:
+      APP_DIR: /opt/1panel/apps/xianyu-auto-reply
+      IMAGE: ghcr.io/${{ github.repository }}:latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 只上传 compose 文件和运行时配置，不再上传整个代码包
+      - name: Upload compose & config files to server
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT }}
-          timeout: 30m
-          source: ${{ env.RELEASE_ARCHIVE }}
+          timeout: 5m
+          source: "docker-compose.yml,.dockerignore"
           target: ${{ env.APP_DIR }}
 
-      - name: Deploy on server
+      - name: Deploy on server (pull & restart)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT }}
-          command_timeout: 60m
+          command_timeout: 10m   # 从 60m 缩短到 10m，因为不再本地 build
           script_stop: true
           script: |
             set -e
 
             APP_DIR="${{ env.APP_DIR }}"
-            ARCHIVE="$APP_DIR/${{ env.RELEASE_ARCHIVE }}"
             ENV_FILE="$APP_DIR/.env"
-            ENV_BACKUP="$APP_DIR/.env.backup"
 
-            mkdir -p "$APP_DIR"
             mkdir -p "$APP_DIR/data" "$APP_DIR/logs" "$APP_DIR/backups"
-
-            if [ ! -f "$ARCHIVE" ]; then
-              echo "发布包不存在：$ARCHIVE"
-              exit 1
-            fi
-
-            if [ -f "$ENV_FILE" ]; then
-              cp "$ENV_FILE" "$ENV_BACKUP"
-            fi
-
-            rm -rf "$APP_DIR/frontend" "$APP_DIR/backend"
-            rm -f "$APP_DIR/Dockerfile" "$APP_DIR/docker-compose.yml" "$APP_DIR/.dockerignore"
-
-            tar -xzf "$ARCHIVE" -C "$APP_DIR"
-            rm -f "$ARCHIVE"
-
-            if [ -f "$ENV_BACKUP" ]; then
-              mv "$ENV_BACKUP" "$ENV_FILE"
-            fi
 
             if [ ! -f "$ENV_FILE" ]; then
               echo "缺少 $ENV_FILE，请先在服务器创建环境变量文件"
@@ -126,8 +105,17 @@ jobs:
 
             cd "$APP_DIR"
 
-            docker compose --env-file .env down || true
-            docker compose --env-file .env up -d --build
+            # 登录 GHCR 拉取最新镜像（使用 GITHUB_TOKEN 无需额外 secret）
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            # 拉取最新镜像（镜像在 CI 已构建好，这一步通常 < 1min）
+            docker compose --env-file .env pull
+
+            # 重启容器（不加 --build，因为镜像已经是最新的）
+            docker compose --env-file .env up -d
+
+            # 清理旧镜像释放磁盘空间
+            docker image prune -f
 
             docker compose ps
-            docker compose logs --tail=120 xianyu-app | cat || docker compose logs --tail=120 | cat
+            docker compose logs --tail=50 xianyu-app | cat || docker compose logs --tail=50 | cat
