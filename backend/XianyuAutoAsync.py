@@ -1363,6 +1363,139 @@ class XianyuLive:
 
 
 
+    def _extract_h5_token(self, cookies_dict: Dict[str, str] = None) -> str:
+        """从Cookie中提取 _m_h5_tk / m_h5_tk 的 token 部分。"""
+        cookie_source = cookies_dict if cookies_dict is not None else trans_cookies(self.cookies_str)
+        token_raw = str(cookie_source.get('_m_h5_tk') or cookie_source.get('m_h5_tk') or '').strip()
+        if not token_raw:
+            return ''
+        return token_raw.split('_', 1)[0]
+
+    async def _reload_latest_cookie_from_db(self, reason: str = "") -> bool:
+        """从数据库重新加载当前账号的最新Cookie。"""
+        try:
+            account_info = db_manager.get_cookie_details(self.cookie_id)
+            db_cookie_value = (account_info or {}).get('value', '')
+            if db_cookie_value and db_cookie_value != self.cookies_str:
+                self.cookies_str = db_cookie_value
+                self.cookies = trans_cookies(self.cookies_str)
+                suffix = f"（{reason}）" if reason else ""
+                logger.info(f"【{self.cookie_id}】Cookie已从数据库重新加载{suffix}")
+                return True
+        except Exception as reload_e:
+            suffix = f"（{reason}）" if reason else ""
+            logger.warning(f"【{self.cookie_id}】从数据库重新加载Cookie失败{suffix}: {self._safe_str(reload_e)}")
+        return False
+
+    async def _merge_and_persist_cookies(self, new_cookies: Dict[str, str], reason: str) -> bool:
+        """合并新Cookie并持久化，避免下次仍从残缺Cookie启动。"""
+        if not new_cookies:
+            return False
+
+        merged_cookies = self.cookies.copy()
+        changed_keys = []
+        for cookie_name, cookie_value in new_cookies.items():
+            if not cookie_value:
+                continue
+            if merged_cookies.get(cookie_name) != cookie_value:
+                changed_keys.append(cookie_name)
+            merged_cookies[cookie_name] = cookie_value
+
+        if not changed_keys:
+            return False
+
+        self.cookies = merged_cookies
+        self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
+        await self.update_config_cookies()
+
+        try:
+            db_manager.delete_cached_token(self.myid)
+        except Exception as del_e:
+            logger.warning(f"【{self.cookie_id}】Cookie更新后清除Token缓存失败: {self._safe_str(del_e)}")
+
+        logger.info(f"【{self.cookie_id}】通过{reason}补全Cookie成功，更新字段: {changed_keys}")
+        return True
+
+    async def _try_enrich_h5_cookies(self, force_refresh: bool = False) -> bool:
+        """尝试基于现有Cookie主动补全 _m_h5_tk / _m_h5_tk_enc。"""
+        try:
+            from utils.xianyu_utils import extract_cookies_from_response
+
+            working_cookies = self.cookies.copy()
+            if force_refresh:
+                for cookie_name in ('_m_h5_tk', '_m_h5_tk_enc', 'm_h5_tk', 'm_h5_tk_enc'):
+                    working_cookies.pop(cookie_name, None)
+
+            token = self._extract_h5_token(working_cookies)
+            if token:
+                if working_cookies != self.cookies:
+                    await self._merge_and_persist_cookies(working_cookies, "H5 Token强制刷新前同步")
+                return True
+
+            seed_url = (
+                API_ENDPOINTS.get('h5_tk_seed')
+                or 'https://h5api.m.goofish.com/h5/mtop.gaia.nodejs.gaia.idle.data.gw.v2.index.get/1.0/'
+            )
+            timeout = aiohttp.ClientTimeout(total=10)
+            base_headers = dict(DEFAULT_HEADERS or {})
+            base_headers.setdefault('accept', 'application/json')
+            base_headers.setdefault('accept-language', 'zh-CN,zh;q=0.9,en;q=0.8')
+            base_headers.setdefault('user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36')
+            base_headers.setdefault('referer', 'https://www.goofish.com/')
+            base_headers.setdefault('origin', 'https://www.goofish.com')
+
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                request_headers = dict(base_headers)
+                request_headers['cookie'] = '; '.join([f"{k}={v}" for k, v in working_cookies.items()])
+
+                async with session.get(seed_url, headers=request_headers) as response:
+                    seed_cookies = extract_cookies_from_response(response)
+                    if seed_cookies:
+                        working_cookies.update(seed_cookies)
+                        logger.info(f"【{self.cookie_id}】种子请求补到Cookie字段: {list(seed_cookies.keys())}")
+
+                token = self._extract_h5_token(working_cookies)
+                if not token:
+                    logger.warning(f"【{self.cookie_id}】种子请求后仍未获取到_m_h5_tk")
+                    return False
+
+                data_seed = '{"bizScene":"home"}'
+                t_seed = str(int(time.time() * 1000))
+                params_seed = {
+                    'jsv': '2.7.2',
+                    'appKey': '34839810',
+                    't': t_seed,
+                    'sign': generate_sign(t_seed, token, data_seed),
+                    'v': '1.0',
+                    'type': 'originaljson',
+                    'dataType': 'json',
+                    'timeout': 20000,
+                    'api': 'mtop.gaia.nodejs.gaia.idle.data.gw.v2.index.get',
+                    'data': data_seed,
+                }
+                request_headers['content-type'] = 'application/x-www-form-urlencoded'
+                request_headers['cookie'] = '; '.join([f"{k}={v}" for k, v in working_cookies.items()])
+
+                async with session.post(
+                    seed_url,
+                    params=params_seed,
+                    data={'data': data_seed},
+                    headers=request_headers,
+                ) as response:
+                    followup_cookies = extract_cookies_from_response(response)
+                    if followup_cookies:
+                        working_cookies.update(followup_cookies)
+                        logger.info(f"【{self.cookie_id}】二次补全Cookie字段: {list(followup_cookies.keys())}")
+
+            if not self._extract_h5_token(working_cookies):
+                return False
+
+            await self._merge_and_persist_cookies(working_cookies, "H5 Token自动补全")
+            return True
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】自动补全H5 Cookie失败: {self._safe_str(e)}")
+            return False
+
     async def refresh_token(self, captcha_retry_count: int = 0, token_expiry_retry_count: int = 0):
         """刷新token
 
@@ -1424,19 +1557,7 @@ class XianyuLive:
             # 这样即使用户已经手动更新了cookie，代码也会使用最新的cookie
             logger.info(f"【{self.cookie_id}】开始执行Cookie刷新任务...")
             # await self._execute_cookie_refresh(time.time())
-            try:
-                from db_manager import db_manager
-                account_info = db_manager.get_cookie_details(self.cookie_id)
-                if account_info and account_info.get('cookie_value'):
-                    new_cookies_str = account_info.get('cookie_value')
-                    if new_cookies_str != self.cookies_str:
-                        logger.info(f"【{self.cookie_id}】检测到数据库中的cookie已更新，重新加载cookie")
-                        self.cookies_str = new_cookies_str
-                        # 更新cookies字典
-                        self.cookies = trans_cookies(self.cookies_str)
-                        logger.warning(f"【{self.cookie_id}】Cookie已从数据库重新加载")
-            except Exception as reload_e:
-                logger.warning(f"【{self.cookie_id}】从数据库重新加载cookie失败，继续使用当前cookie: {self._safe_str(reload_e)}")
+            await self._reload_latest_cookie_from_db("token刷新前")
 
             # 生成更精确的时间戳
             timestamp = str(int(time.time() * 1000))
@@ -1468,7 +1589,25 @@ class XianyuLive:
 
             # 获取token
             token = None
-            token = trans_cookies(self.cookies_str).get('_m_h5_tk', '').split('_')[0] if trans_cookies(self.cookies_str).get('_m_h5_tk') else ''
+            token = self._extract_h5_token()
+            if not token:
+                logger.warning(f"【{self.cookie_id}】Cookie中缺少_m_h5_tk，先尝试自动补全Cookie...")
+                enriched = await self._try_enrich_h5_cookies()
+                if enriched:
+                    token = self._extract_h5_token()
+
+            if not token:
+                logger.warning(f"【{self.cookie_id}】自动补全Cookie失败，触发密码登录刷新Cookie...")
+                refresh_success = await self._try_password_login_refresh("Cookie缺少_m_h5_tk")
+                if not refresh_success:
+                    notification_sent = True
+                    return None
+                try:
+                    from db_manager import db_manager
+                    db_manager.delete_cached_token(self.myid)
+                except Exception as del_e:
+                    logger.warning(f"【{self.cookie_id}】清除Token缓存失败: {self._safe_str(del_e)}")
+                return await self.refresh_token(captcha_retry_count, token_expiry_retry_count)
 
             sign = generate_sign(params['t'], token, data_val)
             params['sign'] = sign
@@ -2245,7 +2384,7 @@ class XianyuLive:
             
             # 【重要】先检查数据库中的cookie是否已经更新
             # 如果用户已经手动更新了cookie，就不需要触发密码登录刷新
-            db_cookie_value = account_info.get('cookie_value', '')
+            db_cookie_value = account_info.get('value', '')
             if db_cookie_value and db_cookie_value != self.cookies_str:
                 logger.info(f"【{self.cookie_id}】检测到数据库中的cookie已更新，重新加载cookie")
                 self.cookies_str = db_cookie_value
