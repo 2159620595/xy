@@ -1,6 +1,10 @@
 {
   "rewrites": [
     {
+      "source": "/_proxy/:path*",
+      "destination": "http://119.29.199.95:8080/:path*"
+    },
+    {
       "source": "/(.*)",
       "destination": "/index.html"
     }
