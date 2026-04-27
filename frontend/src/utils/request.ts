@@ -10,9 +10,29 @@ const normalizeBase = (value: string | undefined) =>
     .trim()
     .replace(/\/+$/, "");
 
-export const API_BASE_URL = normalizeBase(import.meta.env.VITE_API_BASE_URL);
-export const STATIC_BASE_URL =
-  normalizeBase(import.meta.env.VITE_STATIC_BASE_URL) || API_BASE_URL;
+const isVercelHosted = () => {
+  if (typeof window === "undefined") return false;
+  return window.location.hostname.toLowerCase().endsWith(".vercel.app");
+};
+
+const resolveApiBaseUrl = () => {
+  const configuredBase = normalizeBase(import.meta.env.VITE_API_BASE_URL);
+  if (configuredBase) return configuredBase;
+  return isVercelHosted() ? "/_proxy" : "";
+};
+
+const resolveStaticBaseUrl = () => {
+  const configuredStaticBase = normalizeBase(
+    import.meta.env.VITE_STATIC_BASE_URL,
+  );
+  if (configuredStaticBase) return configuredStaticBase;
+
+  const configuredApiBase = normalizeBase(import.meta.env.VITE_API_BASE_URL);
+  return configuredApiBase || "";
+};
+
+export const API_BASE_URL = resolveApiBaseUrl();
+export const STATIC_BASE_URL = resolveStaticBaseUrl();
 export const NETDISK_API_BASE_URL =
   normalizeBase(import.meta.env.VITE_NETDISK_API_BASE) ||
   (API_BASE_URL ? `${API_BASE_URL}/netdisk_api/api` : "/netdisk_api/api");

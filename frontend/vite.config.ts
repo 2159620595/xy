@@ -22,6 +22,71 @@ const spaRouteProxy = () => ({
   },
 });
 
+const legacyProxyTargets = [
+  "/api",
+  "/netdisk_api",
+  "/verify",
+  "/logout",
+  "/system-settings",
+  "/cards",
+  "/delivery-rules",
+  "/generate-captcha",
+  "/verify-captcha",
+  "/send-verification-code",
+  "/cookies",
+  "/cookie",
+  "/password-login",
+  "/qr-login",
+  "/ai-reply-settings",
+  "/itemReplays",
+  "/item-reply",
+  "/keywords-with-item-id",
+  "/keywords-export",
+  "/keywords-import",
+  "/default-reply",
+  "/upload-image",
+  "/change-password",
+  "/backup",
+];
+
+const legacySpaProxyTargets = [
+  "/login",
+  "/register",
+  "/items",
+  "/item-search",
+  "/keywords",
+  "/notification-channels",
+  "/message-notifications",
+  "/admin",
+];
+
+const buildProxyMap = () => {
+  const proxy: Record<string, ReturnType<typeof spaRouteProxy> | {
+    target: string;
+    changeOrigin: boolean;
+    rewrite?: (path: string) => string;
+  }> = {
+    "/_proxy": {
+      target: backendTarget,
+      changeOrigin: true,
+      rewrite: (path) => path.replace(/^\/_proxy/, ""),
+    },
+  };
+
+  for (const route of legacyProxyTargets) {
+    proxy[route] = {
+      target: backendTarget,
+      changeOrigin: true,
+    };
+  }
+
+  for (const route of legacySpaProxyTargets) {
+    proxy[route] = spaRouteProxy();
+  }
+
+  return proxy;
+};
+
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [vue()],
@@ -36,135 +101,6 @@ export default defineConfig({
     outDir: path.resolve(__dirname, outputDir),
   },
   server: {
-    proxy: {
-      "/api": {
-        target: backendTarget,
-        changeOrigin: true,
-      },
-      "/netdisk_api": {
-        target: backendTarget,
-        changeOrigin: true,
-      },
-      "/login": spaRouteProxy(),
-      "/verify": {
-        target: backendTarget,
-        changeOrigin: true,
-      },
-      "/logout": {
-        target: backendTarget,
-        changeOrigin: true,
-      },
-      "/register": {
-        target: backendTarget,
-        changeOrigin: true,
-        bypass: (req) => {
-          const accept = Array.isArray(req.headers.accept)
-            ? req.headers.accept.join(",")
-            : req.headers.accept;
-          if (req.method === "GET" && accept?.includes("text/html")) {
-            return "/index.html";
-          }
-          return undefined;
-        },
-      },
-      "/system-settings": {
-        target: backendTarget,
-        changeOrigin: true,
-      },
-      "/cards": {
-        target: backendTarget,
-        changeOrigin: true,
-      },
-      "/delivery-rules": {
-        target: backendTarget,
-        changeOrigin: true,
-      },
-      "/generate-captcha": {
-        target: backendTarget,
-        changeOrigin: true,
-      },
-      "/verify-captcha": {
-        target: backendTarget,
-        changeOrigin: true,
-      },
-      "/send-verification-code": {
-        target: backendTarget,
-        changeOrigin: true,
-      },
-      "/cookies": {
-        target: backendTarget,
-        changeOrigin: true,
-      },
-      "/cookie": {
-        target: backendTarget,
-        changeOrigin: true,
-      },
-      "/password-login": {
-        target: backendTarget,
-        changeOrigin: true,
-      },
-      "/qr-login": {
-        target: backendTarget,
-        changeOrigin: true,
-      },
-      "/ai-reply-settings": {
-        target: backendTarget,
-        changeOrigin: true,
-      },
-      "/items": spaRouteProxy(),
-      "/item-search": spaRouteProxy(),
-      "/itemReplays": {
-        target: backendTarget,
-        changeOrigin: true,
-      },
-      "/item-reply": {
-        target: backendTarget,
-        changeOrigin: true,
-      },
-      "/keywords": spaRouteProxy(),
-      "/keywords-with-item-id": {
-        target: backendTarget,
-        changeOrigin: true,
-      },
-      "/keywords-export": {
-        target: backendTarget,
-        changeOrigin: true,
-      },
-      "/keywords-import": {
-        target: backendTarget,
-        changeOrigin: true,
-      },
-      "/default-reply": {
-        target: backendTarget,
-        changeOrigin: true,
-      },
-      "/notification-channels": spaRouteProxy(),
-      "/message-notifications": spaRouteProxy(),
-      "/upload-image": {
-        target: backendTarget,
-        changeOrigin: true,
-      },
-      "/change-password": {
-        target: backendTarget,
-        changeOrigin: true,
-      },
-      "/backup": {
-        target: backendTarget,
-        changeOrigin: true,
-      },
-      "/admin": {
-        target: backendTarget,
-        changeOrigin: true,
-        bypass: (req) => {
-          const accept = Array.isArray(req.headers.accept)
-            ? req.headers.accept.join(",")
-            : req.headers.accept;
-          if (req.method === "GET" && accept?.includes("text/html")) {
-            return "/index.html";
-          }
-          return undefined;
-        },
-      },
-    },
+    proxy: buildProxyMap(),
   },
 });

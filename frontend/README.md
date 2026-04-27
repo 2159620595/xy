@@ -50,10 +50,14 @@ npm run build
 可参考 `frontend/.env.example`：
 
 ```env
-VITE_NETDISK_API_BASE=/netdisk_api/api
-VITE_JUDIAN_API_BASE=/netdisk_api/judian_api
+VITE_API_BASE_URL=/_proxy
+# 留空时会自动拼接为 /_proxy/netdisk_api/api
+VITE_NETDISK_API_BASE=
+# 留空时会自动拼接为 /_proxy/netdisk_api/judian_api
+VITE_JUDIAN_API_BASE=
 VITE_JUDIAN_API_TIMEOUT_MS=30000
 VITE_JUDIAN_LOGIN_API_TIMEOUT_MS=60000
 ```
 
 如果前端和后端不在同一域名下部署，再按实际网关地址覆盖这几个变量。
+如果部署到 Vercel 且未显式设置 `VITE_API_BASE_URL`，前端会默认回退到 `/_proxy`，对应 `vercel.json` 的公网转发规则；网盘和聚店接口也会随之自动走 `/_proxy/netdisk_api/...`。
