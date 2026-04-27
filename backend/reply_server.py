@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Depends, Query, status, UploadFile, File, Form
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
@@ -742,6 +743,26 @@ def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> D
     if not current_user.get('is_admin'):
         raise HTTPException(status_code=403, detail="需要管理员权限")
     return current_user
+
+
+def _can_access_cookie(cookie_id: str, current_user: Dict[str, Any]) -> bool:
+    """管理员可访问全部账号，普通用户仅可访问自己的账号。"""
+    if current_user.get('is_admin'):
+        return True
+
+    from db_manager import db_manager
+    user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+    return cookie_id in user_cookies
+
+
+def _ensure_cookie_access(cookie_id: str, current_user: Dict[str, Any], action: str = "访问") -> None:
+    if not _can_access_cookie(cookie_id, current_user):
+        raise HTTPException(status_code=403, detail=f"无权限{action}该Cookie")
+
+
+def _get_qr_login_instance(cookie_id: str):
+    from XianyuAutoAsync import XianyuLive
+    return XianyuLive.get_instance(cookie_id)
 
 
 def log_with_user(level: str, message: str, user_info: Dict[str, Any] = None):
@@ -3108,9 +3129,11 @@ async def reset_qr_cookie_refresh_cooldown(
         if not cookie_info:
             return {'success': False, 'message': '账号不存在'}
 
-        # 如果cookie_manager中有对应的实例，直接重置
-        if cookie_manager.manager and cookie_id in cookie_manager.manager.instances:
-            instance = cookie_manager.manager.instances[cookie_id]
+        _ensure_cookie_access(cookie_id, current_user, "操作")
+
+        # 如果有对应的活跃实例，直接重置
+        instance = _get_qr_login_instance(cookie_id)
+        if instance:
             remaining_time_before = instance.get_qr_cookie_refresh_remaining_time()
             instance.reset_qr_cookie_refresh_flag()
 
@@ -3148,9 +3171,11 @@ async def get_qr_cookie_refresh_cooldown_status(
         if not cookie_info:
             return {'success': False, 'message': '账号不存在'}
 
-        # 如果cookie_manager中有对应的实例，获取冷却状态
-        if cookie_manager.manager and cookie_id in cookie_manager.manager.instances:
-            instance = cookie_manager.manager.instances[cookie_id]
+        _ensure_cookie_access(cookie_id, current_user, "访问")
+
+        # 如果有对应的活跃实例，获取冷却状态
+        instance = _get_qr_login_instance(cookie_id)
+        if instance:
             remaining_time = instance.get_qr_cookie_refresh_remaining_time()
             cooldown_duration = instance.qr_cookie_refresh_cooldown
             last_refresh_time = instance.last_qr_cookie_refresh_time
@@ -3948,12 +3973,12 @@ def get_all_message_notifications(current_user: Dict[str, Any] = Depends(get_cur
     try:
         # 只返回当前用户的消息通知配置
         user_id = current_user['user_id']
-        user_cookies = db_manager.get_all_cookies(user_id)
-
         all_notifications = db_manager.get_all_message_notifications()
-        # 过滤只属于当前用户的通知配置
-        user_notifications = {cid: notifications for cid, notifications in all_notifications.items() if cid in user_cookies}
-        return user_notifications
+        if current_user.get('is_admin'):
+            return all_notifications
+
+        user_cookies = db_manager.get_all_cookies(user_id)
+        return {cid: notifications for cid, notifications in all_notifications.items() if cid in user_cookies}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -3963,13 +3988,7 @@ def get_account_notifications(cid: str, current_user: Dict[str, Any] = Depends(g
     """获取指定账号的消息通知配置"""
     from db_manager import db_manager
     try:
-        # 检查cookie是否属于当前用户
-        user_id = current_user['user_id']
-        user_cookies = db_manager.get_all_cookies(user_id)
-
-        if cid not in user_cookies:
-            raise HTTPException(status_code=403, detail="无权限访问该Cookie")
-
+        _ensure_cookie_access(cid, current_user, "访问")
         return db_manager.get_account_notifications(cid)
     except HTTPException:
         raise
@@ -3982,13 +4001,7 @@ def set_message_notification(cid: str, notification_data: MessageNotificationIn,
     """设置账号的消息通知"""
     from db_manager import db_manager
     try:
-        # 检查cookie是否属于当前用户
-        user_id = current_user['user_id']
-        user_cookies = db_manager.get_all_cookies(user_id)
-
-        if cid not in user_cookies:
-            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
-
+        _ensure_cookie_access(cid, current_user, "操作")
         # 检查通知渠道是否存在
         channel = db_manager.get_notification_channel(notification_data.channel_id)
         if not channel:
@@ -4006,10 +4019,11 @@ def set_message_notification(cid: str, notification_data: MessageNotificationIn,
 
 
 @app.delete('/message-notifications/account/{cid}')
-def delete_account_notifications(cid: str, _: None = Depends(require_auth)):
+def delete_account_notifications(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """删除账号的所有消息通知配置"""
     from db_manager import db_manager
     try:
+        _ensure_cookie_access(cid, current_user, "操作")
         success = db_manager.delete_account_notifications(cid)
         if success:
             return {'msg': 'account notifications deleted'}
@@ -4022,10 +4036,14 @@ def delete_account_notifications(cid: str, _: None = Depends(require_auth)):
 
 
 @app.delete('/message-notifications/{notification_id}')
-def delete_message_notification(notification_id: int, _: None = Depends(require_auth)):
+def delete_message_notification(notification_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
     """删除消息通知配置"""
     from db_manager import db_manager
     try:
+        notification = db_manager.get_message_notification(notification_id)
+        if not notification:
+            raise HTTPException(status_code=404, detail='通知配置不存在')
+        _ensure_cookie_access(notification['cookie_id'], current_user, "操作")
         success = db_manager.delete_message_notification(notification_id)
         if success:
             return {'msg': 'message notification deleted'}
@@ -5131,6 +5149,11 @@ def create_card(card_data: dict, current_user: Dict[str, Any] = Depends(get_curr
 
         log_with_user('info', f"卡券创建成功: {card_name} (ID: {card_id})", current_user)
         return {"id": card_id, "message": "卡券创建成功"}
+    except HTTPException:
+        raise
+    except ValueError as e:
+        log_with_user('warning', f"创建卡券参数冲突: {card_data.get('name', '未知')} - {str(e)}", current_user)
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         log_with_user('error', f"创建卡券失败: {card_data.get('name', '未知')} - {str(e)}", current_user)
         raise HTTPException(status_code=500, detail=str(e))
@@ -5141,21 +5164,28 @@ def get_card(card_id: int, current_user: Dict[str, Any] = Depends(get_current_us
     """获取单个卡券详情"""
     try:
         from db_manager import db_manager
-        user_id = current_user['user_id']
+        user_id = None if current_user.get('is_admin') else current_user['user_id']
         card = db_manager.get_card_by_id(card_id, user_id)
         if card:
             return card
         else:
             raise HTTPException(status_code=404, detail="卡券不存在")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.put("/cards/{card_id}")
-def update_card(card_id: int, card_data: dict, _: None = Depends(require_auth)):
+def update_card(card_id: int, card_data: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
     """更新卡券"""
     try:
         from db_manager import db_manager
+        user_id = None if current_user.get('is_admin') else current_user['user_id']
+
+        if not db_manager.get_card_by_id(card_id, user_id):
+            raise HTTPException(status_code=404, detail="卡券不存在")
+
         # 验证多规格字段
         is_multi_spec = card_data.get('is_multi_spec')
         if is_multi_spec:
@@ -5171,16 +5201,21 @@ def update_card(card_id: int, card_data: dict, _: None = Depends(require_auth)):
             data_content=card_data.get('data_content'),
             image_url=card_data.get('image_url'),
             description=card_data.get('description'),
-            enabled=card_data.get('enabled', True),
+            enabled=card_data['enabled'] if 'enabled' in card_data else None,
             delay_seconds=card_data.get('delay_seconds'),
             is_multi_spec=is_multi_spec,
             spec_name=card_data.get('spec_name'),
-            spec_value=card_data.get('spec_value')
+            spec_value=card_data.get('spec_value'),
+            user_id=user_id
         )
         if success:
             return {"message": "卡券更新成功"}
         else:
             raise HTTPException(status_code=404, detail="卡券不存在")
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -5202,6 +5237,11 @@ async def update_card_with_image(
     """更新带图片的卡券"""
     try:
         logger.info(f"接收到带图片的卡券更新请求: card_id={card_id}, name={name}, type={type}")
+
+        from db_manager import db_manager
+        user_id = None if current_user.get('is_admin') else current_user['user_id']
+        if not db_manager.get_card_by_id(card_id, user_id):
+            raise HTTPException(status_code=404, detail="卡券不存在")
 
         # 验证图片文件
         if not image.content_type or not image.content_type.startswith('image/'):
@@ -5226,7 +5266,6 @@ async def update_card_with_image(
         logger.info(f"图片保存成功: {image_url}")
 
         # 更新卡券
-        from db_manager import db_manager
         success = db_manager.update_card(
             card_id=card_id,
             name=name,
@@ -5237,7 +5276,8 @@ async def update_card_with_image(
             delay_seconds=delay_seconds,
             is_multi_spec=is_multi_spec,
             spec_name=spec_name if is_multi_spec else None,
-            spec_value=spec_value if is_multi_spec else None
+            spec_value=spec_value if is_multi_spec else None,
+            user_id=user_id
         )
 
         if success:
@@ -5362,15 +5402,18 @@ def update_delivery_rule(rule_id: int, rule_data: dict, current_user: Dict[str, 
 
 
 @app.delete("/cards/{card_id}")
-def delete_card(card_id: int, _: None = Depends(require_auth)):
+def delete_card(card_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
     """删除卡券"""
     try:
         from db_manager import db_manager
-        success = db_manager.delete_card(card_id)
+        user_id = None if current_user.get('is_admin') else current_user['user_id']
+        success = db_manager.delete_card(card_id, user_id=user_id)
         if success:
             return {"message": "卡券删除成功"}
         else:
             raise HTTPException(status_code=404, detail="卡券不存在")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -5409,7 +5452,7 @@ def export_backup(current_user: Dict[str, Any] = Depends(get_current_user)):
         filename = f"xianyu_backup_{username}_{timestamp}.json"
 
         # 返回JSON响应，设置下载头
-        response = JSONResponse(content=backup_data)
+        response = JSONResponse(content=jsonable_encoder(backup_data))
         response.headers["Content-Disposition"] = f"attachment; filename={filename}"
         response.headers["Content-Type"] = "application/json"
 
@@ -5451,8 +5494,12 @@ def import_backup(file: UploadFile = File(...), current_user: Dict[str, Any] = D
         else:
             raise HTTPException(status_code=400, detail="备份导入失败")
 
+    except HTTPException:
+        raise
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="备份文件格式无效")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="备份文件编码无效，请使用 UTF-8 JSON 文件")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"导入备份失败: {str(e)}")
 
@@ -6808,14 +6855,8 @@ def get_all_items(current_user: Dict[str, Any] = Depends(get_current_user)):
 def get_items_by_cookie(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取指定Cookie的商品信息"""
     try:
-        # 检查cookie是否属于当前用户
-        user_id = current_user['user_id']
         from db_manager import db_manager
-        user_cookies = db_manager.get_all_cookies(user_id)
-
-        if cookie_id not in user_cookies:
-            raise HTTPException(status_code=403, detail="无权限访问该Cookie")
-
+        _ensure_cookie_access(cookie_id, current_user, "访问")
         items = db_manager.get_itemReplays_by_cookie(cookie_id)
         return {"items": items}
     except HTTPException:
@@ -6834,14 +6875,9 @@ def update_item_reply(
     更新指定账号和商品的回复内容
     """
     try:
-        user_id = current_user['user_id']
         from db_manager import db_manager
 
-        # 验证cookie是否属于用户
-        user_cookies = db_manager.get_all_cookies(user_id)
-        if cookie_id not in user_cookies:
-            raise HTTPException(status_code=403, detail="无权限访问该Cookie")
-
+        _ensure_cookie_access(cookie_id, current_user, "访问")
         reply_content = data.get("reply_content", "").strip()
         if not reply_content:
             raise HTTPException(status_code=400, detail="回复内容不能为空")
@@ -6867,11 +6903,7 @@ def delete_item_reply(cookie_id: str, item_id: str, current_user: Dict[str, Any]
     删除指定账号cookie_id和商品item_id的商品回复
     """
     try:
-        user_id = current_user['user_id']
-        user_cookies = db_manager.get_all_cookies(user_id)
-        if cookie_id not in user_cookies:
-            raise HTTPException(status_code=403, detail="无权限访问该Cookie")
-
+        _ensure_cookie_access(cookie_id, current_user, "访问")
         success = db_manager.delete_item_reply(cookie_id, item_id)
         if not success:
             raise HTTPException(status_code=404, detail="商品回复不存在")
@@ -6898,14 +6930,11 @@ async def batch_delete_item_reply(
     """
     批量删除商品回复
     """
-    user_id = current_user['user_id']
     from db_manager import db_manager
 
     # 先校验当前用户是否有权限删除每个cookie对应的回复
-    user_cookies = db_manager.get_all_cookies(user_id)
     for item in req.items:
-        if item.cookie_id not in user_cookies:
-            raise HTTPException(status_code=403, detail=f"无权限访问Cookie {item.cookie_id}")
+        _ensure_cookie_access(item.cookie_id, current_user, "访问")
 
     result = db_manager.batch_delete_item_replies([item.dict() for item in req.items])
     return {
@@ -6919,12 +6948,8 @@ def get_item_reply(cookie_id: str, item_id: str, current_user: Dict[str, Any] = 
     获取指定账号cookie_id和商品item_id的商品回复内容
     """
     try:
-        user_id = current_user['user_id']
         # 校验cookie_id是否属于当前用户
-        user_cookies = db_manager.get_all_cookies(user_id)
-        if cookie_id not in user_cookies:
-            raise HTTPException(status_code=403, detail="无权限访问该Cookie")
-
+        _ensure_cookie_access(cookie_id, current_user, "访问")
         # 获取指定商品回复
         item_replies = db_manager.get_itemReplays_by_cookie(cookie_id)
         # 找对应item_id的回复
@@ -6973,7 +6998,9 @@ async def upload_database_backup(admin_user: Dict[str, Any] = Depends(require_ad
             raise HTTPException(status_code=400, detail="备份文件大小不能超过100MB")
 
         # 验证是否为有效的SQLite数据库文件
-        temp_file_path = f"temp_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+        current_db_path = db_manager.db_path
+        db_dir = os.path.dirname(os.path.abspath(current_db_path)) or os.getcwd()
+        temp_file_path = os.path.join(db_dir, f"temp_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db")
 
         try:
             # 保存临时文件
@@ -7005,11 +7032,7 @@ async def upload_database_backup(admin_user: Dict[str, Any] = Depends(require_ad
             raise HTTPException(status_code=400, detail="无效的数据库文件")
 
         # 备份当前数据库
-        from db_manager import db_manager
-        current_db_path = db_manager.db_path
-
         # 生成备份文件路径（与原数据库在同一目录）
-        db_dir = os.path.dirname(current_db_path)
         backup_filename = f"xianyu_data_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
         backup_current_path = os.path.join(db_dir, backup_filename)
 
@@ -7039,7 +7062,7 @@ async def upload_database_backup(admin_user: Dict[str, Any] = Depends(require_ad
             # 如果验证失败，尝试恢复原数据库
             if os.path.exists(backup_current_path):
                 shutil.copy2(backup_current_path, current_db_path)
-                db_manager.__init__()
+                db_manager.__init__(current_db_path)
                 log_with_user('info', "已恢复原数据库", admin_user)
             raise HTTPException(status_code=500, detail="数据库恢复失败，已回滚到原数据库")
 
@@ -7051,6 +7074,8 @@ async def upload_database_backup(admin_user: Dict[str, Any] = Depends(require_ad
         }
 
     except HTTPException:
+        if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
         raise
     except Exception as e:
         log_with_user('error', f"上传数据库备份失败: {str(e)}", admin_user)
@@ -7075,8 +7100,9 @@ def list_backup_files(admin_user: Dict[str, Any] = Depends(require_admin)):
                 detail="当前运行在PostgreSQL模式，本地SQLite备份文件列表接口已禁用。"
             )
 
-        # 查找备份文件（在data目录中）
-        backup_files = glob.glob("data/xianyu_data_backup_*.db")
+        db_dir = os.path.dirname(os.path.abspath(db_manager.db_path)) or os.getcwd()
+        backup_pattern = os.path.join(db_dir, "xianyu_data_backup_*.db")
+        backup_files = glob.glob(backup_pattern)
 
         backup_list = []
         for file_path in backup_files:
@@ -7102,6 +7128,8 @@ def list_backup_files(admin_user: Dict[str, Any] = Depends(require_admin)):
             "total": len(backup_list)
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         log_with_user('error', f"查询备份文件列表失败: {str(e)}", admin_user)
         raise HTTPException(status_code=500, detail=str(e))

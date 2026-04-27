@@ -2756,15 +2756,29 @@ def get_batch_script_display_path() -> str:
         return script_path
 
 
-def resolve_public_batch_script_credentials(account: models.JudianAccount, body: JudianPublicBatchPurchaseRequest) -> tuple[str, str]:
-    login_email = pick_text(body.account, resolve_account_login_email(account))
-    login_password = pick_text(body.password, resolve_account_login_password(account))
-    if not login_email or not login_password:
-        raise HTTPException(status_code=400, detail='当前账号未保存动漫共和国登录账号或密码，无法执行批量下单脚本')
-    return login_email, login_password
+def resolve_public_batch_script_auth(account: models.JudianAccount, body: JudianPublicBatchPurchaseRequest) -> tuple[str, str, str, str, str]:
+    remote_token = resolve_account_session_token(account)
+    remote_login_email = resolve_account_login_email(account)
+    remote_login_password = resolve_account_login_password(account)
+    target_login_email = pick_text(body.account)
+    target_login_password = pick_text(body.password)
+    if not target_login_email or not target_login_password:
+        raise HTTPException(status_code=400, detail='请提供被付款的动漫共和国账号和密码，无法执行批量下单脚本')
+    if not remote_token and (not remote_login_email or not remote_login_password):
+        raise HTTPException(status_code=400, detail='当前聚点付款账号既没有可复用的远端 token，也未保存可用于回退登录的聚点账号或密码，无法执行批量下单脚本')
+    return remote_token, remote_login_email, remote_login_password, target_login_email, target_login_password
 
 
-def build_public_batch_script_command(login_email: str, login_password: str, count: int, *, vip_id: str = '') -> tuple[list[str], str]:
+def build_public_batch_script_command(
+    remote_token: str,
+    remote_login_email: str,
+    remote_login_password: str,
+    target_login_email: str,
+    target_login_password: str,
+    count: int,
+    *,
+    vip_id: str = '',
+) -> tuple[list[str], str]:
     script_root = get_batch_script_root()
     script_path = get_batch_script_path()
     if not os.path.isfile(script_path):
@@ -2773,15 +2787,27 @@ def build_public_batch_script_command(login_email: str, login_password: str, cou
         'node',
         'test-vip.js',
         'batch',
-        '--account',
-        login_email,
-        '--password',
-        login_password,
         '--count',
         str(max(1, int(count))),
         '--confirm-buy',
         '--progress-jsonl',
     ]
+    if remote_token:
+        command.extend(['--remote-token', remote_token])
+    if remote_login_email and remote_login_password:
+        command.extend([
+            '--remote-account',
+            remote_login_email,
+            '--remote-password',
+            remote_login_password,
+        ])
+    if target_login_email and target_login_password:
+        command.extend([
+            '--account',
+            target_login_email,
+            '--password',
+            target_login_password,
+        ])
     if vip_id:
         command.extend(['--vip-id', str(vip_id)])
     return command, script_root
@@ -2851,6 +2877,63 @@ def merge_public_batch_progress_items(items_result: list[dict[str, Any]], next_i
     })
     normalized.sort(key=lambda item: max(1, pick_int(item.get('index'), 1)))
     return normalized
+
+
+def normalize_public_batch_debug_trace_entry(event: dict[str, Any]) -> dict[str, Any] | None:
+    event_type = pick_text(event.get('type')).lower()
+    if event_type not in {'diagnostic', 'buy_phase_started', 'autopay_phase_started'}:
+        return None
+    entry = {
+        'timestamp': pick_text(event.get('timestamp'), now_text()),
+        'type': event_type,
+        'source': pick_text(event.get('source'), 'unknown').lower() or 'unknown',
+        'stage': pick_text(event.get('stage')),
+        'message': pick_text(event.get('message')),
+        'index': max(0, pick_int(event.get('index'))),
+        'total': max(0, pick_int(event.get('total'))),
+        'orderNo': pick_text(event.get('orderNo')),
+        'tradeNo': pick_text(event.get('tradeNo')),
+        'ok': event.get('ok'),
+    }
+    return entry
+
+
+def append_public_batch_debug_trace(result_payload: dict[str, Any], event: dict[str, Any], *, limit: int = 60) -> dict[str, Any]:
+    entry = normalize_public_batch_debug_trace_entry(event)
+    if entry is None:
+        return result_payload
+    current_trace = result_payload.get('debugTrace')
+    trace_items = [dict_like(item) for item in current_trace] if isinstance(current_trace, list) else []
+    trace_items.append(entry)
+    if len(trace_items) > limit:
+        trace_items = trace_items[-limit:]
+    result_payload['debugTrace'] = trace_items
+    if entry.get('source') and entry['source'] != 'unknown':
+        result_payload['lastErrorSource'] = entry['source']
+    return result_payload
+
+
+def resolve_public_batch_error_source(result_payload: dict[str, Any], fallback_message: str = '') -> str:
+    script_result = dict_like(result_payload.get('scriptResult'))
+    explicit_source = pick_text(
+        script_result.get('errorSource'),
+        result_payload.get('errorSource'),
+        result_payload.get('lastErrorSource'),
+    ).lower()
+    if explicit_source in {'judian', 'dmghg', 'unknown'}:
+        return explicit_source
+    debug_trace = result_payload.get('debugTrace')
+    if isinstance(debug_trace, list):
+        for item in reversed(debug_trace):
+            source = pick_text(dict_like(item).get('source')).lower()
+            if source in {'judian', 'dmghg'}:
+                return source
+    text = fallback_message.strip()
+    if any(keyword in text for keyword in ('聚点', '钻石', 'tradeNo', 'orderNo', '登录', 'token', '验证码')):
+        return 'judian'
+    if any(keyword in text for keyword in ('动漫共和国', '套餐', 'vip_id', '下单', '订单创建')):
+        return 'dmghg'
+    return 'unknown'
 
 
 def build_public_batch_progress_item_from_script_event(event: dict[str, Any]) -> dict[str, Any] | None:
@@ -2950,6 +3033,10 @@ def apply_public_batch_script_progress_event(
         'items': items_result,
         'lastEvent': event,
     }
+    batch_task_row.result_payload = append_public_batch_debug_trace(
+        dict_like(batch_task_row.result_payload),
+        event,
+    )
     batch_task_row.updated_at = now_text()
     session_row.updated_at = batch_task_row.updated_at
     session_row.result_payload = {
@@ -2968,8 +3055,7 @@ def build_public_batch_items_from_script_result(result_payload: dict[str, Any], 
         fallback_count,
     )
     if str(result_payload.get('phase') or '') == 'precheck':
-        message = pick_text(result_payload.get('message'), '批量下单前置校验失败')
-        return make_public_batch_failed_items(count, message), 0
+        return [], 0
 
     buy_result = dict_like(result_payload.get('buyResult'))
     auto_pay_result = dict_like(result_payload.get('autoPayResult'))
@@ -3058,6 +3144,8 @@ def finalize_public_batch_task(
     success_count = sum(1 for item in items_result if str(item.get('status') or '') == 'completed')
     failed_count = sum(1 for item in items_result if str(item.get('status') or '') == 'failed')
     pending_count = max(0, total_count - processed_count)
+    if status == 'failed' and processed_count == 0:
+        pending_count = 0
     computed_consumed = sum(max(0, pick_int(item.get('consumedDiamond'))) for item in items_result)
     row.status = status
     row.message = message
@@ -3294,7 +3382,15 @@ def run_public_batch_purchase_job(session_id: str, batch_id: str) -> None:
         db.close()
 
 
-def run_public_batch_script_job(session_id: str, batch_id: str, login_email: str, login_password: str) -> None:
+def run_public_batch_script_job(
+    session_id: str,
+    batch_id: str,
+    remote_token: str,
+    remote_login_email: str,
+    remote_login_password: str,
+    target_login_email: str,
+    target_login_password: str,
+) -> None:
     db = SessionLocal()
     try:
         ensure_judian_schema(db)
@@ -3343,8 +3439,11 @@ def run_public_batch_script_job(session_id: str, batch_id: str, login_email: str
             db.refresh(batch_task_row)
         ensure_public_cdkey_quota_sufficient(cdkey_row, required_diamond)
         command, script_root = build_public_batch_script_command(
-            login_email,
-            login_password,
+            remote_token,
+            remote_login_email,
+            remote_login_password,
+            target_login_email,
+            target_login_password,
             count,
             vip_id=vip_id,
         )
@@ -3445,6 +3544,10 @@ def run_public_batch_script_job(session_id: str, batch_id: str, login_email: str
             'stdout': stdout_text[-12000:],
             'stderr': stderr_text[-12000:],
         }
+        batch_task_row.result_payload['errorSource'] = resolve_public_batch_error_source(
+            dict_like(batch_task_row.result_payload),
+            final_message,
+        )
         apply_public_batch_script_consumption(
             batch_task_row,
             cdkey_row,
@@ -3492,6 +3595,10 @@ def run_public_batch_script_job(session_id: str, batch_id: str, login_email: str
                     **dict_like(failed_task.result_payload),
                     'stderr': pick_text(dict_like(failed_task.result_payload).get('stderr'), str(exc or '')),
                 }
+                failed_task.result_payload['errorSource'] = resolve_public_batch_error_source(
+                    dict_like(failed_task.result_payload),
+                    str(exc or ''),
+                )
                 if failed_session is not None:
                     failed_session.message = failed_task.message
                     failed_session.updated_at = now_text()
@@ -3585,7 +3692,7 @@ def public_unlock_batch_purchase(session_id: str, body: JudianPublicBatchPurchas
     session_row, cdkey_row, account = get_public_unlock_session_or_404(db, session_id)
     if body.count is not None and not (body.items or []):
         count = normalize_public_batch_order_count(body)
-        login_email, login_password = resolve_public_batch_script_credentials(account, body)
+        remote_token, remote_login_email, remote_login_password, target_login_email, target_login_password = resolve_public_batch_script_auth(account, body)
         package_type = pick_text(body.packageType).lower()
         vip_id, unit_diamond, required_diamond = resolve_public_batch_required_diamond(
             count,
@@ -3606,7 +3713,15 @@ def public_unlock_batch_purchase(session_id: str, body: JudianPublicBatchPurchas
         )
         worker = threading.Thread(
             target=run_public_batch_script_job,
-            args=(session_row.session_id, batch_task_row.batch_id, login_email, login_password),
+            args=(
+                session_row.session_id,
+                batch_task_row.batch_id,
+                remote_token,
+                remote_login_email,
+                remote_login_password,
+                target_login_email,
+                target_login_password,
+            ),
             daemon=True,
         )
         worker.start()

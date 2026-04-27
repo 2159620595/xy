@@ -10,6 +10,7 @@ import re
 import aiohttp
 import io
 import base64
+from datetime import date, datetime
 from PIL import Image, ImageDraw, ImageFont
 from typing import List, Tuple, Dict, Optional, Any
 from loguru import logger
@@ -3170,6 +3171,34 @@ class DBManager:
                 logger.error(f"获取所有消息通知配置失败: {e}")
                 return {}
 
+    def get_message_notification(self, notification_id: int) -> Optional[Dict[str, any]]:
+        """获取单条消息通知配置。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    """
+                    SELECT id, cookie_id, channel_id, enabled
+                    FROM message_notifications
+                    WHERE id = ?
+                    """,
+                    (notification_id,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                return {
+                    'id': row[0],
+                    'cookie_id': row[1],
+                    'channel_id': row[2],
+                    'enabled': bool(row[3]),
+                }
+            except Exception as e:
+                logger.error(f"获取消息通知配置失败: {e}")
+                self._rollback_quietly()
+                return None
+
     def delete_message_notification(self, notification_id: int) -> bool:
         """删除消息通知配置"""
         with self.lock:
@@ -3199,6 +3228,35 @@ class DBManager:
                 return False
 
     # -------------------- 备份和恢复操作 --------------------
+    def _make_backup_safe_value(self, value: Any) -> Any:
+        """将备份数据里的非 JSON 原生类型转换成可序列化值。"""
+        if isinstance(value, (datetime, date)):
+            return value.isoformat()
+        if isinstance(value, memoryview):
+            value = value.tobytes()
+        if isinstance(value, bytes):
+            try:
+                return value.decode('utf-8')
+            except UnicodeDecodeError:
+                return base64.b64encode(value).decode('ascii')
+        return value
+
+    def _serialize_backup_rows(
+        self,
+        columns: List[str],
+        rows: List[Tuple[Any, ...]],
+        redacted_fields: Optional[set[str]] = None
+    ) -> List[List[Any]]:
+        """按列顺序输出可直接写入 JSON 的备份行。"""
+        redacted = set(redacted_fields or set())
+        serialized_rows = []
+        for row in rows:
+            row_dict = {}
+            for col, value in zip(columns, list(row)):
+                row_dict[col] = '' if col in redacted else self._make_backup_safe_value(value)
+            serialized_rows.append([row_dict.get(col) for col in columns])
+        return serialized_rows
+
     def export_backup(self, user_id: int = None) -> Dict[str, any]:
         """导出系统备份数据（支持用户隔离）"""
         with self.lock:
@@ -3216,37 +3274,37 @@ class DBManager:
                     # 备份用户的cookies
                     self._execute_sql(cursor, "SELECT * FROM cookies WHERE user_id = ?", (user_id,))
                     columns = [description[0] for description in cursor.description]
-                    rows = cursor.fetchall()
-
-                    if rows:
-                        sanitized_rows = []
-                        for row in rows:
-                            row_dict = dict(zip(columns, list(row)))
-                            if 'value' in row_dict:
-                                row_dict['value'] = ''
-                            if 'password' in row_dict:
-                                row_dict['password'] = ''
-                            sanitized_rows.append([row_dict.get(col) for col in columns])
-                        rows = sanitized_rows
+                    cookie_rows = cursor.fetchall()
+                    serialized_rows = self._serialize_backup_rows(columns, cookie_rows, {'value', 'password'})
 
                     backup_data['data']['cookies'] = {
                         'columns': columns,
-                        'rows': [list(row) for row in rows]
+                        'rows': serialized_rows
                     }
 
+                    user_scoped_tables = ['cards', 'delivery_rules', 'notification_channels', 'user_settings']
+                    for table in user_scoped_tables:
+                        self._execute_sql(cursor, f"SELECT * FROM {table} WHERE user_id = ?", (user_id,))
+                        columns = [description[0] for description in cursor.description]
+                        rows = cursor.fetchall()
+                        backup_data['data'][table] = {
+                            'columns': columns,
+                            'rows': self._serialize_backup_rows(columns, rows)
+                        }
+
                     # 备份用户cookies相关的其他数据
-                    user_cookie_ids = [row[0] for row in rows]  # 获取用户的cookie_id列表
+                    user_cookie_ids = [row[0] for row in cookie_rows]  # 获取用户的cookie_id列表
 
                     if user_cookie_ids:
                         placeholders = ','.join(['?' for _ in user_cookie_ids])
 
                         # 备份关键字
-                        cursor.execute(f"SELECT * FROM keywords WHERE cookie_id IN ({placeholders})", user_cookie_ids)
+                        self._execute_sql(cursor, f"SELECT * FROM keywords WHERE cookie_id IN ({placeholders})", tuple(user_cookie_ids))
                         columns = [description[0] for description in cursor.description]
                         rows = cursor.fetchall()
                         backup_data['data']['keywords'] = {
                             'columns': columns,
-                            'rows': [list(row) for row in rows]
+                            'rows': self._serialize_backup_rows(columns, rows)
                         }
 
                         # 备份其他相关表
@@ -3254,38 +3312,39 @@ class DBManager:
                                         'item_info', 'ai_reply_settings', 'ai_conversations', 'delivery_records']
 
                         for table in related_tables:
-                            cursor.execute(f"SELECT * FROM {table} WHERE cookie_id IN ({placeholders})", user_cookie_ids)
+                            self._execute_sql(cursor, f"SELECT * FROM {table} WHERE cookie_id IN ({placeholders})", tuple(user_cookie_ids))
                             columns = [description[0] for description in cursor.description]
                             rows = cursor.fetchall()
-                            if table == 'ai_reply_settings' and rows:
-                                sanitized_rows = []
-                                for row in rows:
-                                    row_dict = dict(zip(columns, list(row)))
-                                    if 'api_key' in row_dict:
-                                        row_dict['api_key'] = ''
-                                    sanitized_rows.append([row_dict.get(col) for col in columns])
-                                rows = sanitized_rows
                             backup_data['data'][table] = {
                                 'columns': columns,
-                                'rows': [list(row) for row in rows]
+                                'rows': self._serialize_backup_rows(
+                                    columns,
+                                    rows,
+                                    {'api_key'} if table == 'ai_reply_settings' else None
+                                )
                             }
                 else:
                     # 系统级备份：备份所有数据
                     tables = [
                         'cookies', 'keywords', 'cookie_status', 'cards',
                         'delivery_rules', 'default_replies', 'notification_channels',
-                        'message_notifications', 'system_settings', 'item_info',
+                        'message_notifications', 'system_settings', 'user_settings', 'item_info',
                         'ai_reply_settings', 'ai_conversations', 'ai_item_cache', 'delivery_records'
                     ]
 
                     for table in tables:
-                        cursor.execute(f"SELECT * FROM {table}")
+                        self._execute_sql(cursor, f"SELECT * FROM {table}")
                         columns = [description[0] for description in cursor.description]
                         rows = cursor.fetchall()
+                        redacted_fields = None
+                        if table == 'cookies':
+                            redacted_fields = {'value', 'password'}
+                        elif table == 'ai_reply_settings':
+                            redacted_fields = {'api_key'}
 
                         backup_data['data'][table] = {
                             'columns': columns,
-                            'rows': [list(row) for row in rows]
+                            'rows': self._serialize_backup_rows(columns, rows, redacted_fields)
                         }
 
                 logger.info(f"导出备份成功，用户ID: {user_id}")
@@ -3321,20 +3380,25 @@ class DBManager:
                                         'cookie_status', 'keywords', 'ai_conversations', 'ai_reply_settings', 'delivery_records']
 
                         for table in related_tables:
-                            cursor.execute(f"DELETE FROM {table} WHERE cookie_id IN ({placeholders})", user_cookie_ids)
+                            self._execute_sql(cursor, f"DELETE FROM {table} WHERE cookie_id IN ({placeholders})", tuple(user_cookie_ids))
 
-                        # 删除用户的cookies
-                        self._execute_sql(cursor, "DELETE FROM cookies WHERE user_id = ?", (user_id,))
+                    self._execute_sql(cursor, "DELETE FROM cards WHERE user_id = ?", (user_id,))
+                    self._execute_sql(cursor, "DELETE FROM delivery_rules WHERE user_id = ?", (user_id,))
+                    self._execute_sql(cursor, "DELETE FROM notification_channels WHERE user_id = ?", (user_id,))
+                    self._execute_sql(cursor, "DELETE FROM user_settings WHERE user_id = ?", (user_id,))
+                    # 删除用户的cookies
+                    self._execute_sql(cursor, "DELETE FROM cookies WHERE user_id = ?", (user_id,))
                 else:
                     # 系统级导入：清空所有数据（除了用户和管理员密码）
                     tables = [
                         'message_notifications', 'notification_channels', 'default_replies',
                         'delivery_rules', 'cards', 'item_info', 'cookie_status', 'keywords',
-                        'ai_conversations', 'ai_reply_settings', 'ai_item_cache', 'cookies', 'delivery_records'
+                        'ai_conversations', 'ai_reply_settings', 'ai_item_cache', 'cookies',
+                        'delivery_records', 'user_settings'
                     ]
 
                     for table in tables:
-                        cursor.execute(f"DELETE FROM {table}")
+                        self._execute_sql(cursor, f"DELETE FROM {table}")
 
                     # 清空系统设置（保留管理员密码）
                     self._execute_sql(cursor, "DELETE FROM system_settings WHERE key != 'admin_password_hash'")
@@ -3344,7 +3408,7 @@ class DBManager:
                 for table_name, table_data in data.items():
                     if table_name not in ['cookies', 'keywords', 'cookie_status', 'cards',
                                         'delivery_rules', 'default_replies', 'notification_channels',
-                                        'message_notifications', 'system_settings', 'item_info',
+                                        'message_notifications', 'system_settings', 'user_settings', 'item_info',
                                         'ai_reply_settings', 'ai_conversations', 'ai_item_cache', 'delivery_records']:
                         continue
 
@@ -3354,9 +3418,8 @@ class DBManager:
                     if not rows:
                         continue
 
-                    # 如果是用户级导入，需要确保cookies表的user_id正确
-                    if user_id is not None and table_name == 'cookies':
-                        # 更新所有导入的cookies的user_id
+                    # 用户级导入时，强制重写归属字段，避免脏数据串用户
+                    if user_id is not None and table_name in {'cookies', 'cards', 'delivery_rules', 'notification_channels', 'user_settings'}:
                         updated_rows = []
                         for row in rows:
                             row_dict = dict(zip(columns, row))
@@ -3371,9 +3434,13 @@ class DBManager:
                         # 系统设置需要特殊处理，避免覆盖管理员密码
                         for row in rows:
                             if len(row) >= 1 and row[0] != 'admin_password_hash':
-                                cursor.execute(f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})", row)
+                                self._execute_sql(cursor, f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})", tuple(row))
                     else:
-                        cursor.executemany(f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})", rows)
+                        self._executemany_sql(
+                            cursor,
+                            f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})",
+                            rows
+                        )
 
                 # 提交事务
                 self.conn.commit()
@@ -4029,7 +4096,7 @@ class DBManager:
                     cursor = self.conn.cursor()
                     cursor.execute('''
                     SELECT COUNT(*) FROM cards
-                    WHERE name = ? AND (is_multi_spec = 0 OR is_multi_spec IS NULL) AND user_id = ?
+                    WHERE name = ? AND (is_multi_spec = FALSE OR is_multi_spec IS NULL) AND user_id = ?
                     ''', (name, user_id))
 
                     if cursor.fetchone()[0] > 0:
@@ -4062,6 +4129,7 @@ class DBManager:
                 return card_id
             except Exception as e:
                 logger.error(f"创建卡券失败: {e}")
+                self._rollback_quietly()
                 raise
 
     def get_all_cards(self, user_id: int = None):
@@ -4180,8 +4248,8 @@ class DBManager:
                    api_config=None, text_content: str = None, data_content: str = None,
                    image_url: str = None, description: str = None, enabled: bool = None,
                    delay_seconds: int = None, is_multi_spec: bool = None, spec_name: str = None,
-                   spec_value: str = None):
-        """更新卡券"""
+                   spec_value: str = None, user_id: int = None):
+        """更新卡券（支持用户隔离）"""
         with self.lock:
             try:
                 # 处理api_config参数
@@ -4243,11 +4311,14 @@ class DBManager:
                 params.append(card_id)
 
                 sql = f"UPDATE cards SET {', '.join(update_fields)} WHERE id = ?"
+                if user_id is not None:
+                    sql += " AND user_id = ?"
+                    params.append(user_id)
                 self._execute_sql(cursor, sql, params)
 
                 if cursor.rowcount > 0:
                     self.conn.commit()
-                    logger.info(f"更新卡券成功: ID {card_id}")
+                    logger.info(f"更新卡券成功: ID {card_id} (用户ID: {user_id})")
                     return True
                 else:
                     return False  # 没有找到对应的记录
@@ -4746,9 +4817,9 @@ class DBManager:
                            c.is_multi_spec, c.spec_name, c.spec_value
                     FROM delivery_rules dr
                     LEFT JOIN cards c ON dr.card_id = c.id
-                    WHERE dr.enabled = 1 AND c.enabled = 1
+                    WHERE dr.enabled = TRUE AND c.enabled = TRUE
                     AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
-                    AND c.is_multi_spec = 1 AND c.spec_name = ? AND c.spec_value = ?
+                    AND c.is_multi_spec = TRUE AND c.spec_name = ? AND c.spec_value = ?
                     ORDER BY
                         CASE
                             WHEN ? LIKE '%' || dr.keyword || '%' THEN LENGTH(dr.keyword)
@@ -4804,9 +4875,9 @@ class DBManager:
                        c.is_multi_spec, c.spec_name, c.spec_value
                 FROM delivery_rules dr
                 LEFT JOIN cards c ON dr.card_id = c.id
-                WHERE dr.enabled = 1 AND c.enabled = 1
+                WHERE dr.enabled = TRUE AND c.enabled = TRUE
                 AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
-                AND (c.is_multi_spec = 0 OR c.is_multi_spec IS NULL)
+                AND (c.is_multi_spec = FALSE OR c.is_multi_spec IS NULL)
                 ORDER BY
                     CASE
                         WHEN ? LIKE '%' || dr.keyword || '%' THEN LENGTH(dr.keyword)
@@ -4931,9 +5002,9 @@ class DBManager:
                            c.is_multi_spec, c.spec_name, c.spec_value
                     FROM delivery_rules dr
                     LEFT JOIN cards c ON dr.card_id = c.id
-                    WHERE dr.enabled = 1 AND c.enabled = 1
+                    WHERE dr.enabled = TRUE AND c.enabled = TRUE
                     AND dr.item_id = ?
-                    AND c.is_multi_spec = 1 AND c.spec_name = ? AND c.spec_value = ?
+                    AND c.is_multi_spec = TRUE AND c.spec_name = ? AND c.spec_value = ?
                     ORDER BY dr.delivery_times ASC, dr.id ASC
                     ''', (item_id, spec_name, spec_value))
 
@@ -5024,16 +5095,19 @@ class DBManager:
                 logger.error(f"根据商品ID和规格获取发货规则失败: {e}")
                 return []
 
-    def delete_card(self, card_id: int):
-        """删除卡券"""
+    def delete_card(self, card_id: int, user_id: int = None):
+        """删除卡券（支持用户隔离）"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                self._execute_sql(cursor, "DELETE FROM cards WHERE id = ?", (card_id,))
+                if user_id is not None:
+                    self._execute_sql(cursor, "DELETE FROM cards WHERE id = ? AND user_id = ?", (card_id, user_id))
+                else:
+                    self._execute_sql(cursor, "DELETE FROM cards WHERE id = ?", (card_id,))
 
                 if cursor.rowcount > 0:
                     self.conn.commit()
-                    logger.info(f"删除卡券成功: ID {card_id}")
+                    logger.info(f"删除卡券成功: ID {card_id} (用户ID: {user_id})")
                     return True
                 else:
                     return False  # 没有找到对应的记录

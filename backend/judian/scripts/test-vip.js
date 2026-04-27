@@ -200,6 +200,8 @@ batch 参数:
   --count <n>               批量数量；缺省时会在终端提示输入
   --autopay-output <path>   批量支付结果输出文件，默认当前目录自动命名
   --progress-jsonl          输出机器可读进度事件，供后端实时同步
+  --create-retry <n>        创建订单遇到限流时的最大重试次数，默认 3
+  --create-retry-interval-ms <ms> 创建订单限流重试间隔，默认 1200
   --confirm-buy             确认执行 batch，避免误下单
 
 autopay 参数:
@@ -210,7 +212,9 @@ autopay 参数:
   --batch-output <path>     批量支付结果输出文件，默认当前目录自动命名
   --batch-interval-ms <ms>  批量支付每笔间隔，默认 0
   --stop-on-error           批量支付遇错后立即停止
-  --remote-token <token>    复用 Android 远端 token，缺省则用 --account/--password 登录
+  --remote-token <token>    复用 Android 远端 token，缺省则用 --remote-account/--remote-password 登录
+  --remote-account <name>   聚点付款账号，仅在远端 token 失效时用于重登
+  --remote-password <pwd>   聚点付款密码，仅在远端 token 失效时用于重登
   --settle-attempts <n>     支付后轮询余额/订单次数，默认 8
   --settle-interval-ms <ms> 支付后轮询间隔，默认 1000
   --query-retry <n>         解析 tradeNo 时每个候选重试次数，默认 2
@@ -333,6 +337,64 @@ function emitBatchProgressResult(args, result) {
     return;
   }
   console.log(`${BATCH_PROGRESS_RESULT_PREFIX}${JSON.stringify(result)}`);
+}
+
+function hasLoginCredentials(account, password) {
+  return Boolean(String(account ?? "").trim() && String(password ?? "").trim());
+}
+
+function getRemoteLoginCredentials(args) {
+  return {
+    account: String(args?.["remote-account"] ?? "").trim(),
+    password: String(args?.["remote-password"] ?? "").trim(),
+  };
+}
+
+function classifyBatchErrorSource(message, fallback = "unknown") {
+  const text = String(message || "").trim();
+  if (!text) {
+    return fallback;
+  }
+  if (
+    [
+      "聚点",
+      "钻石",
+      "tradeNo",
+      "orderNo",
+      "未登录",
+      "登录失效",
+      "token失效",
+      "请登录",
+      "验证码登录",
+      "异地登录",
+    ].some((keyword) => text.includes(keyword))
+  ) {
+    return "judian";
+  }
+  if (
+    [
+      "vip_id",
+      "套餐",
+      "/pc/",
+      "最近播放记录",
+      "动漫共和国",
+      "创建订单",
+      "下单",
+    ].some((keyword) => text.includes(keyword))
+  ) {
+    return "dmghg";
+  }
+  return fallback;
+}
+
+function emitBatchDiagnostic(args, source, stage, message, extra = {}) {
+  emitBatchProgressEvent(args, {
+    type: "diagnostic",
+    source: String(source || "unknown").trim() || "unknown",
+    stage: String(stage || "unknown").trim() || "unknown",
+    message: String(message || "").trim(),
+    ...extra,
+  });
 }
 
 function writeJsonFile(filePath, payload) {
@@ -555,13 +617,8 @@ function isPublicOrderPayloadSuccess(payload) {
   if (!Object.keys(orderData).length) {
     return false;
   }
-  const message = pickText(
-    payloadDict.msg,
-    payloadDict.message,
-    payloadDict.data?.msg,
-    payloadDict.data?.message,
-  );
-  const codeText = pickText(payloadDict.code, payloadDict.status).toLowerCase();
+  const message = getPublicOrderPayloadMessage(payloadDict);
+  const codeText = getPublicOrderPayloadCode(payloadDict).toLowerCase();
   if (payloadDict.success === false) {
     return false;
   }
@@ -584,6 +641,68 @@ function isPublicOrderPayloadSuccess(payload) {
   return !["失败", "错误", "不存在", "无效", "失效", "异地登录", "未登录"].some(
     (keyword) => message.includes(keyword),
   );
+}
+
+function getPublicOrderPayloadMessage(payload) {
+  const payloadDict = dictLike(payload);
+  return pickText(
+    payloadDict.msg,
+    payloadDict.message,
+    payloadDict.data?.msg,
+    payloadDict.data?.message,
+  );
+}
+
+function getPublicOrderPayloadCode(payload) {
+  const payloadDict = dictLike(payload);
+  return pickText(
+    payloadDict.code,
+    payloadDict.status,
+    payloadDict.data?.code,
+    payloadDict.data?.status,
+  );
+}
+
+function isCreateVipOrderRateLimited(source) {
+  const payload = dictLike(source?.createResult ?? source?.payload ?? source);
+  const codeText = getPublicOrderPayloadCode(payload);
+  const message = getPublicOrderPayloadMessage(payload);
+  return (
+    codeText === "429209" ||
+    message.includes("操作过于频繁") ||
+    message.includes("过于频繁")
+  );
+}
+
+function buildCreateVipOrderError(createResult, orderInfo = {}) {
+  const codeText = getPublicOrderPayloadCode(createResult);
+  const message = getPublicOrderPayloadMessage(createResult);
+  const missingFields = [];
+  if (!orderInfo.orderNo) {
+    missingFields.push("orderNo");
+  }
+  if (!orderInfo.scanUrl) {
+    missingFields.push("scanUrl");
+  }
+
+  const details = [];
+  if (codeText) {
+    details.push(`code=${codeText}`);
+  }
+  if (message) {
+    details.push(`message=${message}`);
+  }
+  if (missingFields.length) {
+    details.push(`缺少 ${missingFields.join("/")}`);
+  }
+
+  const error = new Error(
+    details.length ? `创建订单失败: ${details.join(", ")}` : "创建订单失败",
+  );
+  error.code = codeText;
+  error.createResult = createResult;
+  error.rateLimited = isCreateVipOrderRateLimited(createResult);
+  return error;
 }
 
 function appendUniqueText(items, ...values) {
@@ -785,15 +904,41 @@ async function remoteLoginWithPassword(account, password) {
 }
 
 async function ensureRemoteAutoPaySession(args, debugAutoPay = false) {
-  if (args["remote-token"]) {
-    return {
-      context: createRemoteContext(args["remote-token"]),
+  const remoteToken = String(args["remote-token"] ?? "").trim();
+  const remoteCredentials = getRemoteLoginCredentials(args);
+  if (remoteToken) {
+    const tokenSession = {
+      context: createRemoteContext(remoteToken),
       loginResult: null,
-      remoteToken: String(args["remote-token"]).trim(),
+      remoteToken,
     };
+    try {
+      await remoteGetFund(tokenSession.context);
+      return tokenSession;
+    } catch (error) {
+      printAutoPayDebug(debugAutoPay, "REMOTE_TOKEN_ERROR", {
+        message: error.message,
+        hasFallbackCredentials: hasLoginCredentials(
+          remoteCredentials.account,
+          remoteCredentials.password,
+        ),
+      });
+      if (
+        !hasLoginCredentials(
+          remoteCredentials.account,
+          remoteCredentials.password,
+        ) ||
+        !shouldRefreshRemoteSession(error.message)
+      ) {
+        throw error;
+      }
+    }
   }
 
-  const credentials = getLoginCredentials(args.account, args.password);
+  const credentials = getLoginCredentials(
+    remoteCredentials.account,
+    remoteCredentials.password,
+  );
   try {
     const loginResult = await remoteLoginWithPassword(
       credentials.account,
@@ -2098,6 +2243,21 @@ function extractBuyOrderInfo(result) {
   };
 }
 
+function ensureCreateVipOrderReady(createResult) {
+  const orderInfo = extractBuyOrderInfo(createResult);
+  const codeText = getPublicOrderPayloadCode(createResult);
+  const payloadOk = isPublicOrderPayloadSuccess(createResult);
+  if (
+    !payloadOk ||
+    codeText !== "20000" ||
+    !orderInfo.orderNo ||
+    !orderInfo.scanUrl
+  ) {
+    throw buildCreateVipOrderError(createResult, orderInfo);
+  }
+  return orderInfo;
+}
+
 function summarizeRemoteLogin(loginResult) {
   if (!loginResult) {
     return null;
@@ -2120,17 +2280,12 @@ function summarizeRemoteLogin(loginResult) {
 }
 
 function summarizeCreateResult(createResult) {
+  const orderInfo = extractBuyOrderInfo(createResult);
   return {
-    code: createResult?.code ?? null,
-    message: pickText(createResult?.message, createResult?.msg),
-    orderNo: pickText(
-      createResult?.data?.order_no,
-      createResult?.data?.orderNo,
-      findFirstStringByKeys(createResult?.data, ["order_no", "orderNo"]),
-    ),
-    scanUrl: sanitizeUrlLike(
-      pickText(createResult?.data?.qr_code, createResult?.data?.qrCode),
-    ),
+    code: getPublicOrderPayloadCode(createResult) || null,
+    message: getPublicOrderPayloadMessage(createResult),
+    orderNo: orderInfo.orderNo,
+    scanUrl: orderInfo.scanUrl,
     diamond: Number(createResult?.data?.diamond ?? 0) || 0,
     amount: Number(createResult?.data?.amount ?? 0) || 0,
     expireAt: pickText(
@@ -2182,12 +2337,17 @@ function summarizeBatchBuyOrder(item) {
     return {
       index: Number(item.index ?? 0) || 0,
       ok: false,
+      createAttempts: Number(item.createAttempts ?? 0) || 0,
+      orderNo: pickText(item.orderNo),
+      scanUrl: sanitizeUrlLike(item.scanUrl),
       error: pickText(item.error),
+      createResult: summarizeCreateResult(item.createResult),
     };
   }
   return {
     index: Number(item.index ?? 0) || 0,
     ok: true,
+    createAttempts: Number(item.createAttempts ?? 0) || 0,
     orderNo: pickText(item.orderNo),
     scanUrl: sanitizeUrlLike(item.scanUrl),
     createResult: summarizeCreateResult(item.createResult),
@@ -2267,7 +2427,19 @@ async function resolveVipId(host, token, vipId) {
 }
 
 async function buildBatchPurchasePlan(host, token, vipId, count, args) {
-  const plans = await fetchVipPlans(host, token);
+  let plans;
+  try {
+    plans = await fetchVipPlans(host, token);
+  } catch (error) {
+    emitBatchDiagnostic(
+      args,
+      "dmghg",
+      "vip_plan_fetch",
+      `动漫共和国套餐查询失败: ${error.message}`,
+      { vipId, count },
+    );
+    throw error;
+  }
   const selectedPlan = findVipPlanById(plans, vipId);
   if (!selectedPlan) {
     throw new Error(`未找到 vip_id=${vipId} 的套餐，无法预估钻石消耗`);
@@ -2280,11 +2452,46 @@ async function buildBatchPurchasePlan(host, token, vipId, count, args) {
     );
   }
 
-  const remoteSession = await ensureRemoteAutoPaySession(
-    args,
-    Boolean(args["debug-autopay"]),
-  );
-  const fundResult = await remoteGetFund(remoteSession.context);
+  let remoteSession;
+  try {
+    remoteSession = await ensureRemoteAutoPaySession(
+      args,
+      Boolean(args["debug-autopay"]),
+    );
+    emitBatchDiagnostic(
+      args,
+      "judian",
+      "remote_session_ready",
+      remoteSession.loginResult
+        ? "聚点远端登录成功，已切换到新会话"
+        : "已复用聚点远端 token",
+      {
+        loginMode: remoteSession.loginResult ? "password_login" : "saved_token",
+      },
+    );
+  } catch (error) {
+    emitBatchDiagnostic(
+      args,
+      "judian",
+      "remote_session",
+      `聚点会话初始化失败: ${error.message}`,
+      { vipId, count },
+    );
+    throw error;
+  }
+  let fundResult;
+  try {
+    fundResult = await remoteGetFund(remoteSession.context);
+  } catch (error) {
+    emitBatchDiagnostic(
+      args,
+      "judian",
+      "remote_fund",
+      `聚点余额查询失败: ${error.message}`,
+      { vipId, count },
+    );
+    throw error;
+  }
   const availableDiamond = fundResult.diamondQuantity;
   const requiredDiamond = unitDiamond * count;
 
@@ -2303,6 +2510,11 @@ async function buildBatchPurchasePlan(host, token, vipId, count, args) {
 async function runBatchBuyFlow(host, token, payload, args) {
   const count = Math.max(1, Number(args.count ?? 1));
   const intervalMs = Math.max(0, Number(args["batch-interval-ms"] ?? 0));
+  const createRetry = Math.max(1, Number(args["create-retry"] ?? 3));
+  const createRetryIntervalMs = Math.max(
+    0,
+    Number(args["create-retry-interval-ms"] ?? 1200),
+  );
   const stopOnError = Boolean(args["stop-on-error"]);
   const outputFile = resolveBatchOutputPath(args["batch-output"], "vip-orders");
   const orders = [];
@@ -2315,38 +2527,69 @@ async function runBatchBuyFlow(host, token, payload, args) {
 
   for (let index = 1; index <= count; index += 1) {
     try {
-      const createResult = await createVipOrder(host, token, payload);
-      const { orderNo, scanUrl } = extractBuyOrderInfo(createResult);
+      const createAttempt = await createVipOrderWithRetry(
+        host,
+        token,
+        payload,
+        {
+          maxAttempts: createRetry,
+          retryIntervalMs: createRetryIntervalMs,
+          onRetry: ({ attempt, maxAttempts, error }) => {
+            console.error(
+              `批量下单 ${index}/${count} 命中限流，${createRetryIntervalMs}ms 后重试 (${attempt}/${maxAttempts}): ${error.message}`,
+            );
+          },
+        },
+      );
+      const { orderNo, scanUrl, createResult } = createAttempt;
       orders.push({
         index,
         ok: true,
+        createAttempts: createAttempt.attempt,
         orderNo,
         scanUrl,
         createResult,
       });
       console.error(
-        `批量下单 ${index}/${count} 成功: ${orderNo || "无订单号"}`,
+        `批量下单 ${index}/${count} 成功: ${orderNo || "无订单号"}${createAttempt.attempt > 1 ? ` (重试 ${createAttempt.attempt - 1} 次)` : ""}`,
       );
       emitBatchProgressEvent(args, {
         type: "buy_item",
         index,
         total: count,
         ok: true,
+        createAttempts: createAttempt.attempt,
         orderNo,
         scanUrl: sanitizeUrlLike(scanUrl),
       });
     } catch (error) {
+      const failedCreateResult = error?.createResult ?? null;
+      const failedOrderInfo = extractBuyOrderInfo(failedCreateResult);
       orders.push({
         index,
         ok: false,
+        createAttempts: Number(error?.attempt ?? 1) || 1,
+        orderNo: failedOrderInfo.orderNo,
+        scanUrl: failedOrderInfo.scanUrl,
         error: error.message,
+        createResult: failedCreateResult,
       });
+      emitBatchDiagnostic(
+        args,
+        "dmghg",
+        "create_order",
+        `动漫共和国创建订单失败: ${error.message}`,
+        { index, total: count },
+      );
       console.error(`批量下单 ${index}/${count} 失败: ${error.message}`);
       emitBatchProgressEvent(args, {
         type: "buy_item",
         index,
         total: count,
         ok: false,
+        createAttempts: Number(error?.attempt ?? 1) || 1,
+        orderNo: failedOrderInfo.orderNo,
+        scanUrl: sanitizeUrlLike(failedOrderInfo.scanUrl),
         error: error.message,
       });
       if (stopOnError) {
@@ -2482,6 +2725,18 @@ async function runBatchAutoPayItems(sourceItems, args, options = {}) {
         scanUrl: sanitizeUrlLike(scanUrl),
         error: error.message,
       });
+      emitBatchDiagnostic(
+        args,
+        "judian",
+        "autopay",
+        `聚点自动支付失败: ${error.message}`,
+        {
+          index: index + 1,
+          total: sourceItems.length,
+          orderNo,
+          scanUrl: sanitizeUrlLike(scanUrl),
+        },
+      );
       console.error(
         `批量支付 ${index + 1}/${sourceItems.length} 失败: ${error.message}`,
       );
@@ -2716,6 +2971,48 @@ async function createVipOrder(host, token, payload) {
   });
 }
 
+async function createVipOrderWithRetry(host, token, payload, options = {}) {
+  const maxAttempts = Math.max(1, Number(options.maxAttempts ?? 3));
+  const retryIntervalMs = Math.max(0, Number(options.retryIntervalMs ?? 1200));
+  const onRetry =
+    typeof options.onRetry === "function" ? options.onRetry : null;
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const createResult = await createVipOrder(host, token, payload);
+      const orderInfo = ensureCreateVipOrderReady(createResult);
+      return {
+        attempt,
+        createResult,
+        ...orderInfo,
+      };
+    } catch (error) {
+      if (!error.createResult && error.payload) {
+        error.createResult = error.payload;
+      }
+      error.attempt = attempt;
+      lastError = error;
+      if (!isCreateVipOrderRateLimited(error) || attempt >= maxAttempts) {
+        throw error;
+      }
+      if (onRetry) {
+        onRetry({
+          attempt,
+          maxAttempts,
+          retryIntervalMs,
+          error,
+        });
+      }
+      if (retryIntervalMs > 0) {
+        await delay(retryIntervalMs);
+      }
+    }
+  }
+
+  throw lastError || new Error("创建订单失败");
+}
+
 async function runBuyPaymentFlow(host, token, payload, options = {}) {
   const watchTimeoutMs = Number(options.watchTimeoutMs ?? 15000);
   const unlockTimeoutMs = Number(options.unlockTimeoutMs ?? 20000);
@@ -2727,7 +3024,7 @@ async function runBuyPaymentFlow(host, token, payload, options = {}) {
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const createResult = await createVipOrder(host, token, payload);
-    const { orderNo, scanUrl } = extractBuyOrderInfo(createResult);
+    const { orderNo, scanUrl } = ensureCreateVipOrderReady(createResult);
     const attemptResult = {
       attempt,
       createResult,
@@ -3362,51 +3659,68 @@ async function run() {
   }
 
   if (action === "batch") {
-    if (!args["confirm-buy"]) {
-      throw new Error("batch 操作默认拦截，请显式加上 --confirm-buy");
-    }
-    const finalToken = await ensureToken(
-      host,
-      token,
-      args.account,
-      args.password,
-    );
-    const vipSelection = await resolveVipId(host, finalToken, args["vip-id"]);
-    const vipId = vipSelection.vipId;
-    if (vipSelection.autoSelected) {
-      console.error(
-        `已自动选择默认套餐: vip_id=${vipId} (${vipSelection.plan?.title ?? "unknown"})`,
-      );
-    }
-    if (!jsonPayload) {
-      Object.assign(args, await resolveVipOrderContext(host, finalToken, args));
-    }
-    if (!jsonPayload && args["v-id"] && args.player && args.part) {
-      console.error(
-        `\n已自动带入最近播放记录: v_id=${args["v-id"]}, player=${args.player}, part=${args.part}`,
-      );
-    }
-    if (!jsonPayload && (!args["v-id"] || !args.player || !args.part)) {
-      if (process.stdin.isTTY || args["interactive-buy"]) {
-        Object.assign(args, await promptVipOrderContext(args));
+    try {
+      if (!args["confirm-buy"]) {
+        throw new Error("batch 操作默认拦截，请显式加上 --confirm-buy");
       }
-    }
+      const finalToken = await ensureToken(
+        host,
+        token,
+        args.account,
+        args.password,
+      );
+      const vipSelection = await resolveVipId(host, finalToken, args["vip-id"]);
+      const vipId = vipSelection.vipId;
+      if (vipSelection.autoSelected) {
+        console.error(
+          `已自动选择默认套餐: vip_id=${vipId} (${vipSelection.plan?.title ?? "unknown"})`,
+        );
+      }
+      if (!jsonPayload) {
+        Object.assign(
+          args,
+          await resolveVipOrderContext(host, finalToken, args),
+        );
+      }
+      if (!jsonPayload && args["v-id"] && args.player && args.part) {
+        console.error(
+          `\n已自动带入最近播放记录: v_id=${args["v-id"]}, player=${args.player}, part=${args.part}`,
+        );
+      }
+      if (!jsonPayload && (!args["v-id"] || !args.player || !args.part)) {
+        if (process.stdin.isTTY || args["interactive-buy"]) {
+          Object.assign(args, await promptVipOrderContext(args));
+        }
+      }
 
-    const payload = jsonPayload ?? buildBuyPayload(args, vipId);
-    if (!jsonPayload) {
-      validateBuyPayload(payload);
-    }
+      const payload = jsonPayload ?? buildBuyPayload(args, vipId);
+      if (!jsonPayload) {
+        validateBuyPayload(payload);
+      }
 
-    const result = await runBatchCreateAndAutoPayFlow(
-      host,
-      finalToken,
-      payload,
-      args,
-    );
-    emitBatchProgressResult(args, result);
-    printResult(result, pretty);
-    printBatchCreateAndAutoPaySummary(result);
-    return;
+      const result = await runBatchCreateAndAutoPayFlow(
+        host,
+        finalToken,
+        payload,
+        args,
+      );
+      emitBatchProgressResult(args, result);
+      printResult(result, pretty);
+      printBatchCreateAndAutoPaySummary(result);
+      return;
+    } catch (error) {
+      const errorSource = classifyBatchErrorSource(error.message, "unknown");
+      emitBatchDiagnostic(args, errorSource, "batch_exception", error.message);
+      emitBatchProgressResult(args, {
+        ok: false,
+        mode: "batch_create_and_autopay",
+        phase: "exception",
+        errorSource,
+        message: error.message,
+        count: Math.max(1, Number(args.count ?? 1)),
+      });
+      throw error;
+    }
   }
 
   if (action === "autopay") {

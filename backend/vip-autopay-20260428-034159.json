@@ -1,0 +1,54 @@
+{
+  "ok": true,
+  "mode": "batch_autopay",
+  "count": 1,
+  "successCount": 1,
+  "failedCount": 0,
+  "intervalMs": 0,
+  "stopOnError": false,
+  "sourceFile": "D:\\hms\\Desktop\\整合项目\\_git_push_clone_20260427\\backend\\vip-orders-20260428-034159.json",
+  "outputFile": "D:\\hms\\Desktop\\整合项目\\_git_push_clone_20260427\\backend\\vip-autopay-20260428-034159.json",
+  "items": [
+    {
+      "index": 1,
+      "ok": true,
+      "orderNo": "20260428034159332420020126",
+      "scanUrl": "http://64.120.95.181:2026/pc/order/scan/20260428034159332420020126?jdTokenNo=20260428034159332420020126",
+      "result": {
+        "ok": true,
+        "pending": false,
+        "settledByPolling": false,
+        "tradeNo": "AI390000202604280342002610736",
+        "orderNo": "20260428034159332420020126",
+        "beforeDiamond": 31385,
+        "afterDiamond": 31380,
+        "consumedDiamond": 5,
+        "login": {
+          "accessTime": "2026-04-28 03:41:59",
+          "expireTime": "2026-05-13 03:41:59",
+          "isRegister": false
+        },
+        "scanResult": {
+          "status": "ok",
+          "message": "扫码页返回跳转脚本",
+          "tradeNo": "AI390000202604280342002610736"
+        },
+        "orderInfo": {
+          "diamond": 5,
+          "status": 1,
+          "orderNo": "20260428034159332420020126",
+          "tradeNo": "AI390000202604280342002610736",
+          "remark": "购买1天 VIP",
+          "createTime": "2026-04-28 03:42:00"
+        },
+        "beforeFund": 31385,
+        "afterFund": 31380,
+        "remoteUser": {
+          "id": 251717,
+          "account": "2159620595m@gmail.com",
+          "nickName": "US1857342"
+        }
+      }
+    }
+  ]
+}
