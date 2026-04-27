@@ -1,9 +1,6 @@
 services:
   xianyu-app:
-<<<<<<< HEAD
-    # ✅ 从阿里云 ACR 拉取（国内速度快），不在服务器本地 build
-=======
->>>>>>> 1835944 (chore: sync docker and deploy config)
+    # 从阿里云 ACR 拉取（国内速度快），不在服务器本地 build
     image: crpi-pkla7gt01j0vnny1.cn-guangzhou.personal.cr.aliyuncs.com/2159620595_xianyu/xianyu:latest
     container_name: xianyu-auto-reply
     restart: unless-stopped
@@ -25,16 +22,12 @@ services:
       - RELOAD=${RELOAD:-false}
       - API_HOST=${API_HOST:-0.0.0.0}
       - API_PORT=${API_PORT:-8080}
-<<<<<<< HEAD
-      - LOCAL_ONLY_MODE=${LOCAL_ONLY_MODE:-true}
-=======
       - LOCAL_ONLY_MODE=${LOCAL_ONLY_MODE:-false}
       # 数据库配置
       - DATABASE_URL=${DATABASE_URL:-}
       - DATABASE_URL_ECO=${DATABASE_URL_ECO:-}
       - DATABASE_URL_XIANYU=${DATABASE_URL_XIANYU:-}
       # SQL日志
->>>>>>> 1835944 (chore: sync docker and deploy config)
       - SQL_LOG_ENABLED=${SQL_LOG_ENABLED:-true}
       - SQL_LOG_LEVEL=${SQL_LOG_LEVEL:-INFO}
       # 管理员配置
@@ -42,11 +35,8 @@ services:
       - ADMIN_PASSWORD=${ADMIN_PASSWORD}
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
       - SESSION_TIMEOUT=${SESSION_TIMEOUT:-3600}
-<<<<<<< HEAD
-=======
       - LOGIN_CAPTCHA_ENABLED=${LOGIN_CAPTCHA_ENABLED:-false}
       # 多用户系统
->>>>>>> 1835944 (chore: sync docker and deploy config)
       - MULTIUSER_ENABLED=${MULTIUSER_ENABLED:-true}
       - USER_REGISTRATION_ENABLED=${USER_REGISTRATION_ENABLED:-true}
       - EMAIL_VERIFICATION_ENABLED=${EMAIL_VERIFICATION_ENABLED:-true}
@@ -58,10 +48,7 @@ services:
       - AUTO_DELIVERY_TIMEOUT=${AUTO_DELIVERY_TIMEOUT:-30}
       - API_CARD_TIMEOUT=${API_CARD_TIMEOUT:-10}
       - BATCH_DATA_LOCK_TIMEOUT=${BATCH_DATA_LOCK_TIMEOUT:-5}
-<<<<<<< HEAD
-=======
       # AI配置
->>>>>>> 1835944 (chore: sync docker and deploy config)
       - AI_REPLY_ENABLED=${AI_REPLY_ENABLED:-false}
       - DEFAULT_AI_MODEL=${DEFAULT_AI_MODEL:-qwen-plus}
       - DEFAULT_AI_BASE_URL=${DEFAULT_AI_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
