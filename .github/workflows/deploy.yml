@@ -31,6 +31,8 @@ jobs:
             --exclude='./.git' \
             --exclude='./.github' \
             --exclude='./backend/__pycache__' \
+            --exclude='./backend/.pytest_cache' \
+            --exclude='./backend/.mypy_cache' \
             --exclude='./backend/data' \
             --exclude='./backend/logs' \
             --exclude='./backend/backups' \
@@ -45,6 +47,27 @@ jobs:
             Dockerfile \
             docker-compose.yml \
             .dockerignore
+
+          echo "Release archive size:"
+          ls -lh "$RELEASE_ARCHIVE"
+
+          echo "Validate required files in release archive..."
+          required_files=(
+            "backend/requirements.txt"
+            "backend/entrypoint.sh"
+            "backend/judian/scripts/package.json"
+            "backend/judian/scripts/package-lock.json"
+            "Dockerfile"
+            "docker-compose.yml"
+            ".dockerignore"
+          )
+          for file in "${required_files[@]}"; do
+            if ! tar -tzf "$RELEASE_ARCHIVE" "$file" >/dev/null 2>&1; then
+              echo "发布包缺少关键文件: $file"
+              exit 1
+            fi
+          done
+          echo "Release archive validation passed."
 
       - name: Upload release bundle to server
         uses: appleboy/scp-action@v0.1.7
