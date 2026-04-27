@@ -1,7 +1,6 @@
 import { createRouter, createWebHistory } from "vue-router";
 import AppLayout from "@/components/layout/AppLayout.vue";
 import LoginView from "@/views/auth/LoginView.vue";
-import RegisterView from "@/views/auth/RegisterView.vue";
 import DashboardView from "@/views/dashboard/DashboardView.vue";
 import AccountsView from "@/views/accounts/AccountsView.vue";
 import CardsView from "@/views/cards/CardsView.vue";
@@ -279,7 +278,7 @@ const router = createRouter({
     {
       path: "/register",
       name: "register",
-      component: RegisterView,
+      redirect: "/login",
       meta: { public: true },
     },
     {

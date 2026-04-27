@@ -2,16 +2,13 @@
 import { computed, onMounted, ref } from "vue";
 import {
   Delete,
-  DocumentCopy,
   Plus,
   RefreshRight,
   Search,
-  TopRight,
   UserFilled,
 } from "@element-plus/icons-vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { deleteUser, getUsers } from "@/api/admin";
-import { getRegistrationStatus } from "@/api/auth";
 import { useAuthStore } from "@/stores/auth";
 import type { User } from "@/types";
 
@@ -22,7 +19,6 @@ const keyword = ref("");
 const roleFilter = ref("");
 const deletingUserId = ref<number | null>(null);
 const createUserDialogVisible = ref(false);
-const registrationEnabled = ref(true);
 const users = ref<User[]>([]);
 
 const filteredUsers = computed(() => {
@@ -119,28 +115,8 @@ const loadUsers = async () => {
   }
 };
 
-const registerUrl = computed(() => {
-  if (typeof window === "undefined") {
-    return "/register";
-  }
-  return `${window.location.origin}/register`;
-});
-
 const openCreateUserDialog = () => {
   createUserDialogVisible.value = true;
-};
-
-const handleOpenRegisterPage = () => {
-  window.open("/register", "_blank", "noopener,noreferrer");
-};
-
-const handleCopyRegisterLink = async () => {
-  try {
-    await navigator.clipboard.writeText(registerUrl.value);
-    ElMessage.success("注册链接已复制");
-  } catch {
-    ElMessage.error("复制失败，请手动复制");
-  }
 };
 
 const handleDelete = async (userId: number) => {
@@ -182,12 +158,6 @@ const handleDelete = async (userId: number) => {
 };
 
 onMounted(async () => {
-  try {
-    const result = await getRegistrationStatus();
-    registrationEnabled.value = result.enabled;
-  } catch {
-    registrationEnabled.value = true;
-  }
   await loadUsers();
 });
 </script>
@@ -272,9 +242,7 @@ onMounted(async () => {
           </div>
         </div>
         <div class="toolbar-tags">
-          <el-tag type="primary" effect="plain"
-            >注册新增仍以公开注册页为主</el-tag
-          >
+          <el-tag type="info" effect="plain">当前不开放公开注册</el-tag>
           <el-tag type="warning" effect="plain"
             >删除用户会同步清理关联数据</el-tag
           >
@@ -348,7 +316,7 @@ onMounted(async () => {
       <div class="tip-card">
         <el-icon><UserFilled /></el-icon>
         <span>
-          当前登录管理员账号不可自删；如需新增用户，可通过注册入口自助创建，管理员页负责巡检、筛选和清理异常用户。
+          当前登录管理员账号不可自删；当前版本不开放公开注册，管理员页负责巡检、筛选和清理异常用户。
         </span>
       </div>
     </el-card>
@@ -361,44 +329,24 @@ onMounted(async () => {
     >
       <div class="create-user-guide">
         <el-alert
-          :title="
-            registrationEnabled
-              ? '当前系统已开启注册功能'
-              : '当前系统已关闭公开注册'
-          "
-          :type="registrationEnabled ? 'success' : 'warning'"
+          title="当前系统已关闭公开注册"
+          type="warning"
           :closable="false"
           show-icon
         />
 
         <div class="guide-block">
-          <div class="guide-title">推荐方式</div>
+          <div class="guide-title">当前状态</div>
           <div class="guide-text">
-            用户通过注册页完成邮箱验证后即可创建账号，创建完成后会自动出现在当前列表中。
+            登录页和公开注册页都已收起，前台用户无法再通过注册链接自助创建账号。
           </div>
         </div>
 
         <div class="guide-block">
-          <div class="guide-title">注册链接</div>
-          <el-input :model-value="registerUrl" readonly />
-        </div>
-
-        <div class="guide-actions">
-          <el-button :icon="DocumentCopy" @click="handleCopyRegisterLink">
-            复制链接
-          </el-button>
-          <el-button
-            type="primary"
-            :icon="TopRight"
-            :disabled="!registrationEnabled"
-            @click="handleOpenRegisterPage"
-          >
-            打开注册页
-          </el-button>
-        </div>
-
-        <div class="guide-tip">
-          若你希望后台直接新增/编辑用户，需要后端补充管理接口；目前前端已提供最顺手的注册引导流程。
+          <div class="guide-title">新增用户</div>
+          <div class="guide-text">
+            如需继续提供管理员创建用户能力，需要后端补充管理接口，或由你指定新的后台新增方案。
+          </div>
         </div>
       </div>
     </el-dialog>

@@ -1844,9 +1844,6 @@ class SystemSettingCreateIn(BaseModel):
 
 @app.get("/cookies")
 def list_cookies(current_user: Dict[str, Any] = Depends(get_current_user)):
-    if cookie_manager.manager is None:
-        return []
-
     # 获取当前用户的cookies
     user_id = current_user['user_id']
     from db_manager import db_manager
@@ -1857,17 +1854,18 @@ def list_cookies(current_user: Dict[str, Any] = Depends(get_current_user)):
 @app.get("/cookies/details")
 def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取所有Cookie的详细信息（包括值和状态）"""
-    if cookie_manager.manager is None:
-        return []
-
     # 获取当前用户的cookies
     user_id = current_user['user_id']
     from db_manager import db_manager
     user_cookies = db_manager.get_all_cookies(user_id)
+    manager = cookie_manager.manager
 
     result = []
     for cookie_id, cookie_value in user_cookies.items():
-        cookie_enabled = cookie_manager.manager.get_cookie_status(cookie_id)
+        if manager is not None:
+            cookie_enabled = manager.get_cookie_status(cookie_id)
+        else:
+            cookie_enabled = db_manager.get_cookie_status(cookie_id)
         auto_confirm = db_manager.get_auto_confirm(cookie_id)
         # 获取备注信息
         cookie_details = db_manager.get_cookie_details(cookie_id)

@@ -91,12 +91,6 @@
               </button>
             </div>
           </article>
-
-          <article class="panel stat-card">
-            <div class="stat-label">解锁方式</div>
-            <div class="stat-value">已保存 token</div>
-            <div class="stat-help">识别有效订单后直接自动扣钻</div>
-          </article>
         </section>
 
         <section class="scan-layout">
@@ -2011,7 +2005,7 @@ function showToast(message) {
 .stats-grid {
   margin-top: 10px;
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
 }
 
@@ -2879,11 +2873,12 @@ function showToast(message) {
 
 @media (max-width: 640px) {
   .redeem-page {
-    padding: 0 12px calc(28px + env(safe-area-inset-bottom));
+    padding: 0 10px calc(20px + env(safe-area-inset-bottom));
   }
 
   .redeem-page__topbar {
-    padding: 16px 0 14px;
+    gap: 8px;
+    padding: 12px 0 10px;
   }
 
   .redeem-page__topbar,
@@ -2898,19 +2893,43 @@ function showToast(message) {
   .confirm-modal,
   .camera-modal,
   .pay-result-modal {
-    padding: 16px;
+    padding: 12px;
   }
 
   .hero-title {
-    font-size: 20px;
+    margin: 6px 0 4px;
+    font-size: 18px;
   }
 
   .hero-desc {
-    font-size: 12px;
+    gap: 4px;
+    font-size: 11px;
+    line-height: 1.5;
   }
 
   .hero-badge {
     justify-content: center;
+  }
+
+  .redeem-page__brand-mark {
+    width: 30px;
+    height: 30px;
+    border-radius: 9px;
+    font-size: 14px;
+  }
+
+  .redeem-page__brand-title {
+    font-size: 13px;
+  }
+
+  .redeem-page__brand-subtitle {
+    margin-top: 1px;
+    font-size: 10px;
+  }
+
+  .redeem-page__status-pill {
+    padding: 5px 10px;
+    font-size: 11px;
   }
 
   .stats-grid,
@@ -2928,6 +2947,8 @@ function showToast(message) {
 
   .stat-meta {
     flex-wrap: wrap;
+    gap: 6px;
+    font-size: 11px;
   }
 
   .stat-action {
@@ -2936,21 +2957,66 @@ function showToast(message) {
     justify-content: center;
   }
 
+  .stat-card {
+    border-radius: 16px;
+  }
+
+  .stat-label,
+  .scan-status-card__label,
+  .order-label {
+    font-size: 11px;
+  }
+
+  .stat-value {
+    font-size: 20px;
+    line-height: 1.2;
+  }
+
+  .stat-help,
+  .scan-panel__desc,
+  .scan-status-card__help,
+  .batch-progress-card__desc,
+  .batch-progress-current,
+  .batch-progress-item__message {
+    font-size: 11px;
+    line-height: 1.5;
+  }
+
+  .panel-title {
+    font-size: 15px;
+  }
+
+  .scan-layout,
+  .mini-order-grid,
+  .actions-row,
+  .batch-progress-list {
+    gap: 10px;
+  }
+
+  .batch-progress-card,
+  .scan-status-card,
+  .mini-order-item,
+  .batch-progress-item {
+    border-radius: 14px;
+  }
+
   .actions-row {
     flex-direction: column;
   }
 
   .action-button {
     width: 100%;
-    min-height: 48px;
+    min-height: 42px;
+    padding: 10px 14px;
+    font-size: 13px;
   }
 
   .scan-primary-button {
-    min-height: 52px;
+    min-height: 46px;
   }
 
   .upload-dropzone {
-    padding: 20px 14px;
+    padding: 16px 12px;
   }
 
   .camera-overlay,
@@ -2964,7 +3030,7 @@ function showToast(message) {
   .confirm-modal,
   .pay-result-modal {
     width: min(100%, 420px);
-    border-radius: 18px;
+    border-radius: 16px;
   }
 
   .camera-frame {
