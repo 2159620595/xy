@@ -7,6 +7,7 @@ import json
 import random
 import secrets
 import string
+import re
 import aiohttp
 import io
 import base64
@@ -17,8 +18,91 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+class PostgresCompatCursor:
+    """兼容现有 SQLite 风格调用的 PostgreSQL 游标包装器。"""
+
+    def __init__(self, raw_cursor, manager: "DBManager"):
+        self._cursor = raw_cursor
+        self._manager = manager
+        self.lastrowid = None
+
+    def execute(self, sql, params=None):
+        adapted_sql, adapted_params, should_capture_lastrowid = self._manager._adapt_postgres_sql(sql, params)
+        self.lastrowid = None
+        if adapted_params is None:
+            self._cursor.execute(adapted_sql)
+        else:
+            self._cursor.execute(adapted_sql, adapted_params)
+        if should_capture_lastrowid:
+            row = self._cursor.fetchone()
+            self.lastrowid = row[0] if row else None
+        return self
+
+    def executemany(self, sql, params_list):
+        adapted_sql, _, _ = self._manager._adapt_postgres_sql(sql, None, for_executemany=True)
+        self._cursor.executemany(adapted_sql, params_list)
+        return self
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    def close(self):
+        return self._cursor.close()
+
+    def __enter__(self):
+        self._cursor.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._cursor.__exit__(exc_type, exc, tb)
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
+    @property
+    def description(self):
+        return self._cursor.description
+
+    def __getattr__(self, item):
+        return getattr(self._cursor, item)
+
+
+class PostgresCompatConnection:
+    """兼容现有 SQLite 风格调用的 PostgreSQL 连接包装器。"""
+
+    def __init__(self, raw_conn, manager: "DBManager"):
+        self._conn = raw_conn
+        self._manager = manager
+
+    def cursor(self, *args, **kwargs):
+        return PostgresCompatCursor(self._conn.cursor(*args, **kwargs), self._manager)
+
+    def commit(self):
+        return self._conn.commit()
+
+    def rollback(self):
+        return self._conn.rollback()
+
+    def close(self):
+        return self._conn.close()
+
+    def __enter__(self):
+        self._conn.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._conn.__exit__(exc_type, exc, tb)
+
+    def __getattr__(self, item):
+        return getattr(self._conn, item)
+
+
 class DBManager:
-    """SQLite数据库管理，持久化存储Cookie和关键字"""
+    """数据库管理，支持 SQLite 和 PostgreSQL。"""
     
     def __init__(self, db_path: str = None):
         """初始化数据库连接和表结构"""
@@ -52,10 +136,13 @@ class DBManager:
         self.db_path = db_path
         logger.info(f"数据库路径: {self.db_path}")
         self.pg_auth_url = self._resolve_pg_auth_url()
+        self.pg_data_url = self.pg_auth_url
+        self.is_postgres = bool(self.pg_data_url)
         if self.pg_auth_url:
             logger.info("用户认证数据源: PostgreSQL(DATABASE_URL_XIANYU/DATABASE_URL)")
         else:
             logger.info("用户认证数据源: SQLite(DB_PATH)")
+        logger.info(f"主业务数据源: {'PostgreSQL' if self.is_postgres else 'SQLite'}")
         self.conn = None
         self.lock = threading.RLock()  # 使用可重入锁保护数据库操作
 
@@ -180,9 +267,356 @@ class DBManager:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
         return conn
+
+    def _create_postgres_connection(self):
+        """创建 PostgreSQL 连接，并包装成兼容 SQLite 调用风格的连接对象。"""
+        import psycopg2
+
+        raw_conn = psycopg2.connect(self.pg_data_url, connect_timeout=10)
+        return PostgresCompatConnection(raw_conn, self)
+
+    def _is_valid_identifier(self, value: str) -> bool:
+        return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value or ""))
+
+    def _table_exists(self, cursor, table_name: str) -> bool:
+        if not self._is_valid_identifier(table_name):
+            return False
+        if self.is_postgres:
+            self._execute_sql(
+                cursor,
+                """
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = ?
+                LIMIT 1
+                """,
+                (table_name,),
+            )
+            return cursor.fetchone() is not None
+
+        self._execute_sql(
+            cursor,
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,),
+        )
+        return cursor.fetchone() is not None
+
+    def _get_table_columns(self, cursor, table_name: str) -> List[str]:
+        if not self._is_valid_identifier(table_name):
+            return []
+        if self.is_postgres:
+            self._execute_sql(
+                cursor,
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = ?
+                ORDER BY ordinal_position
+                """,
+                (table_name,),
+            )
+            return [row[0] for row in cursor.fetchall()]
+
+        self._execute_sql(cursor, f"PRAGMA table_info({table_name})")
+        return [row[1] for row in cursor.fetchall()]
+
+    def _column_exists(self, cursor, table_name: str, column_name: str) -> bool:
+        return column_name in self._get_table_columns(cursor, table_name)
+
+    def get_table_columns(self, table_name: str) -> List[Dict[str, Any]]:
+        """获取指定表的列定义，兼容 SQLite 和 PostgreSQL。"""
+        if not self._is_valid_identifier(table_name):
+            raise ValueError(f"非法表名: {table_name}")
+
+        with self.lock:
+            cursor = self.conn.cursor()
+            if self.is_postgres:
+                self._execute_sql(
+                    cursor,
+                    """
+                    SELECT
+                        ordinal_position - 1 AS cid,
+                        column_name,
+                        data_type,
+                        CASE WHEN is_nullable = 'NO' THEN 1 ELSE 0 END AS notnull,
+                        column_default,
+                        CASE WHEN EXISTS (
+                            SELECT 1
+                            FROM information_schema.table_constraints tc
+                            JOIN information_schema.key_column_usage kcu
+                              ON tc.constraint_name = kcu.constraint_name
+                             AND tc.table_schema = kcu.table_schema
+                             AND tc.table_name = kcu.table_name
+                            WHERE tc.constraint_type = 'PRIMARY KEY'
+                              AND tc.table_schema = 'public'
+                              AND tc.table_name = c.table_name
+                              AND kcu.column_name = c.column_name
+                        ) THEN 1 ELSE 0 END AS pk
+                    FROM information_schema.columns c
+                    WHERE table_schema = 'public' AND table_name = ?
+                    ORDER BY ordinal_position
+                    """,
+                    (table_name,),
+                )
+                rows = cursor.fetchall()
+                return [
+                    {"name": row[1], "type": row[2], "default": row[4], "notnull": row[3], "pk": row[5]}
+                    for row in rows
+                ]
+
+            self._execute_sql(cursor, f"PRAGMA table_info({table_name})")
+            rows = cursor.fetchall()
+            return [
+                {"name": row[1], "type": row[2], "default": row[4], "notnull": row[3], "pk": row[5]}
+                for row in rows
+            ]
+
+    def _ensure_column_exists(self, cursor, table_name: str, column_name: str, column_definition: str):
+        if not self._column_exists(cursor, table_name, column_name):
+            logger.info(f"正在为 {table_name} 表添加 {column_name} 列...")
+            self._execute_sql(cursor, f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}")
+            logger.info(f"{table_name} 表 {column_name} 列添加完成")
+
+    def _ensure_pg_runtime_schema(self, cursor):
+        """PostgreSQL 模式下仅做远程 schema 校验/补齐，不走本地 SQLite 建库迁移。"""
+        create_statements = [
+            """
+            CREATE TABLE IF NOT EXISTS auto_reply_once_records (
+                id SERIAL PRIMARY KEY,
+                cookie_id TEXT NOT NULL,
+                customer_user_id TEXT NOT NULL,
+                replied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(cookie_id, customer_user_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS item_reply_once_records (
+                id SERIAL PRIMARY KEY,
+                cookie_id TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                customer_user_id TEXT NOT NULL,
+                replied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(cookie_id, item_id, customer_user_id)
+            )
+            """,
+        ]
+        for sql in create_statements:
+            self._execute_sql(cursor, sql)
+
+        columns_to_ensure = [
+            ("users", "nickname", "TEXT"),
+            ("cookies", "auto_confirm", "INTEGER DEFAULT 1"),
+            ("cookies", "auto_reply_once_per_customer", "INTEGER DEFAULT 0"),
+            ("cookies", "remark", "TEXT DEFAULT ''"),
+            ("cookies", "pause_duration", "INTEGER DEFAULT 10"),
+            ("cookies", "username", "TEXT DEFAULT ''"),
+            ("cookies", "password", "TEXT DEFAULT ''"),
+            ("cookies", "show_browser", "INTEGER DEFAULT 0"),
+            ("cookies", "xianyu_nickname", "TEXT DEFAULT ''"),
+            ("cookies", "xianyu_avatar_url", "TEXT DEFAULT ''"),
+            ("keywords", "item_id", "TEXT"),
+            ("keywords", "type", "TEXT DEFAULT 'text'"),
+            ("keywords", "image_url", "TEXT"),
+            ("cards", "image_url", "TEXT"),
+            ("cards", "delay_seconds", "INTEGER DEFAULT 0"),
+            ("cards", "is_multi_spec", "BOOLEAN DEFAULT FALSE"),
+            ("cards", "spec_name", "TEXT"),
+            ("cards", "spec_value", "TEXT"),
+            ("cards", "user_id", "INTEGER NOT NULL DEFAULT 1"),
+            ("orders", "is_bargain", "INTEGER DEFAULT 0"),
+            ("delivery_rules", "item_id", "TEXT"),
+            ("delivery_rules", "user_id", "INTEGER"),
+            ("delivery_rules", "delivery_times", "INTEGER DEFAULT 0"),
+            ("delivery_rules", "description", "TEXT"),
+            ("notification_channels", "user_id", "INTEGER"),
+            ("email_verifications", "type", "TEXT DEFAULT 'register'"),
+            ("item_images", "thumbnail_url", "TEXT"),
+            ("item_info", "multi_quantity_delivery", "BOOLEAN DEFAULT FALSE"),
+            ("item_info", "seller_nick", "TEXT"),
+            ("item_info", "primary_image_url", "TEXT"),
+            ("item_info", "item_status", "TEXT"),
+            ("item_info", "auto_relist_enabled", "BOOLEAN DEFAULT FALSE"),
+            ("item_info", "auto_polish_enabled", "BOOLEAN DEFAULT FALSE"),
+            ("item_info", "auto_polish_interval_hours", "INTEGER DEFAULT 24"),
+            ("item_info", "last_polish_at", "TIMESTAMP"),
+            ("item_info", "last_relist_at", "TIMESTAMP"),
+        ]
+        for table_name, column_name, definition in columns_to_ensure:
+            if self._table_exists(cursor, table_name):
+                self._ensure_column_exists(cursor, table_name, column_name, definition)
+
+        self._execute_sql(
+            cursor,
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_nickname_unique ON users(nickname)",
+        )
+        self._execute_sql(
+            cursor,
+            "CREATE INDEX IF NOT EXISTS idx_item_images_item ON item_images(cookie_id, item_id, sort_order, id)",
+        )
+        self._execute_sql(
+            cursor,
+            "CREATE INDEX IF NOT EXISTS idx_delivery_records_rule ON delivery_records(rule_id, created_at DESC, id DESC)",
+        )
+        self._execute_sql(
+            cursor,
+            "CREATE INDEX IF NOT EXISTS idx_delivery_records_user ON delivery_records(user_id, created_at DESC, id DESC)",
+        )
+
+        default_settings = [
+            ("theme_color", "blue", "主题颜色"),
+            ("registration_enabled", "true", "是否开启用户注册"),
+            ("show_default_login_info", "true", "是否显示默认登录信息"),
+            ("login_captcha_enabled", "true", "登录滑动验证码开关"),
+            ("smtp_server", "", "SMTP服务器地址"),
+            ("smtp_port", "587", "SMTP端口"),
+            ("smtp_user", "", "SMTP登录用户名（发件邮箱）"),
+            ("smtp_password", "", "SMTP登录密码/授权码"),
+            ("smtp_from", "", "发件人显示名（留空则使用用户名）"),
+            ("smtp_use_tls", "true", "是否启用TLS"),
+            ("smtp_use_ssl", "false", "是否启用SSL"),
+            ("qq_reply_secret_key", "", "QQ回复消息API秘钥"),
+            ("db_version", "1.5", "数据库版本号"),
+        ]
+        for key, value, description in default_settings:
+            self._execute_sql(
+                cursor,
+                """
+                INSERT INTO system_settings (key, value, description, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT (key) DO NOTHING
+                """,
+                (key, value, description),
+            )
+
+    def _init_postgres_db(self):
+        """初始化 PostgreSQL 连接和运行时 schema。"""
+        try:
+            self.conn = self._create_postgres_connection()
+            cursor = self.conn.cursor()
+            self._ensure_pg_runtime_schema(cursor)
+            self.conn.commit()
+            logger.info("PostgreSQL数据库初始化完成")
+        except Exception as e:
+            logger.error(f"PostgreSQL数据库初始化失败: {e}")
+            if self.conn:
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
+            raise
+
+    def _adapt_postgres_sql(self, sql: str, params: tuple = None, for_executemany: bool = False):
+        """把常见 SQLite 方言转换成 PostgreSQL 可执行语句。"""
+        sql_text = sql or ""
+        stripped_sql = sql_text.strip()
+        lowered = stripped_sql.lower()
+
+        pragma_match = re.match(r"(?is)^pragma\s+table_info\((?P<table>[A-Za-z_][A-Za-z0-9_]*)\)$", stripped_sql)
+        if pragma_match:
+            table_name = pragma_match.group("table")
+            sql_text = """
+            SELECT
+                c.ordinal_position - 1 AS cid,
+                c.column_name AS name,
+                c.data_type AS type,
+                CASE WHEN c.is_nullable = 'NO' THEN 1 ELSE 0 END AS notnull,
+                c.column_default AS dflt_value,
+                CASE WHEN EXISTS (
+                    SELECT 1
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.key_column_usage kcu
+                      ON tc.constraint_name = kcu.constraint_name
+                     AND tc.table_schema = kcu.table_schema
+                     AND tc.table_name = kcu.table_name
+                    WHERE tc.constraint_type = 'PRIMARY KEY'
+                      AND tc.table_schema = 'public'
+                      AND tc.table_name = c.table_name
+                      AND kcu.column_name = c.column_name
+                ) THEN 1 ELSE 0 END AS pk
+            FROM information_schema.columns c
+            WHERE c.table_schema = 'public' AND c.table_name = %s
+            ORDER BY c.ordinal_position
+            """
+            return sql_text, (table_name,), False
+
+        sqlite_master_match = re.match(
+            r"(?is)^select\s+name\s+from\s+sqlite_master\s+where\s+type='(?P<type>table|index)'\s+and\s+name(?:=|\s*=\s*)(?:\?|(?P<quoted>'[^']+'))$",
+            lowered,
+        )
+        if sqlite_master_match:
+            object_type = sqlite_master_match.group("type")
+            quoted_name = sqlite_master_match.group("quoted")
+            name_param = params[0] if params else quoted_name.strip("'")
+            if object_type == "table":
+                sql_text = """
+                SELECT table_name AS name
+                FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = %s
+                """
+            else:
+                sql_text = """
+                SELECT indexname AS name
+                FROM pg_indexes
+                WHERE schemaname = 'public' AND indexname = %s
+                """
+            return sql_text, (name_param,), False
+
+        if lowered == "begin transaction":
+            sql_text = "BEGIN"
+
+        if re.match(r"(?is)^\s*insert\s+or\s+ignore\s+into\s+", sql_text):
+            sql_text = re.sub(r"(?is)^\s*insert\s+or\s+ignore\s+into\s+", "INSERT INTO ", sql_text, count=1)
+            sql_text = sql_text.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+
+        replace_match = re.match(
+            r"(?is)^\s*insert\s+or\s+replace\s+into\s+([A-Za-z_][A-Za-z0-9_]*)\s*\((.*?)\)\s*values\s*\((.*?)\)\s*;?\s*$",
+            sql_text,
+        )
+        if replace_match:
+            table_name = replace_match.group(1)
+            columns = [col.strip() for col in replace_match.group(2).split(",")]
+            values_part = replace_match.group(3).strip()
+            conflict_map = {
+                "cookies": ["id"],
+                "cookie_status": ["cookie_id"],
+                "ai_reply_settings": ["cookie_id"],
+                "message_notifications": ["cookie_id", "channel_id"],
+                "system_settings": ["key"],
+                "user_settings": ["user_id", "key"],
+                "token_cache": ["user_id"],
+            }
+            conflict_columns = conflict_map.get(table_name.lower())
+            if conflict_columns:
+                update_columns = [col for col in columns if col not in conflict_columns]
+                if update_columns:
+                    update_clause = ", ".join(f"{col} = EXCLUDED.{col}" for col in update_columns)
+                    sql_text = (
+                        f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({values_part}) "
+                        f"ON CONFLICT ({', '.join(conflict_columns)}) DO UPDATE SET {update_clause}"
+                    )
+                else:
+                    sql_text = (
+                        f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({values_part}) "
+                        f"ON CONFLICT ({', '.join(conflict_columns)}) DO NOTHING"
+                    )
+
+        sql_text = sql_text.replace("?", "%s")
+
+        should_capture_lastrowid = False
+        if not for_executemany:
+            insert_match = re.match(r"(?is)^\s*insert\s+into\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", sql_text)
+            if insert_match and "returning" not in sql_text.lower():
+                if insert_match.group(1).lower() in {"notification_channels", "cards", "delivery_rules", "delivery_records"}:
+                    sql_text = sql_text.rstrip().rstrip(";") + " RETURNING id"
+                    should_capture_lastrowid = True
+
+        return sql_text, params, should_capture_lastrowid
     
     def init_db(self):
         """初始化数据库表结构"""
+        if self.is_postgres:
+            self._init_postgres_db()
+            return
         try:
             self.conn = self._create_sqlite_connection()
             cursor = self.conn.cursor()
@@ -1468,7 +1902,7 @@ class DBManager:
     def get_connection(self):
         """获取数据库连接，如果已关闭则重新连接"""
         if self.conn is None:
-            self.conn = self._create_sqlite_connection()
+            self.conn = self._create_postgres_connection() if self.is_postgres else self._create_sqlite_connection()
         return self.conn
 
     def _log_sql(self, sql: str, params: tuple = None, operation: str = "EXECUTE"):
@@ -2097,14 +2531,31 @@ class DBManager:
                 cursor = self.conn.cursor()
 
                 # 先获取所有关键词
-                self._execute_sql(cursor,
-                    "SELECT rowid FROM keywords WHERE cookie_id = ? ORDER BY rowid",
-                    (cookie_id,))
+                if self.is_postgres:
+                    self._execute_sql(
+                        cursor,
+                        """
+                        SELECT ctid
+                        FROM keywords
+                        WHERE cookie_id = ?
+                        ORDER BY keyword, COALESCE(item_id, ''), COALESCE(type, 'text'), COALESCE(reply, '')
+                        """,
+                        (cookie_id,),
+                    )
+                else:
+                    self._execute_sql(
+                        cursor,
+                        "SELECT rowid FROM keywords WHERE cookie_id = ? ORDER BY rowid",
+                        (cookie_id,),
+                    )
                 rows = cursor.fetchall()
 
                 if 0 <= index < len(rows):
-                    rowid = rows[index][0]
-                    self._execute_sql(cursor, "DELETE FROM keywords WHERE rowid = ?", (rowid,))
+                    row_marker = rows[index][0]
+                    if self.is_postgres:
+                        self._execute_sql(cursor, "DELETE FROM keywords WHERE ctid = ?::tid", (row_marker,))
+                    else:
+                        self._execute_sql(cursor, "DELETE FROM keywords WHERE rowid = ?", (row_marker,))
                     self.conn.commit()
                     logger.info(f"删除关键词成功: {cookie_id}, 索引: {index}")
                     return True
@@ -5828,10 +6279,10 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
 
-                # 获取表结构
-                cursor.execute(f"PRAGMA table_info({table_name})")
-                columns_info = cursor.fetchall()
-                columns = [col[1] for col in columns_info]  # 列名
+                if not self._is_valid_identifier(table_name):
+                    raise ValueError(f"非法表名: {table_name}")
+
+                columns = [col["name"] for col in self.get_table_columns(table_name)]
 
                 # 获取表数据
                 cursor.execute(f"SELECT * FROM {table_name}")
@@ -6105,6 +6556,15 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+
+                if not self._is_valid_identifier(table_name):
+                    raise ValueError(f"非法表名: {table_name}")
+
+                if self.is_postgres:
+                    cursor.execute(f"TRUNCATE TABLE {table_name} RESTART IDENTITY CASCADE")
+                    self.conn.commit()
+                    logger.info(f"清空表数据成功: {table_name}")
+                    return True
 
                 # 清空表数据
                 cursor.execute(f"DELETE FROM {table_name}")
@@ -6618,68 +7078,102 @@ class DBManager:
             with self.lock:
                 cursor = self.conn.cursor()
                 stats = {}
+                use_postgres = self.is_postgres
                 
                 # 清理AI对话历史（保留最近90天）
                 try:
-                    cursor.execute(
-                        "DELETE FROM ai_conversations WHERE created_at < datetime('now', '-' || ? || ' days')",
-                        (days,)
-                    )
+                    if use_postgres:
+                        cursor.execute(
+                            "DELETE FROM ai_conversations WHERE created_at < CURRENT_TIMESTAMP - (%s * INTERVAL '1 day')",
+                            (days,)
+                        )
+                    else:
+                        cursor.execute(
+                            "DELETE FROM ai_conversations WHERE created_at < datetime('now', '-' || ? || ' days')",
+                            (days,)
+                        )
                     stats['ai_conversations'] = cursor.rowcount
                     if cursor.rowcount > 0:
                         logger.info(f"清理了 {cursor.rowcount} 条过期的AI对话记录（{days}天前）")
                 except Exception as e:
+                    self.conn.rollback()
                     logger.warning(f"清理AI对话历史失败: {e}")
                     stats['ai_conversations'] = 0
                 
                 # 清理风控日志（保留最近90天）
                 try:
-                    cursor.execute(
-                        "DELETE FROM risk_control_logs WHERE created_at < datetime('now', '-' || ? || ' days')",
-                        (days,)
-                    )
+                    if use_postgres:
+                        cursor.execute(
+                            "DELETE FROM risk_control_logs WHERE created_at < CURRENT_TIMESTAMP - (%s * INTERVAL '1 day')",
+                            (days,)
+                        )
+                    else:
+                        cursor.execute(
+                            "DELETE FROM risk_control_logs WHERE created_at < datetime('now', '-' || ? || ' days')",
+                            (days,)
+                        )
                     stats['risk_control_logs'] = cursor.rowcount
                     if cursor.rowcount > 0:
                         logger.info(f"清理了 {cursor.rowcount} 条过期的风控日志（{days}天前）")
                 except Exception as e:
+                    self.conn.rollback()
                     logger.warning(f"清理风控日志失败: {e}")
                     stats['risk_control_logs'] = 0
                 
                 # 清理AI商品缓存（保留最近30天）
                 cache_days = min(days, 30)  # AI商品缓存最多保留30天
                 try:
-                    cursor.execute(
-                        "DELETE FROM ai_item_cache WHERE last_updated < datetime('now', '-' || ? || ' days')",
-                        (cache_days,)
-                    )
+                    if use_postgres:
+                        cursor.execute(
+                            "DELETE FROM ai_item_cache WHERE last_updated < CURRENT_TIMESTAMP - (%s * INTERVAL '1 day')",
+                            (cache_days,)
+                        )
+                    else:
+                        cursor.execute(
+                            "DELETE FROM ai_item_cache WHERE last_updated < datetime('now', '-' || ? || ' days')",
+                            (cache_days,)
+                        )
                     stats['ai_item_cache'] = cursor.rowcount
                     if cursor.rowcount > 0:
                         logger.info(f"清理了 {cursor.rowcount} 条过期的AI商品缓存（{cache_days}天前）")
                 except Exception as e:
+                    self.conn.rollback()
                     logger.warning(f"清理AI商品缓存失败: {e}")
                     stats['ai_item_cache'] = 0
                 
                 # 清理验证码记录（保留最近1天）
                 try:
-                    cursor.execute(
-                        "DELETE FROM captcha_codes WHERE created_at < datetime('now', '-1 day')"
-                    )
+                    if use_postgres:
+                        cursor.execute(
+                            "DELETE FROM captcha_codes WHERE created_at < CURRENT_TIMESTAMP - INTERVAL '1 day'"
+                        )
+                    else:
+                        cursor.execute(
+                            "DELETE FROM captcha_codes WHERE created_at < datetime('now', '-1 day')"
+                        )
                     stats['captcha_codes'] = cursor.rowcount
                     if cursor.rowcount > 0:
                         logger.info(f"清理了 {cursor.rowcount} 条过期的验证码记录")
                 except Exception as e:
+                    self.conn.rollback()
                     logger.warning(f"清理验证码记录失败: {e}")
                     stats['captcha_codes'] = 0
                 
                 # 清理邮箱验证记录（保留最近7天）
                 try:
-                    cursor.execute(
-                        "DELETE FROM email_verifications WHERE created_at < datetime('now', '-7 days')"
-                    )
+                    if use_postgres:
+                        cursor.execute(
+                            "DELETE FROM email_verifications WHERE created_at < CURRENT_TIMESTAMP - INTERVAL '7 days'"
+                        )
+                    else:
+                        cursor.execute(
+                            "DELETE FROM email_verifications WHERE created_at < datetime('now', '-7 days')"
+                        )
                     stats['email_verifications'] = cursor.rowcount
                     if cursor.rowcount > 0:
                         logger.info(f"清理了 {cursor.rowcount} 条过期的邮箱验证记录")
                 except Exception as e:
+                    self.conn.rollback()
                     logger.warning(f"清理邮箱验证记录失败: {e}")
                     stats['email_verifications'] = 0
                 
@@ -6690,7 +7184,21 @@ class DBManager:
                 total_cleaned = sum(stats.values())
                 if total_cleaned > 100:
                     logger.info(f"共清理了 {total_cleaned} 条记录，执行VACUUM以释放磁盘空间...")
-                    cursor.execute("VACUUM")
+                    if use_postgres:
+                        # PostgreSQL 中 VACUUM 需要在事务外、autocommit 连接上执行
+                        import psycopg2
+
+                        vacuum_conn = None
+                        try:
+                            vacuum_conn = psycopg2.connect(self.pg_data_url, connect_timeout=10)
+                            vacuum_conn.autocommit = True
+                            with vacuum_conn.cursor() as vacuum_cursor:
+                                vacuum_cursor.execute("VACUUM")
+                        finally:
+                            if vacuum_conn:
+                                vacuum_conn.close()
+                    else:
+                        cursor.execute("VACUUM")
                     logger.info("VACUUM执行完成")
                     stats['vacuum_executed'] = True
                 else:

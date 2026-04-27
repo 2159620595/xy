@@ -5022,24 +5022,16 @@ def delete_keyword_by_index(cid: str, index: int, current_user: Dict[str, Any] =
 def debug_keywords_table_info(current_user: Dict[str, Any] = Depends(get_current_user)):
     """调试：检查keywords表结构"""
     try:
-        import sqlite3
-        conn = sqlite3.connect(db_manager.db_path)
-        cursor = conn.cursor()
-
-        # 获取表结构信息
-        cursor.execute("PRAGMA table_info(keywords)")
-        columns = cursor.fetchall()
-
-        # 获取数据库版本
-        cursor.execute("SELECT value FROM system_settings WHERE key = 'db_version'")
-        version_result = cursor.fetchone()
-        db_version = version_result[0] if version_result else "未知"
-
-        conn.close()
+        columns = db_manager.get_table_columns("keywords")
+        db_version = db_manager.get_system_setting("db_version") or "未知"
 
         return {
             "db_version": db_version,
-            "table_columns": [{"name": col[1], "type": col[2], "default": col[4]} for col in columns]
+            "database_backend": "postgresql" if getattr(db_manager, "is_postgres", False) else "sqlite",
+            "table_columns": [
+                {"name": col.get("name"), "type": col.get("type"), "default": col.get("default")}
+                for col in columns
+            ],
         }
     except Exception as e:
         logger.error(f"检查表结构失败: {e}")
@@ -6917,6 +6909,12 @@ async def upload_database_backup(admin_user: Dict[str, Any] = Depends(require_ad
     try:
         log_with_user('info', f"开始上传数据库备份: {backup_file.filename}", admin_user)
 
+        if getattr(db_manager, "is_postgres", False):
+            raise HTTPException(
+                status_code=400,
+                detail="当前运行在PostgreSQL模式，已禁用SQLite .db 恢复接口，请改用JSON备份导入接口。"
+            )
+
         # 验证文件类型
         if not backup_file.filename.endswith('.db'):
             log_with_user('warning', f"无效的备份文件类型: {backup_file.filename}", admin_user)
@@ -7024,6 +7022,12 @@ def list_backup_files(admin_user: Dict[str, Any] = Depends(require_admin)):
 
     try:
         log_with_user('info', "查询备份文件列表", admin_user)
+
+        if getattr(db_manager, "is_postgres", False):
+            raise HTTPException(
+                status_code=400,
+                detail="当前运行在PostgreSQL模式，本地SQLite备份文件列表接口已禁用。"
+            )
 
         # 查找备份文件（在data目录中）
         backup_files = glob.glob("data/xianyu_data_backup_*.db")
