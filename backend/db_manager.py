@@ -1961,10 +1961,15 @@ class DBManager:
                 return None
     
     def get_all_cookies(self, user_id: int = None) -> Dict[str, str]:
-        """获取所有Cookie（支持用户隔离）"""
+        """获取所有Cookie（支持用户隔离，管理员返回全部账号）"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                if user_id is not None:
+                    user_info = self.get_user_by_id(user_id)
+                    if user_info and user_info.get('is_admin'):
+                        user_id = None
+
                 if user_id is not None:
                     self._execute_sql(cursor, "SELECT id, value FROM cookies WHERE user_id = ?", (user_id,))
                 else:
