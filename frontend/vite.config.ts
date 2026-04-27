@@ -3,6 +3,7 @@ import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
 
 const backendTarget = "http://localhost:8080";
+const outputDir = process.env.FRONTEND_OUT_DIR?.trim() || "dist";
 
 const spaRouteProxy = () => ({
   target: backendTarget,
@@ -30,10 +31,9 @@ export default defineConfig({
     },
   },
   build: {
-    // Build directly into the backend static directory so the integrated app
-    // can be served by reply_server without an extra copy step.
-    outDir: path.resolve(__dirname, "../static"),
-    emptyOutDir: false,
+    // Default to a local dist directory for Vercel deployments.
+    // Set FRONTEND_OUT_DIR=../backend/static when you want an integrated backend build.
+    outDir: path.resolve(__dirname, outputDir),
   },
   server: {
     proxy: {

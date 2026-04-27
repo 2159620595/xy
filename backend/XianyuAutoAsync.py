@@ -21,6 +21,7 @@ from config import (
 import sys
 import aiohttp
 from collections import defaultdict
+from typing import Any, Dict
 from db_manager import db_manager
 
 # 滑块验证补丁已废弃，使用集成的 Playwright 登录方法

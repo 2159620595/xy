@@ -1,4 +1,4 @@
-import { del, get, post } from '@/utils/request'
+import { buildApiUrl, del, get, post } from '@/utils/request'
 import type { AdminStats, ApiResponse, User } from '@/types'
 
 interface BackendUser {
@@ -260,7 +260,7 @@ export const exportLogs = async (): Promise<{ blob: Blob; filename: string }> =>
   }
 
   const response = await fetch(
-    `/admin/logs/export?file=${encodeURIComponent(latest.name)}`,
+    buildApiUrl(`/admin/logs/export?file=${encodeURIComponent(latest.name)}`),
     {
       headers: {
         Authorization: `Bearer ${token}`,

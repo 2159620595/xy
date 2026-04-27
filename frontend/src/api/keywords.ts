@@ -1,4 +1,4 @@
-import { get, post, put } from "@/utils/request";
+import { buildApiUrl, get, post, put } from "@/utils/request";
 import type { ApiResponse, Keyword } from "@/types";
 
 export const getKeywords = (cookieId: string): Promise<Keyword[]> => {
@@ -123,7 +123,7 @@ export const updateDefaultReply = (
 
 export const exportKeywords = async (cookieId: string): Promise<Blob> => {
   const token = localStorage.getItem("auth_token");
-  const response = await fetch(`/keywords-export/${cookieId}`, {
+  const response = await fetch(buildApiUrl(`/keywords-export/${cookieId}`), {
     headers: {
       Authorization: `Bearer ${token}`,
     },

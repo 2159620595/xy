@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
+import { buildStaticUrl } from "@/utils/request";
 import {
   Bell,
   ChatDotRound,
@@ -31,9 +32,10 @@ const features = [
   { title: "数据统计", desc: "账号订单汇总分析", icon: DataBoard },
 ];
 
+const versionUrl = buildStaticUrl("/static/version.txt");
 const groupImages = [
-  { title: "微信群", path: "/static/wechat-group.png", icon: ChatDotRound },
-  { title: "QQ群", path: "/static/qq-group.png", icon: Connection },
+  { title: "微信群", path: buildStaticUrl("/static/wechat-group.png"), icon: ChatDotRound },
+  { title: "QQ群", path: buildStaticUrl("/static/qq-group.png"), icon: Connection },
 ];
 
 const contributors = [
@@ -85,7 +87,7 @@ const isImageUnavailable = (path: string) => unavailableImages.value.includes(pa
 
 onMounted(async () => {
   try {
-    const response = await fetch("/static/version.txt");
+    const response = await fetch(versionUrl);
     if (!response.ok) {
       version.value = "未知版本";
       return;

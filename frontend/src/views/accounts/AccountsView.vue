@@ -31,7 +31,6 @@ import {
   updateAccountAutoConfirm,
   updateAccountCookie,
   updateAccountLoginInfo,
-  updateAccountPauseDuration,
   updateAccountRemark,
   updateAccountStatus,
   updateAIReplySettings,

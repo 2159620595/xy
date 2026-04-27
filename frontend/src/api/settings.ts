@@ -1,4 +1,4 @@
-import { get, post, put } from "@/utils/request";
+import { buildApiUrl, get, post, put } from "@/utils/request";
 import type { ApiResponse, SystemSettings } from "@/types";
 
 export const getSystemSettings = async (): Promise<{
@@ -125,7 +125,7 @@ export const exportUserBackup = async (): Promise<{
     throw new Error("未登录");
   }
 
-  const response = await fetch("/backup/export", {
+  const response = await fetch(buildApiUrl("/backup/export"), {
     headers: {
       Authorization: `Bearer ${token}`,
     },

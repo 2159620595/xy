@@ -1,66 +1,105 @@
-import axios, { type AxiosError, type AxiosRequestConfig, type AxiosResponse } from 'axios'
-import { useAuthStore } from '@/stores/auth'
+import axios, {
+  type AxiosError,
+  type AxiosRequestConfig,
+  type AxiosResponse,
+} from "axios";
+import { useAuthStore } from "@/stores/auth";
+
+const normalizeBase = (value: string | undefined) =>
+  String(value || "")
+    .trim()
+    .replace(/\/+$/, "");
+
+export const API_BASE_URL = normalizeBase(import.meta.env.VITE_API_BASE_URL);
+export const STATIC_BASE_URL =
+  normalizeBase(import.meta.env.VITE_STATIC_BASE_URL) || API_BASE_URL;
+export const NETDISK_API_BASE_URL =
+  normalizeBase(import.meta.env.VITE_NETDISK_API_BASE) ||
+  (API_BASE_URL ? `${API_BASE_URL}/netdisk_api/api` : "/netdisk_api/api");
+export const JUDIAN_API_BASE_URL =
+  normalizeBase(import.meta.env.VITE_JUDIAN_API_BASE) ||
+  (API_BASE_URL
+    ? `${API_BASE_URL}/netdisk_api/judian_api`
+    : "/netdisk_api/judian_api");
+
+export const buildApiUrl = (path: string) => {
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  return API_BASE_URL ? `${API_BASE_URL}${normalizedPath}` : normalizedPath;
+};
+
+export const buildStaticUrl = (path: string) => {
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  return STATIC_BASE_URL
+    ? `${STATIC_BASE_URL}${normalizedPath}`
+    : normalizedPath;
+};
 
 const request = axios.create({
-  baseURL: '',
+  baseURL: API_BASE_URL,
   timeout: 30000,
   headers: {
-    'Content-Type': 'application/json',
+    "Content-Type": "application/json",
   },
-})
+});
 
 request.interceptors.request.use(
   (config) => {
-    const token = localStorage.getItem('auth_token')
+    const token = localStorage.getItem("auth_token");
     if (token) {
-      config.headers.Authorization = `Bearer ${token}`
+      config.headers.Authorization = `Bearer ${token}`;
     }
-    return config
+    return config;
   },
   (error) => Promise.reject(error),
-)
+);
 
 request.interceptors.response.use(
   (response: AxiosResponse) => response,
   (error: AxiosError) => {
     if (error.response?.status === 401) {
       try {
-        useAuthStore().clearAuth()
+        useAuthStore().clearAuth();
       } catch {
-        localStorage.removeItem('auth_token')
-        localStorage.removeItem('user_info')
+        localStorage.removeItem("auth_token");
+        localStorage.removeItem("user_info");
       }
     }
-    return Promise.reject(error)
+    return Promise.reject(error);
   },
-)
+);
 
-export const get = async <T = unknown>(url: string, config?: AxiosRequestConfig): Promise<T> => {
-  const response = await request.get<T>(url, config)
-  return response.data
-}
+export const get = async <T = unknown>(
+  url: string,
+  config?: AxiosRequestConfig,
+): Promise<T> => {
+  const response = await request.get<T>(url, config);
+  return response.data;
+};
 
 export const post = async <T = unknown>(
   url: string,
   data?: unknown,
   config?: AxiosRequestConfig,
 ): Promise<T> => {
-  const response = await request.post<T>(url, data, config)
-  return response.data
-}
+  const response = await request.post<T>(url, data, config);
+  return response.data;
+};
 
 export const put = async <T = unknown>(
   url: string,
   data?: unknown,
   config?: AxiosRequestConfig,
 ): Promise<T> => {
-  const response = await request.put<T>(url, data, config)
-  return response.data
-}
+  const response = await request.put<T>(url, data, config);
+  return response.data;
+};
 
-export const del = async <T = unknown>(url: string, config?: AxiosRequestConfig): Promise<T> => {
-  const response = await request.delete<T>(url, config)
-  return response.data
-}
+export const del = async <T = unknown>(
+  url: string,
+  config?: AxiosRequestConfig,
+): Promise<T> => {
+  const response = await request.delete<T>(url, config);
+  return response.data;
+};
 
-export default request
+export default request;

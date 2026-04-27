@@ -1,11 +1,12 @@
 from fastapi import FastAPI, HTTPException, Depends, Query, status, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 from typing import List, Tuple, Optional, Dict, Any
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 import ipaddress
 import hashlib
 import secrets
@@ -36,6 +37,33 @@ _xianyu_nickname_fetch_limiter: Dict[str, float] = {}
 
 def _contains_cjk(text: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", text))
+
+
+def _normalize_origin(value: str | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = urlsplit(text if "://" in text else f"https://{text}")
+    except Exception:
+        return ""
+    scheme = str(parsed.scheme or "https").strip().lower()
+    netloc = str(parsed.netloc or "").strip().lower()
+    if scheme not in {"http", "https"} or not netloc:
+        return ""
+    return f"{scheme}://{netloc}"
+
+
+def _parse_cors_allow_origins(value: str | None) -> List[str]:
+    raw_text = str(value or "")
+    if not raw_text.strip():
+        return []
+    origins: List[str] = []
+    for part in re.split(r"[\n,;]+", raw_text):
+        origin = _normalize_origin(part)
+        if origin and origin not in origins:
+            origins.append(origin)
+    return origins
 
 
 def _looks_like_account_id(value: str) -> bool:
@@ -781,6 +809,16 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
+cors_allowed_origins = _parse_cors_allow_origins(os.environ.get("CORS_ALLOW_ORIGINS", ""))
+if cors_allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_allowed_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
 # 注册刮刮乐远程控制路由
 if CAPTCHA_ROUTER_AVAILABLE:
     app.include_router(captcha_router)
@@ -1288,8 +1326,9 @@ class GeetestRegisterResponse(BaseModel):
 
 class GeetestValidateRequest(BaseModel):
     """极验二次验证请求"""
+    model_config = ConfigDict(populate_by_name=True)
     challenge: str
-    validate: str
+    validate_token: str = Field(alias="validate")
     seccode: str
 
 
@@ -1384,13 +1423,13 @@ async def geetest_validate(request: GeetestValidateRequest):
         if is_normal_mode:
             result = await gt_lib.success_validate(
                 request.challenge,
-                request.validate,
+                request.validate_token,
                 request.seccode
             )
         else:
             result = gt_lib.fail_validate(
                 request.challenge,
-                request.validate,
+                request.validate_token,
                 request.seccode
             )
         
