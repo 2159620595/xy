@@ -121,12 +121,61 @@ ENV NODE_PATH=/usr/lib/node_modules
 
 # Install Node.js from a China mirror to speed up downloads in CI.
 RUN set -e; \
-    NODE_DIST_URL="https://npmmirror.com/mirrors/node/latest-v20.x"; \
-    NODE_TARBALL="$(curl -fsSL "$NODE_DIST_URL/SHASUMS256.txt" | awk '/node-v[0-9.]+-linux-x64\\.tar\\.xz$/{print $2; exit}')"; \
-    curl -fsSLO "$NODE_DIST_URL/$NODE_TARBALL"; \
-    curl -fsSL "$NODE_DIST_URL/SHASUMS256.txt" | grep " $NODE_TARBALL$" | sha256sum -c -; \
+    NODE_DIST_URL_PRIMARY="https://npmmirror.com/mirrors/node/latest-v20.x"; \
+    NODE_DIST_URL_FALLBACK="https://nodejs.org/dist/latest-v20.x"; \
+    ARCH="$(uname -m)"; \
+    case "$ARCH" in \
+      x86_64) NODE_PLATFORM="linux-x64" ;; \
+      aarch64|arm64) NODE_PLATFORM="linux-arm64" ;; \
+      armv7l) NODE_PLATFORM="linux-armv7l" ;; \
+      *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;; \
+    esac; \
+    fetch_small() { curl --http1.1 -fSL --retry 8 --retry-connrefused --retry-delay 2 --retry-all-errors --connect-timeout 20 --max-time 900 --speed-time 30 --speed-limit 1024 -o "$2" "$1"; }; \
+    fetch_large() { curl --http1.1 -fSL -C - --retry 8 --retry-connrefused --retry-delay 2 --retry-all-errors --connect-timeout 20 --max-time 900 --speed-time 30 --speed-limit 1024 -o "$2" "$1"; }; \
+    tmpdir="$(mktemp -d)"; \
+    cd "$tmpdir"; \
+    SHASUMS_FILE=""; \
+    NODE_DIST_URL=""; \
+    if fetch_small "$NODE_DIST_URL_PRIMARY/SHASUMS256.txt" SHASUMS256.primary.txt; then \
+      NODE_DIST_URL="$NODE_DIST_URL_PRIMARY"; \
+      SHASUMS_FILE="SHASUMS256.primary.txt"; \
+    elif fetch_small "$NODE_DIST_URL_FALLBACK/SHASUMS256.txt" SHASUMS256.fallback.txt; then \
+      NODE_DIST_URL="$NODE_DIST_URL_FALLBACK"; \
+      SHASUMS_FILE="SHASUMS256.fallback.txt"; \
+    else \
+      echo "Failed to download SHASUMS256.txt from both primary and fallback mirrors" >&2; \
+      exit 1; \
+    fi; \
+    NODE_TARBALL="$(awk -v platform="$NODE_PLATFORM" '$2 ~ ("node-v[0-9.]+-" platform "\\.tar\\.xz$"){print $2; exit}' "$SHASUMS_FILE")"; \
+    if [ -z "$NODE_TARBALL" ]; then echo "Failed to determine Node.js tarball for platform: $NODE_PLATFORM" >&2; exit 1; fi; \
+    EXPECTED_SHA="$(awk -v tar="$NODE_TARBALL" '$2 == tar {print $1; exit}' "$SHASUMS_FILE")"; \
+    if [ -z "$EXPECTED_SHA" ]; then echo "Failed to find expected SHA256 for: $NODE_TARBALL" >&2; exit 1; fi; \
+    if fetch_large "$NODE_DIST_URL/$NODE_TARBALL" "$NODE_TARBALL"; then \
+      if echo "$EXPECTED_SHA  $NODE_TARBALL" | sha256sum -c -; then \
+        :; \
+      else \
+        rm -f "$NODE_TARBALL"; \
+        fetch_small "$NODE_DIST_URL/$NODE_TARBALL" "$NODE_TARBALL"; \
+        echo "$EXPECTED_SHA  $NODE_TARBALL" | sha256sum -c -; \
+      fi; \
+    else \
+      if [ "$NODE_DIST_URL" = "$NODE_DIST_URL_PRIMARY" ]; then OTHER_URL="$NODE_DIST_URL_FALLBACK"; OTHER_SHASUMS="SHASUMS256.fallback.txt"; else OTHER_URL="$NODE_DIST_URL_PRIMARY"; OTHER_SHASUMS="SHASUMS256.primary.txt"; fi; \
+      if [ ! -f "$OTHER_SHASUMS" ]; then fetch_small "$OTHER_URL/SHASUMS256.txt" "$OTHER_SHASUMS"; fi; \
+      EXPECTED_SHA_OTHER="$(awk -v tar="$NODE_TARBALL" '$2 == tar {print $1; exit}' "$OTHER_SHASUMS")"; \
+      if [ -z "$EXPECTED_SHA_OTHER" ]; then echo "Failed to find expected SHA256 for: $NODE_TARBALL (other mirror)" >&2; exit 1; fi; \
+      rm -f "$NODE_TARBALL"; \
+      fetch_large "$OTHER_URL/$NODE_TARBALL" "$NODE_TARBALL"; \
+      if echo "$EXPECTED_SHA_OTHER  $NODE_TARBALL" | sha256sum -c -; then \
+        :; \
+      else \
+        rm -f "$NODE_TARBALL"; \
+        fetch_small "$OTHER_URL/$NODE_TARBALL" "$NODE_TARBALL"; \
+        echo "$EXPECTED_SHA_OTHER  $NODE_TARBALL" | sha256sum -c -; \
+      fi; \
+    fi; \
     tar -xJf "$NODE_TARBALL" -C /usr/local --strip-components=1; \
-    rm -f "$NODE_TARBALL"; \
+    cd /; \
+    rm -rf "$tmpdir"; \
     node --version; \
     npm --version
 
