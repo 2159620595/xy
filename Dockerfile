@@ -213,9 +213,9 @@ RUN SCRIPTS_DIR="/app/backend/judian/scripts"; \
         npm ci --prefix "$SCRIPTS_DIR" --omit=dev --no-audit --no-fund; \
     fi
 
+# ✅ 系统 chromium 存在直接用，跳过 playwright 下载
 RUN if command -v chromium >/dev/null 2>&1; then \
         echo "Using system chromium: $(chromium --version), skipping playwright download."; \
-        ln -sf /usr/bin/chromium "${PLAYWRIGHT_BROWSERS_PATH}/chromium"; \
     else \
         echo "System chromium not found, downloading via playwright..."; \
         chromium_dir=$(find "${PLAYWRIGHT_BROWSERS_PATH}" -maxdepth 1 -name "chromium-*" -type d 2>/dev/null | head -1); \
@@ -227,6 +227,8 @@ RUN if command -v chromium >/dev/null 2>&1; then \
             || PLAYWRIGHT_DOWNLOAD_HOST="" playwright install chromium; \
         fi; \
     fi
+
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
