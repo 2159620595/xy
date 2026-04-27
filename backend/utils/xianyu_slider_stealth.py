@@ -279,16 +279,16 @@ class XianyuSliderStealth:
         
         self.success_history_file = f"trajectory_history/{self.pure_user_id}_success.json"
         self.trajectory_params = {
-            "total_steps_range": [5, 8],  # 极速：5-8步（超快滑动）
-            "base_delay_range": [0.0002, 0.0005],  # 极速：0.2-0.5ms延迟
-            "jitter_x_range": [0, 1],  # 极小抖动
-            "jitter_y_range": [0, 1],  # 极小抖动
-            "slow_factor_range": [10, 15],  # 极快加速因子
-            "acceleration_phase": 1.0,  # 全程加速
-            "fast_phase": 1.0,  # 无慢速
-            "slow_start_ratio_base": 2.0,  # 确保超调100%
-            "completion_usage_rate": 0.05,  # 极少补全使用率
-            "avg_completion_steps": 1.0,  # 极少补全步数
+            "total_steps_range": [18, 28],  # 放慢节奏，避免极速直冲
+            "base_delay_range": [0.03, 0.08],  # 单步停顿 30-80ms
+            "jitter_x_range": [0, 2],  # 小幅横向抖动
+            "jitter_y_range": [-2, 2],  # 轻微纵向抖动
+            "slow_factor_range": [2, 4],  # 末段放缓
+            "acceleration_phase": 0.35,  # 前段加速
+            "fast_phase": 0.45,  # 中段匀速
+            "slow_start_ratio_base": 1.03,  # 轻微超调后回正
+            "completion_usage_rate": 0.25,
+            "avg_completion_steps": 2.0,
             "trajectory_length_stats": [],
             "learning_enabled": False
         }
@@ -334,6 +334,7 @@ class XianyuSliderStealth:
 
             launch_options = {
                 "headless": self.headless,
+                "ignore_default_args": ["--enable-automation"],
                 "args": [
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
@@ -349,8 +350,10 @@ class XianyuSliderStealth:
                     "--disable-background-timer-throttling",
                     "--disable-backgrounding-occluded-windows",
                     "--disable-renderer-backgrounding",
+                    "--disable-infobars",
                     f"--lang={browser_features['lang']}",
                     f"--accept-lang={browser_features['accept_lang']}",
+                    "--disable-blink-features",
                     "--disable-blink-features=AutomationControlled",
                     "--disable-extensions",
                     "--disable-plugins",
@@ -770,420 +773,99 @@ class XianyuSliderStealth:
     
     def _get_stealth_script(self, browser_features):
         """获取增强反检测脚本"""
+        user_agent = json.dumps(browser_features['user_agent'])
+        locale = json.dumps(browser_features['locale'])
+        timezone_id = json.dumps(browser_features['timezone_id'])
+        vendor = json.dumps("Google Inc.")
+        platform = json.dumps("Win32")
+
         return f"""
-            // 隐藏webdriver属性
-            Object.defineProperty(navigator, 'webdriver', {{
-                get: () => undefined,
-            }});
-            
-            // 隐藏自动化相关属性
-            delete navigator.__proto__.webdriver;
-            delete window.navigator.webdriver;
-            delete window.navigator.__proto__.webdriver;
-            
-            // 模拟真实浏览器环境
-            window.chrome = {{
-                runtime: {{}},
-                loadTimes: function() {{}},
-                csi: function() {{}},
-                app: {{}}
-            }};
-            
-            // 覆盖plugins - 随机化
-            const pluginCount = {random.randint(3, 8)};
-            Object.defineProperty(navigator, 'plugins', {{
-                get: () => Array.from({{length: pluginCount}}, (_, i) => ({{
-                    name: 'Plugin' + i,
-                    description: 'Plugin ' + i
-                }})),
-            }});
-            
-            // 覆盖languages
-            Object.defineProperty(navigator, 'languages', {{
-                get: () => ['{browser_features['locale']}', 'zh', 'en'],
-            }});
-            
-            // 模拟真实的屏幕信息
-            Object.defineProperty(screen, 'availWidth', {{ get: () => {browser_features['viewport_width']} }});
-            Object.defineProperty(screen, 'availHeight', {{ get: () => {browser_features['viewport_height'] - 40} }});
-            Object.defineProperty(screen, 'width', {{ get: () => {browser_features['viewport_width']} }});
-            Object.defineProperty(screen, 'height', {{ get: () => {browser_features['viewport_height']} }});
-            
-            // 隐藏自动化检测 - 随机化硬件信息
-            Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => {random.choice([2, 4, 6, 8])} }});
-            Object.defineProperty(navigator, 'deviceMemory', {{ get: () => {random.choice([4, 8, 16])} }});
-            
-            // 模拟真实的时区
-            Object.defineProperty(Intl.DateTimeFormat.prototype, 'resolvedOptions', {{
-                value: function() {{
-                    return {{ timeZone: '{browser_features['timezone_id']}' }};
-                }}
-            }});
-            
-            // 隐藏自动化痕迹
-            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
-            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-            delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
-            
-            // 模拟有头模式的特征
-            Object.defineProperty(navigator, 'maxTouchPoints', {{ get: () => 0 }});
-            Object.defineProperty(navigator, 'platform', {{ get: () => 'Win32' }});
-            Object.defineProperty(navigator, 'vendor', {{ get: () => 'Google Inc.' }});
-            Object.defineProperty(navigator, 'vendorSub', {{ get: () => '' }});
-            Object.defineProperty(navigator, 'productSub', {{ get: () => '20030107' }});
-            
-            // 模拟真实的连接信息
-            Object.defineProperty(navigator, 'connection', {{
-                get: () => ({{
-                    effectiveType: "{random.choice(['3g', '4g', '5g'])}",
-                    rtt: {random.randint(20, 100)},
-                    downlink: {round(random.uniform(1, 10), 2)}
-                }})
-            }});
-            
-            // 隐藏无头模式特征
-            Object.defineProperty(navigator, 'headless', {{ get: () => undefined }});
-            Object.defineProperty(window, 'outerHeight', {{ get: () => {browser_features['viewport_height']} }});
-            Object.defineProperty(window, 'outerWidth', {{ get: () => {browser_features['viewport_width']} }});
-            
-            // 模拟真实的媒体设备
-            Object.defineProperty(navigator, 'mediaDevices', {{
-                get: () => ({{
-                    enumerateDevices: () => Promise.resolve([])
-                }}),
-            }});
-            
-            // 隐藏自动化检测特征
-            Object.defineProperty(navigator, 'webdriver', {{ get: () => undefined }});
-            Object.defineProperty(navigator, '__webdriver_script_fn', {{ get: () => undefined }});
-            Object.defineProperty(navigator, '__webdriver_evaluate', {{ get: () => undefined }});
-            Object.defineProperty(navigator, '__webdriver_unwrapped', {{ get: () => undefined }});
-            Object.defineProperty(navigator, '__fxdriver_evaluate', {{ get: () => undefined }});
-            Object.defineProperty(navigator, '__driver_evaluate', {{ get: () => undefined }});
-            Object.defineProperty(navigator, '__webdriver_script_func', {{ get: () => undefined }});
-            
-            // 隐藏Playwright特定的对象
-            delete window.playwright;
-            delete window.__playwright;
-            delete window.__pw_manual;
-            delete window.__pw_original;
-            
-            // 模拟真实的用户代理
-            Object.defineProperty(navigator, 'userAgent', {{
-                get: () => '{browser_features['user_agent']}'
-            }});
-            
-            // 隐藏自动化相关的全局变量
-            delete window.webdriver;
-            delete window.__webdriver_script_fn;
-            delete window.__webdriver_evaluate;
-            delete window.__webdriver_unwrapped;
-            delete window.__fxdriver_evaluate;
-            delete window.__driver_evaluate;
-            delete window.__webdriver_script_func;
-            delete window._selenium;
-            delete window._phantom;
-            delete window.callPhantom;
-            delete window._phantom;
-            delete window.phantom;
-            delete window.Buffer;
-            delete window.emit;
-            delete window.spawn;
-            
-            // Canvas指纹随机化
-            const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
-            HTMLCanvasElement.prototype.toDataURL = function() {{
-                const context = this.getContext('2d');
-                if (context) {{
-                    const imageData = context.getImageData(0, 0, this.width, this.height);
-                    const data = imageData.data;
-                    for (let i = 0; i < data.length; i += 4) {{
-                        if (Math.random() < 0.001) {{
-                            data[i] = Math.floor(Math.random() * 256);
+            (() => {{
+                const defineGetter = (obj, prop, value) => {{
+                    try {{
+                        Object.defineProperty(obj, prop, {{
+                            get: () => value,
+                            configurable: true,
+                        }});
+                    }} catch (e) {{}}
+                }};
+
+                const removeAutomationKeys = (target) => {{
+                    for (const key of Object.keys(target)) {{
+                        const lowerKey = key.toLowerCase();
+                        if (
+                            key.startsWith('cdc_') ||
+                            key.startsWith('$cdc_') ||
+                            key.startsWith('wdc_') ||
+                            key.startsWith('$wdc_') ||
+                            lowerKey.includes('selenium') ||
+                            lowerKey.includes('webdriver')
+                        ) {{
+                            try {{
+                                delete target[key];
+                            }} catch (e) {{}}
                         }}
                     }}
-                    context.putImageData(imageData, 0, 0);
+                }};
+
+                defineGetter(Navigator.prototype, 'webdriver', undefined);
+                try {{ delete navigator.webdriver; }} catch (e) {{}}
+                try {{ delete Navigator.prototype.webdriver; }} catch (e) {{}}
+
+                defineGetter(navigator, 'languages', [{locale}, 'zh-CN', 'zh', 'en-US']);
+                defineGetter(navigator, 'language', {locale});
+                defineGetter(navigator, 'platform', {platform});
+                defineGetter(navigator, 'vendor', {vendor});
+                defineGetter(navigator, 'userAgent', {user_agent});
+                defineGetter(navigator, 'maxTouchPoints', 0);
+                defineGetter(navigator, 'hardwareConcurrency', 4);
+                defineGetter(navigator, 'deviceMemory', 8);
+
+                try {{
+                    Object.defineProperty(Intl.DateTimeFormat.prototype, 'resolvedOptions', {{
+                        value: function() {{
+                            const options = {{
+                                locale: {locale},
+                                calendar: 'gregory',
+                                numberingSystem: 'latn',
+                                timeZone: {timezone_id},
+                                year: 'numeric',
+                                month: 'numeric',
+                                day: 'numeric'
+                            }};
+                            return options;
+                        }},
+                        configurable: true,
+                    }});
+                }} catch (e) {{}}
+
+                if (!window.chrome) {{
+                    Object.defineProperty(window, 'chrome', {{
+                        value: {{
+                            runtime: {{}},
+                            app: {{}},
+                            csi: () => ({{}}),
+                            loadTimes: () => ({{}})
+                        }},
+                        configurable: true,
+                    }});
                 }}
-                return originalToDataURL.apply(this, arguments);
-            }};
-            
-            // 音频指纹随机化
-            const originalGetChannelData = AudioBuffer.prototype.getChannelData;
-            AudioBuffer.prototype.getChannelData = function(channel) {{
-                const data = originalGetChannelData.call(this, channel);
-                for (let i = 0; i < data.length; i += 1000) {{
-                    if (Math.random() < 0.01) {{
-                        data[i] += Math.random() * 0.0001;
-                    }}
-                }}
-                return data;
-            }};
-            
-            // WebGL指纹随机化
-            const originalGetParameter = WebGLRenderingContext.prototype.getParameter;
-            WebGLRenderingContext.prototype.getParameter = function(parameter) {{
-                if (parameter === 37445) {{ // UNMASKED_VENDOR_WEBGL
-                    return 'Intel Inc.';
-                }}
-                if (parameter === 37446) {{ // UNMASKED_RENDERER_WEBGL
-                    return 'Intel Iris OpenGL Engine';
-                }}
-                return originalGetParameter.call(this, parameter);
-            }};
-            
-            // 模拟真实的鼠标事件
-            const originalAddEventListener = EventTarget.prototype.addEventListener;
-            EventTarget.prototype.addEventListener = function(type, listener, options) {{
-                if (type === 'mousedown' || type === 'mouseup' || type === 'mousemove') {{
-                    const originalListener = listener;
-                    listener = function(event) {{
-                        setTimeout(() => originalListener.call(this, event), Math.random() * 10);
+
+                removeAutomationKeys(window);
+                ['__playwright', '__pw_manual', '__pw_original', 'playwright', 'webdriver'].forEach((key) => {{
+                    try {{ delete window[key]; }} catch (e) {{}}
+                }});
+
+                if (navigator.permissions && navigator.permissions.query) {{
+                    const originalQuery = navigator.permissions.query.bind(navigator.permissions);
+                    navigator.permissions.query = (parameters) => {{
+                        if (parameters && parameters.name === 'notifications') {{
+                            return Promise.resolve({{ state: Notification.permission }});
+                        }}
+                        return originalQuery(parameters);
                     }};
                 }}
-                return originalAddEventListener.call(this, type, listener, options);
-            }};
-            
-            // 随机化字体检测
-            Object.defineProperty(document, 'fonts', {{
-                get: () => ({{
-                    ready: Promise.resolve(),
-                    check: () => true,
-                    load: () => Promise.resolve([])
-                }})
-            }});
-            
-            // 隐藏自动化检测的常见特征
-            Object.defineProperty(window, 'chrome', {{
-                get: () => ({{
-                    runtime: {{}},
-                    loadTimes: function() {{}},
-                    csi: function() {{}},
-                    app: {{}}
-                }})
-            }});
-            
-            // 增强鼠标移动轨迹记录
-            let mouseMovements = [];
-            let lastMouseTime = Date.now();
-            document.addEventListener('mousemove', function(e) {{
-                const now = Date.now();
-                const timeDiff = now - lastMouseTime;
-                mouseMovements.push({{
-                    x: e.clientX,
-                    y: e.clientY,
-                    time: now,
-                    timeDiff: timeDiff
-                }});
-                lastMouseTime = now;
-                // 保持最近100个移动记录
-                if (mouseMovements.length > 100) {{
-                    mouseMovements.shift();
-                }}
-            }}, true);
-            
-            // 模拟真实的屏幕触摸点数
-            Object.defineProperty(navigator, 'maxTouchPoints', {{
-                get: () => {random.choice([0, 1, 5, 10])}
-            }});
-            
-            // 模拟真实的电池API
-            if (navigator.getBattery) {{
-                const originalGetBattery = navigator.getBattery;
-                navigator.getBattery = async function() {{
-                    const battery = await originalGetBattery.call(navigator);
-                    Object.defineProperty(battery, 'charging', {{ get: () => {random.choice(['true', 'false'])} }});
-                    Object.defineProperty(battery, 'level', {{ get: () => {random.uniform(0.3, 0.95):.2f} }});
-                    return battery;
-                }};
-            }}
-            
-            // 伪装鼠标移动加速度（反检测关键）
-            let velocityProfile = [];
-            window.addEventListener('mousemove', function(e) {{
-                const now = performance.now();
-                velocityProfile.push({{ x: e.clientX, y: e.clientY, t: now }});
-                if (velocityProfile.length > 50) velocityProfile.shift();
-            }}, true);
-            
-            // 伪装Permission API
-            const originalQuery = Permissions.prototype.query;
-            Permissions.prototype.query = function(parameters) {{
-                if (parameters.name === 'notifications') {{
-                    return Promise.resolve({{ state: 'denied' }});
-                }}
-                return originalQuery.apply(this, arguments);
-            }};
-            
-            // 伪装Performance API
-            const originalNow = Performance.prototype.now;
-            Performance.prototype.now = function() {{
-                return originalNow.call(this) + Math.random() * 0.1;
-            }};
-            
-            // 伪装Date API（添加微小随机偏移）
-            const OriginalDate = Date;
-            Date = function(...args) {{
-                if (args.length === 0) {{
-                    const date = new OriginalDate();
-                    const offset = Math.floor(Math.random() * 3) - 1; // -1到1毫秒
-                    return new OriginalDate(date.getTime() + offset);
-                }}
-                return new OriginalDate(...args);
-            }};
-            Date.prototype = OriginalDate.prototype;
-            Date.now = function() {{
-                return OriginalDate.now() + Math.floor(Math.random() * 3) - 1;
-            }};
-            
-            // 伪装RTCPeerConnection（WebRTC指纹）
-            if (window.RTCPeerConnection) {{
-                const originalRTC = window.RTCPeerConnection;
-                window.RTCPeerConnection = function(...args) {{
-                    const pc = new originalRTC(...args);
-                    const originalCreateOffer = pc.createOffer;
-                    pc.createOffer = function(...args) {{
-                        return originalCreateOffer.apply(this, args).then(offer => {{
-                            // 修改SDP指纹
-                            offer.sdp = offer.sdp.replace(/a=fingerprint:.*\\r\\n/g, 
-                                `a=fingerprint:sha-256 ${{Array.from({{length:64}}, ()=>Math.floor(Math.random()*16).toString(16)).join('')}}\\r\\n`);
-                            return offer;
-                        }});
-                    }};
-                    return pc;
-                }};
-            }}
-            
-            // 伪装 Notification 权限（防止被检测为自动化）
-            Object.defineProperty(Notification, 'permission', {{
-                get: function() {{
-                    return ['default', 'granted', 'denied'][Math.floor(Math.random() * 3)];
-                }}
-            }});
-            
-            // 伪装 Connection API（添加网络信息变化）
-            if (navigator.connection) {{
-                const connection = navigator.connection;
-                const originalEffectiveType = connection.effectiveType;
-                Object.defineProperty(connection, 'effectiveType', {{
-                    get: function() {{
-                        const types = ['slow-2g', '2g', '3g', '4g'];
-                        return types[Math.floor(Math.random() * types.length)];
-                    }}
-                }});
-                Object.defineProperty(connection, 'rtt', {{
-                    get: function() {{
-                        return Math.floor(Math.random() * 100) + 50; // 50-150ms
-                    }}
-                }});
-                Object.defineProperty(connection, 'downlink', {{
-                    get: function() {{
-                        return Math.random() * 10 + 1; // 1-11 Mbps
-                    }}
-                }});
-            }}
-            
-            // 伪装 DeviceMemory（设备内存）
-            Object.defineProperty(navigator, 'deviceMemory', {{
-                get: function() {{
-                    const memories = [2, 4, 8, 16];
-                    return memories[Math.floor(Math.random() * memories.length)];
-                }}
-            }});
-            
-            // 伪装 HardwareConcurrency（CPU核心数）
-            Object.defineProperty(navigator, 'hardwareConcurrency', {{
-                get: function() {{
-                    const cores = [2, 4, 6, 8, 12, 16];
-                    return cores[Math.floor(Math.random() * cores.length)];
-                }}
-            }});
-            
-            // 伪装 maxTouchPoints（触摸点数量）
-            Object.defineProperty(navigator, 'maxTouchPoints', {{
-                get: function() {{
-                    return Math.floor(Math.random() * 5) + 1; // 1-5个触摸点
-                }}
-            }});
-            
-            // 伪装 DoNotTrack
-            Object.defineProperty(navigator, 'doNotTrack', {{
-                get: function() {{
-                    return ['1', '0', 'unspecified', null][Math.floor(Math.random() * 4)];
-                }}
-            }});
-            
-            // 伪装 Geolocation（添加微小延迟和误差）
-            if (navigator.geolocation) {{
-                const originalGetCurrentPosition = navigator.geolocation.getCurrentPosition;
-                navigator.geolocation.getCurrentPosition = function(success, error, options) {{
-                    const wrappedSuccess = function(position) {{
-                        // 添加微小的位置偏移（模拟真实GPS误差）
-                        const offset = Math.random() * 0.001;
-                        position.coords.latitude += offset;
-                        position.coords.longitude += offset;
-                        success(position);
-                    }};
-                    // 添加随机延迟
-                    setTimeout(() => {{
-                        originalGetCurrentPosition.call(this, wrappedSuccess, error, options);
-                    }}, Math.random() * 100);
-                }};
-            }}
-            
-            // 伪装 Clipboard API（防止检测剪贴板访问模式）
-            if (navigator.clipboard) {{
-                const originalReadText = navigator.clipboard.readText;
-                navigator.clipboard.readText = async function() {{
-                    // 添加微小延迟
-                    await new Promise(resolve => setTimeout(resolve, Math.random() * 50));
-                    return originalReadText.call(this);
-                }};
-            }}
-            
-            // 🔑 关键优化：隐藏CDP运行时特征
-            Object.defineProperty(navigator, 'webdriver', {{
-                get: () => undefined
-            }});
-            
-            // 🔑 隐藏自动化控制特征
-            window.navigator.chrome = {{
-                runtime: {{}},
-                loadTimes: function() {{}},
-                csi: function() {{}},
-                app: {{}}
-            }};
-            
-            // 🔑 隐藏Playwright特征
-            delete window.__playwright;
-            delete window.__pw_manual;
-            delete window.__PW_inspect;
-            
-            // 🔑 伪装chrome对象（防止检测headless）
-            if (!window.chrome) {{
-                window.chrome = {{}};
-            }}
-            window.chrome.runtime = {{
-                id: undefined,
-                sendMessage: function() {{}},
-                connect: function() {{}}
-            }};
-            
-            // 🔑 伪装Permissions API
-            const originalQuery = window.navigator.permissions.query;
-            window.navigator.permissions.query = (parameters) => (
-                parameters.name === 'notifications' ?
-                    Promise.resolve({{ state: Notification.permission }}) :
-                    originalQuery(parameters)
-            );
-            
-            // 🔑 覆盖Function.prototype.toString以隐藏代理
-            const oldToString = Function.prototype.toString;
-            Function.prototype.toString = function() {{
-                if (this === navigator.permissions.query) {{
-                    return 'function query() {{ [native code] }}';
-                }}
-                return oldToString.call(this);
-            }};
+            }})();
         """
     
     def _bezier_curve(self, p0, p1, p2, p3, t):
@@ -1204,56 +886,66 @@ class XianyuSliderStealth:
             return t
     
     def _generate_physics_trajectory(self, distance: float):
-        """基于物理加速度模型生成轨迹 - 极速模式
-        
-        优化策略：
-        1. 极少轨迹点（5-8步）：快速完成
-        2. 持续加速：一气呵成，不减速
-        3. 确保超调50%以上：保证滑动到位
-        4. 无回退：单向滑动
-        """
+        """基于人工节奏生成滑动轨迹。"""
         trajectory = []
-        # 确保超调100%
-        target_distance = distance * random.uniform(2.0, 2.1)  # 超调100-110%
-        
-        # 极少步数（5-8步）
-        steps = random.randint(5, 8)
-        
-        # 极快时间间隔
-        base_delay = random.uniform(0.0002, 0.0005)
-        
-        # 生成轨迹点 - 直线加速
-        for i in range(steps):
-            progress = (i + 1) / steps
-            
-            # 计算当前位置（使用平方加速曲线，越来越快）
-            x = target_distance * (progress ** 1.5)  # 加速曲线
-            
-            # 极小Y轴抖动
-            y = random.uniform(0, 2)
-            
-            # 极短延迟
-            delay = base_delay * random.uniform(0.9, 1.1)
-            
-            trajectory.append((x, y, delay))
-        
-        logger.info(f"【{self.pure_user_id}】极速模式：{len(trajectory)}步，超调100%+")
+        steps = random.randint(*self.trajectory_params["total_steps_range"])
+        base_delay = random.uniform(*self.trajectory_params["base_delay_range"])
+        overshoot = min(max(random.uniform(3.0, 8.0), distance * 0.015), distance * 0.08)
+        target_distance = distance + overshoot
+        settle_steps = random.randint(2, 4)
+        forward_steps = max(steps - settle_steps, 8)
+
+        for i in range(forward_steps):
+            progress = (i + 1) / forward_steps
+            eased = self._easing_function(progress, 'easeInOutCubic')
+            x = target_distance * eased
+            y = math.sin(progress * math.pi) * random.uniform(0.5, 2.0) + random.uniform(-0.8, 0.8)
+
+            if progress < 0.2:
+                delay_factor = random.uniform(1.1, 1.35)
+            elif progress < 0.8:
+                delay_factor = random.uniform(0.9, 1.1)
+            else:
+                delay_factor = random.uniform(1.15, 1.4)
+
+            trajectory.append((round(x, 2), round(y, 2), round(base_delay * delay_factor, 4)))
+
+        for i in range(settle_steps):
+            settle_progress = (i + 1) / settle_steps
+            x = target_distance - overshoot * settle_progress
+            y = random.uniform(-1.2, 1.2)
+            delay = random.uniform(0.08, 0.14)
+            trajectory.append((round(x, 2), round(y, 2), round(delay, 4)))
+
+        if trajectory:
+            last_x, last_y, _ = trajectory[-1]
+            if abs(last_x - distance) > 0.5:
+                trajectory[-1] = (round(distance, 2), round(last_y, 2), round(random.uniform(0.1, 0.16), 4))
+
+        logger.info(
+            f"【{self.pure_user_id}】人工轨迹：{len(trajectory)}步，目标{distance:.1f}px，"
+            f"轻微超调{overshoot:.1f}px，基础延迟{base_delay:.3f}s"
+        )
         return trajectory
     
     def generate_human_trajectory(self, distance: float):
-        """生成人类化滑动轨迹 - 只使用极速物理模型"""
+        """生成人类化滑动轨迹。"""
         try:
-            # 只使用物理加速度模型（移除贝塞尔模型以提高速度和稳定性）
-            logger.info(f"【{self.pure_user_id}】📐 使用极速物理模型生成轨迹")
+            logger.info(f"【{self.pure_user_id}】📐 使用人工节奏轨迹生成滑块动作")
             trajectory = self._generate_physics_trajectory(distance)
-            
-            logger.debug(f"【{self.pure_user_id}】极速模式：一次拖到位，无回退")
-            
+
             # 保存轨迹数据
             self.current_trajectory_data = {
                 "distance": distance,
-                "model": "physics_fast",
+                "model": "manual_stealth",
                 "total_steps": len(trajectory),
+                "base_delay": trajectory[0][2] if trajectory else 0,
+                "jitter_x_range": self.trajectory_params["jitter_x_range"],
+                "jitter_y_range": self.trajectory_params["jitter_y_range"],
+                "slow_factor": self.trajectory_params["slow_factor_range"][1],
+                "acceleration_phase": self.trajectory_params["acceleration_phase"],
+                "fast_phase": self.trajectory_params["fast_phase"],
+                "slow_start_ratio": self.trajectory_params["slow_start_ratio_base"],
                 "trajectory_points": trajectory.copy(),
                 "final_left_px": 0,
                 "completion_used": False,
@@ -1269,10 +961,10 @@ class XianyuSliderStealth:
     def simulate_slide(self, slider_button: ElementHandle, trajectory):
         """模拟滑动 - 优化版本（基于高成功率策略）"""
         try:
-            logger.info(f"【{self.pure_user_id}】开始优化滑动模拟...")
+            logger.info(f"【{self.pure_user_id}】开始执行人工节奏滑动模拟...")
             
             # 等待页面稳定
-            time.sleep(random.uniform(0.1, 0.3))
+            time.sleep(random.uniform(0.15, 0.35))
             
             # 获取滑块按钮中心位置
             button_box = slider_button.bounding_box()
@@ -1316,9 +1008,9 @@ class XianyuSliderStealth:
             # 第三阶段：按下鼠标
             try:
                 self.page.mouse.move(start_x, start_y)
-                time.sleep(random.uniform(0.05, 0.15))
+                time.sleep(random.uniform(0.08, 0.18))
                 self.page.mouse.down()
-                time.sleep(random.uniform(0.05, 0.15))
+                time.sleep(random.uniform(0.08, 0.18))
             except Exception as e:
                 logger.error(f"【{self.pure_user_id}】按下鼠标失败: {e}")
                 return False
@@ -1339,7 +1031,7 @@ class XianyuSliderStealth:
                     self.page.mouse.move(
                         current_x,
                         current_y,
-                        steps=random.randint(1, 3)
+                        steps=random.randint(2, 5)
                     )
                     
                     # 延迟（添加微小随机变化）
@@ -1369,10 +1061,10 @@ class XianyuSliderStealth:
                     logger.warning(f"【{self.pure_user_id}】🎨 刮刮乐模式：在目标位置停顿{pause_duration:.2f}秒观察...")
                     time.sleep(pause_duration)
                 
-                # 释放鼠标
-                time.sleep(random.uniform(0.02, 0.05))
+                # 释放鼠标前稍作停顿，避免拖到即放的机械节奏
+                time.sleep(random.uniform(0.12, 0.22))
                 self.page.mouse.up()
-                time.sleep(random.uniform(0.01, 0.03))
+                time.sleep(random.uniform(0.05, 0.12))
                 
                 # 触发click事件
                 try:
@@ -2250,14 +1942,14 @@ class XianyuSliderStealth:
             return {}
     
     def solve_slider(self, max_retries: int = 3, fast_mode: bool = False):
-        """处理滑块验证（极速模式）
+        """处理滑块验证（人工节奏模式）
         
         Args:
             max_retries: 最大重试次数（默认3次，因为同一个页面连续失败3次后就不会成功了）
             fast_mode: 快速查找模式（当已确认滑块存在时使用，减少等待时间）
         """
         failure_records = []
-        current_strategy = 'ultra_fast'  # 极速策略
+        current_strategy = 'manual_stealth'
         
         for attempt in range(1, max_retries + 1):
             try:
@@ -2265,7 +1957,7 @@ class XianyuSliderStealth:
                 
                 # 如果不是第一次尝试，短暂等待后重试
                 if attempt > 1:
-                    retry_delay = random.uniform(0.5, 1.0)  # 减少等待时间
+                    retry_delay = random.uniform(1.0, 1.8)
                     logger.info(f"【{self.pure_user_id}】等待{retry_delay:.2f}秒后重试...")
                     time.sleep(retry_delay)
                     
@@ -2344,6 +2036,16 @@ class XianyuSliderStealth:
         
         # 所有尝试都失败了
         logger.error(f"【{self.pure_user_id}】滑块验证失败，已尝试{max_retries}次")
+        try:
+            if hasattr(self, 'page') and self.page:
+                screenshots_dir = "static/uploads/images"
+                os.makedirs(screenshots_dir, exist_ok=True)
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                screenshot_path = os.path.join(screenshots_dir, f"slider_fail_{self.pure_user_id}_{timestamp}.jpg")
+                self.page.screenshot(path=screenshot_path, full_page=False)
+                logger.info(f"【{self.pure_user_id}】滑块失败截图已保存: {screenshot_path.replace('\\', '/')}")
+        except Exception as screenshot_e:
+            logger.warning(f"【{self.pure_user_id}】保存滑块失败截图时出错: {screenshot_e}")
         
         # 输出失败分析摘要
         if failure_records:

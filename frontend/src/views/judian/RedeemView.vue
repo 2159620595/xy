@@ -2718,6 +2718,11 @@ function showToast(message) {
 .confirm-modal {
   width: min(520px, 100%);
   padding: 20px;
+  max-height: min(720px, calc(100vh - 32px));
+  max-height: min(720px, calc(100dvh - 32px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
 }
 
 .camera-modal {
@@ -2732,6 +2737,14 @@ function showToast(message) {
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 14px;
+}
+
+.confirm-modal__header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding-bottom: 10px;
+  background: #13161f;
 }
 
 .confirm-modal__title,
@@ -3031,6 +3044,11 @@ function showToast(message) {
   .pay-result-modal {
     width: min(100%, 420px);
     border-radius: 16px;
+  }
+
+  .confirm-modal {
+    max-height: calc(100dvh - 24px - env(safe-area-inset-bottom));
+    padding-bottom: calc(16px + env(safe-area-inset-bottom));
   }
 
   .camera-frame {
