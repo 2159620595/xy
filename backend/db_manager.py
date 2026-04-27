@@ -3117,7 +3117,7 @@ class DBManager:
                 SELECT mn.id, mn.channel_id, mn.enabled, nc.name, nc.type, nc.config
                 FROM message_notifications mn
                 JOIN notification_channels nc ON mn.channel_id = nc.id
-                WHERE mn.cookie_id = ? AND nc.enabled = 1
+                WHERE mn.cookie_id = ? AND nc.enabled = TRUE
                 ORDER BY mn.id
                 ''', (cookie_id,))
 
@@ -3147,7 +3147,7 @@ class DBManager:
                 SELECT mn.cookie_id, mn.id, mn.channel_id, mn.enabled, nc.name, nc.type, nc.config
                 FROM message_notifications mn
                 JOIN notification_channels nc ON mn.channel_id = nc.id
-                WHERE nc.enabled = 1
+                WHERE nc.enabled = TRUE
                 ORDER BY mn.cookie_id, mn.id
                 ''')
 
@@ -4487,7 +4487,7 @@ class DBManager:
                        c.is_multi_spec, c.spec_name, c.spec_value
                 FROM delivery_rules dr
                 LEFT JOIN cards c ON dr.card_id = c.id
-                WHERE dr.enabled = 1 AND c.enabled = 1
+                WHERE dr.enabled = TRUE AND c.enabled = TRUE
                 AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
                 ORDER BY
                     CASE
@@ -4944,7 +4944,7 @@ class DBManager:
                        c.is_multi_spec, c.spec_name, c.spec_value
                 FROM delivery_rules dr
                 LEFT JOIN cards c ON dr.card_id = c.id
-                WHERE dr.enabled = 1 AND c.enabled = 1
+                WHERE dr.enabled = TRUE AND c.enabled = TRUE
                 AND dr.item_id = ?
                 ORDER BY dr.delivery_times ASC, dr.id ASC
                 ''', (item_id,))
@@ -5052,7 +5052,7 @@ class DBManager:
                        c.is_multi_spec, c.spec_name, c.spec_value
                 FROM delivery_rules dr
                 LEFT JOIN cards c ON dr.card_id = c.id
-                WHERE dr.enabled = 1 AND c.enabled = 1
+                WHERE dr.enabled = TRUE AND c.enabled = TRUE
                 AND dr.item_id = ?
                 ORDER BY dr.delivery_times ASC, dr.id ASC
                 ''', (item_id,))
