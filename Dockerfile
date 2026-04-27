@@ -1,14 +1,30 @@
 # 使用Python 3.11作为基础镜像
 FROM python:3.11-slim-bookworm AS base
 
+ARG DEBIAN_MIRROR=mirrors.tuna.tsinghua.edu.cn
+
 # 设置环境变量
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_DEFAULT_TIMEOUT=120 \
+    PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
     DEBIAN_FRONTEND=noninteractive \
     TZ=Asia/Shanghai \
     DOCKER_ENV=true \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+RUN set -e; \
+    if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+      sed -i "s|http://deb.debian.org/debian|https://${DEBIAN_MIRROR}/debian|g" /etc/apt/sources.list.d/debian.sources; \
+      sed -i "s|http://security.debian.org/debian-security|https://${DEBIAN_MIRROR}/debian-security|g" /etc/apt/sources.list.d/debian.sources; \
+      sed -i "s|http://deb.debian.org/debian-security|https://${DEBIAN_MIRROR}/debian-security|g" /etc/apt/sources.list.d/debian.sources; \
+    fi; \
+    if [ -f /etc/apt/sources.list ]; then \
+      sed -i "s|http://deb.debian.org/debian|https://${DEBIAN_MIRROR}/debian|g" /etc/apt/sources.list; \
+      sed -i "s|http://security.debian.org/debian-security|https://${DEBIAN_MIRROR}/debian-security|g" /etc/apt/sources.list; \
+      sed -i "s|http://deb.debian.org/debian-security|https://${DEBIAN_MIRROR}/debian-security|g" /etc/apt/sources.list; \
+    fi
 
 # 设置工作目录
 WORKDIR /app
@@ -121,7 +137,6 @@ ENV PATH="$VIRTUAL_ENV/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bi
 
 RUN npm ci --prefix /app/backend/judian/scripts --omit=dev --no-audit --no-fund
 
-# Browser shared libraries are installed above; only download Chromium here.
 RUN playwright install chromium
 
 # 创建必要的目录并设置权限
