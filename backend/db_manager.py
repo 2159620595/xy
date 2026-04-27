@@ -1951,6 +1951,13 @@ class DBManager:
         """批量执行SQL并记录日志"""
         self._log_sql(sql, f"批量执行 {len(params_list)} 条记录", "EXECUTEMANY")
         return cursor.executemany(sql, params_list)
+
+    def _rollback_quietly(self):
+        """在异常路径下尽量恢复连接状态，避免 PostgreSQL 事务长期停留在 aborted 状态。"""
+        try:
+            self.conn.rollback()
+        except Exception as rollback_error:
+            logger.debug(f"数据库回滚失败，忽略: {rollback_error}")
     
     # -------------------- Cookie操作 --------------------
     def save_cookie(self, cookie_id: str, cookie_value: str, user_id: int = None) -> bool:
@@ -2034,6 +2041,7 @@ class DBManager:
                 return {row[0]: row[1] for row in cursor.fetchall()}
             except Exception as e:
                 logger.error(f"获取所有Cookie失败: {e}")
+                self._rollback_quietly()
                 return {}
 
 
@@ -2094,6 +2102,7 @@ class DBManager:
                 return None
             except Exception as e:
                 logger.error(f"获取Cookie详细信息失败: {e}")
+                self._rollback_quietly()
                 return None
 
     def update_auto_confirm(self, cookie_id: str, auto_confirm: bool) -> bool:
@@ -2312,6 +2321,7 @@ class DBManager:
                 return True  # 默认开启
             except Exception as e:
                 logger.error(f"获取自动确认发货设置失败: {e}")
+                self._rollback_quietly()
                 return True  # 出错时默认开启
     
     # -------------------- 关键字操作 --------------------
@@ -2621,6 +2631,7 @@ class DBManager:
                 return bool(result[0]) if result else True  # 默认启用
             except Exception as e:
                 logger.error(f"获取Cookie状态失败: {e}")
+                self._rollback_quietly()
                 return True  # 出错时默认启用
 
     def get_all_cookie_status(self) -> Dict[str, bool]:
@@ -3190,6 +3201,7 @@ class DBManager:
                 return notifications
             except Exception as e:
                 logger.error(f"获取账号通知配置失败: {e}")
+                self._rollback_quietly()
                 return []
 
     def get_all_message_notifications(self) -> Dict[str, List[Dict[str, any]]]:
@@ -3590,6 +3602,7 @@ class DBManager:
                 return None
             except Exception as e:
                 logger.error(f"获取用户信息失败: {e}")
+                self._rollback_quietly()
                 return None
 
     def get_user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
@@ -3645,6 +3658,7 @@ class DBManager:
                 return None
             except Exception as e:
                 logger.error(f"获取用户信息失败: {e}")
+                self._rollback_quietly()
                 return None
 
     def get_user_by_nickname(self, nickname: str) -> Optional[Dict[str, Any]]:
@@ -5739,6 +5753,7 @@ class DBManager:
 
         except Exception as e:
             logger.error(f"获取所有商品信息失败: {e}")
+            self._rollback_quietly()
             return []
 
     def update_item_detail(self, cookie_id: str, item_id: str, item_detail: str) -> bool:
@@ -6951,6 +6966,7 @@ class DBManager:
                 return False
         except Exception as e:
             logger.error(f"更新风控日志失败: {e}")
+            self._rollback_quietly()
             return False
 
     def get_risk_control_logs(self, cookie_id: str = None, limit: int = 100, offset: int = 0) -> List[Dict]:
@@ -7260,6 +7276,7 @@ class DBManager:
                     logger.info(f"Token缓存未命中: user_id={user_id}")
         except Exception as e:
             logger.warning(f"获取Token缓存失败: {e}")
+            self._rollback_quietly()
         return None
 
     def set_cached_token(self, user_id: str, token: str, device_id: str):
@@ -7296,6 +7313,7 @@ class DBManager:
                 logger.info(f"Token已缓存到数据库: user_id={user_id}, 过期时间={expire_at_str}, TTL={ttl_hours:.1f}小时")
         except Exception as e:
             logger.warning(f"缓存Token到数据库失败: {e}")
+            self._rollback_quietly()
 
     def delete_cached_token(self, user_id: str):
         """
@@ -7316,6 +7334,7 @@ class DBManager:
                 logger.info(f"已清除Token缓存: user_id={user_id}")
         except Exception as e:
             logger.warning(f"清除Token缓存失败: {e}")
+            self._rollback_quietly()
 
 
 # 全局单例
