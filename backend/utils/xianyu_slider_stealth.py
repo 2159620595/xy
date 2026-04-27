@@ -315,11 +315,26 @@ class XianyuSliderStealth:
             # 随机选择浏览器特征
             browser_features = self._get_random_browser_features()
             
-            # 启动浏览器，使用随机特征
-            logger.info(f"【{self.pure_user_id}】启动浏览器，headless模式: {self.headless}")
-            self.browser = self.playwright.chromium.launch(
-                headless=self.headless,
-                args=[
+            # 优先使用系统 Chromium，避免容器内回退到缺失的 Playwright 浏览器目录
+            chromium_candidates = [
+                os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"),
+                shutil.which("chromium"),
+                shutil.which("chromium-browser"),
+                shutil.which("google-chrome"),
+                shutil.which("google-chrome-stable"),
+                "/usr/bin/chromium",
+                "/usr/bin/chromium-browser",
+                "/usr/bin/google-chrome",
+                "/usr/bin/google-chrome-stable",
+            ]
+            chromium_executable = next(
+                (path for path in chromium_candidates if path and os.path.exists(path)),
+                None
+            )
+
+            launch_options = {
+                "headless": self.headless,
+                "args": [
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
@@ -373,7 +388,16 @@ class XianyuSliderStealth:
                     "--edge-skip-compat-layer-relaunch",
                     "--allow-pre-commit-input"
                 ]
-            )
+            }
+            if chromium_executable:
+                launch_options["executable_path"] = chromium_executable
+                logger.info(f"【{self.pure_user_id}】使用系统Chromium: {chromium_executable}")
+            else:
+                logger.warning(f"【{self.pure_user_id}】未找到系统Chromium，将使用Playwright默认浏览器")
+
+            # 启动浏览器，使用随机特征
+            logger.info(f"【{self.pure_user_id}】启动浏览器，headless模式: {self.headless}")
+            self.browser = self.playwright.chromium.launch(**launch_options)
             
             # 验证浏览器已启动
             if not self.browser or not self.browser.is_connected():
