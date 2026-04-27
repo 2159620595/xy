@@ -192,7 +192,15 @@ ENV PATH="$VIRTUAL_ENV/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bi
 
 RUN npm ci --prefix /app/backend/judian/scripts --omit=dev --no-audit --no-fund
 
-RUN playwright install chromium
+RUN chromium_dir=$(find "${PLAYWRIGHT_BROWSERS_PATH}" -maxdepth 1 -name "chromium-*" -type d 2>/dev/null | head -1); \
+    if [ -n "$chromium_dir" ]; then \
+        echo "Playwright chromium already exists at $chromium_dir, skipping download."; \
+    else \
+        echo "Playwright chromium not found, downloading..." && \
+        playwright install chromium \
+        || (echo "Mirror failed, falling back to official..." && \
+            PLAYWRIGHT_DOWNLOAD_HOST="" playwright install chromium); \
+    fi
 
 # 创建必要的目录并设置权限
 RUN mkdir -p /app/backend/logs /app/backend/data /app/backend/backups /app/backend/static/uploads/images && \
