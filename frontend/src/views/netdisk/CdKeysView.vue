@@ -39,7 +39,7 @@
         <span style="font-size: 13px">
           兑换接口地址：
           <n-tag size="small" style="font-family: monospace; margin: 0 4px">
-            GET {{ baseUrl }}/redeem?code=卡密串码
+            GET {{ currentOrigin }}/netdisk/redeem?code=卡密串码
           </n-tag>
           返回对应账号的 Cookie 及授权天数
         </span>
@@ -95,7 +95,11 @@ const generating = ref(false)
 const tableData = ref([])
 const accounts = ref([])
 
-const baseUrl = window.location.origin // 前端地址，生产环境直接用域名
+const currentOrigin =
+  typeof window !== 'undefined' ? window.location.origin : ''
+
+const resolveRedeemUrl = (code) =>
+  `${currentOrigin}/netdisk/redeem?code=${encodeURIComponent(code)}`
 
 const form = ref({ accountId: null, days: 30, count: 10, maxUses: 0 })
 
@@ -232,7 +236,7 @@ const columns = [
                 quaternary: true,
                 type: 'success',
                 disabled: r.status === 2,
-                onClick: () => window.open(`${baseUrl}/redeem?code=${r.key_code}`, '_blank'),
+                onClick: () => window.open(resolveRedeemUrl(r.key_code), '_blank'),
               },
               { default: () => '打开页面' },
             ),
@@ -322,7 +326,7 @@ const copyCode = async (code) => {
 }
 
 const copyRedeemUrl = async (code) => {
-  const url = `${baseUrl}/redeem?code=${code}`
+  const url = resolveRedeemUrl(code)
   try {
     if (navigator.clipboard && navigator.clipboard.writeText) {
       await navigator.clipboard.writeText(url)

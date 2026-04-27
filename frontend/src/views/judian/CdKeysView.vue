@@ -200,9 +200,6 @@ import { getJudianSectionMeta } from "@/views/judian/shared/page-meta";
 
 const LEGACY_MOCK_STORAGE_KEY = "judian_frontend_mock_state_v1";
 const DIAMONDS_PER_DAY = 5;
-const PUBLIC_REDEEM_ORIGIN = String(
-  import.meta.env.VITE_PUBLIC_REDEEM_ORIGIN || "",
-).replace(/\/+$/, "");
 const specOptions = [
   { label: "天卡", value: "day", duration: 1 },
   { label: "周卡", value: "week", duration: 7 },
@@ -501,8 +498,7 @@ function resolveAccountName(accountId) {
 
 function resolveRedeemUrl(code) {
   const baseOrigin =
-    PUBLIC_REDEEM_ORIGIN ||
-    (typeof window !== "undefined" ? window.location.origin : "");
+    typeof window !== "undefined" ? window.location.origin : "";
   return `${baseOrigin}/judian/redeem?code=${encodeURIComponent(code)}`;
 }
 
