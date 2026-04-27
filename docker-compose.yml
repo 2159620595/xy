@@ -1,9 +1,8 @@
 services:
   xianyu-app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: xianyu-auto-reply:latest
+    # ✅ 使用 CI 预构建并推送到 GHCR 的镜像，服务器不再本地 build
+    # 原来的 build: { context: ., dockerfile: Dockerfile } 已移除
+    image: ghcr.io/2159620595/xy:latest
     container_name: xianyu-auto-reply
     restart: unless-stopped
     # 使用root用户避免权限问题
@@ -60,7 +59,6 @@ services:
       - TOKEN_REFRESH_INTERVAL=${TOKEN_REFRESH_INTERVAL:-3600}
       - TOKEN_RETRY_INTERVAL=${TOKEN_RETRY_INTERVAL:-300}
       - MESSAGE_EXPIRE_TIME=${MESSAGE_EXPIRE_TIME:-300000}
-
     networks:
       - xianyu-network
     healthcheck:
