@@ -380,6 +380,9 @@ class DBManager:
             if self._table_exists(cursor, table_name):
                 self._ensure_column_exists(cursor, table_name, column_name, definition)
 
+        self._ensure_item_info_uniqueness(cursor)
+        self._ensure_item_reply_uniqueness(cursor)
+
         self._execute_sql(
             cursor,
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_nickname_unique ON users(nickname)",
@@ -1073,6 +1076,9 @@ class DBManager:
             # 执行数据库迁移
             self._migrate_database(cursor)
 
+            self._ensure_item_info_uniqueness(cursor)
+            self._ensure_item_reply_uniqueness(cursor)
+
             self.conn.commit()
             logger.info("数据库初始化完成")
         except Exception as e:
@@ -1211,6 +1217,75 @@ class DBManager:
             logger.info("正在为 item_images 表添加 thumbnail_url 列...")
             self._execute_sql(cursor, "ALTER TABLE item_images ADD COLUMN thumbnail_url TEXT")
             logger.info("item_images 表 thumbnail_url 列添加完成")
+
+    def _cleanup_table_duplicates_by_cookie_item(self, cursor, table_name: str) -> Dict[str, int]:
+        """清理指定表中同一账号同一商品的历史重复记录，仅保留最新一条。"""
+        if not self._is_valid_identifier(table_name):
+            raise ValueError(f"非法表名: {table_name}")
+        if not self._table_exists(cursor, table_name):
+            return {"groups": 0, "removed": 0}
+
+        self._execute_sql(
+            cursor,
+            f"""
+            SELECT cookie_id, item_id, COUNT(*) AS duplicate_count
+            FROM {table_name}
+            GROUP BY cookie_id, item_id
+            HAVING COUNT(*) > 1
+            """,
+        )
+        duplicate_groups = cursor.fetchall()
+        removed_count = 0
+
+        for cookie_id, item_id, _ in duplicate_groups:
+            self._execute_sql(
+                cursor,
+                f"""
+                SELECT id
+                FROM {table_name}
+                WHERE cookie_id = ? AND item_id = ?
+                ORDER BY updated_at DESC, created_at DESC, id DESC
+                """,
+                (cookie_id, item_id),
+            )
+            rows = cursor.fetchall()
+            delete_ids = [row[0] for row in rows[1:] if row and row[0] is not None]
+            if not delete_ids:
+                continue
+
+            placeholders = ",".join(["?"] * len(delete_ids))
+            self._execute_sql(
+                cursor,
+                f"DELETE FROM {table_name} WHERE id IN ({placeholders})",
+                tuple(delete_ids),
+            )
+            removed_count += len(delete_ids)
+
+        return {"groups": len(duplicate_groups), "removed": removed_count}
+
+    def _ensure_item_info_uniqueness(self, cursor):
+        """确保 item_info 按账号+商品唯一，并在建索引前清理历史重复。"""
+        cleanup_result = self._cleanup_table_duplicates_by_cookie_item(cursor, "item_info")
+        if cleanup_result["removed"]:
+            logger.warning(
+                f"清理 item_info 历史重复记录: groups={cleanup_result['groups']}, removed={cleanup_result['removed']}"
+            )
+        self._execute_sql(
+            cursor,
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_item_info_cookie_item_unique ON item_info(cookie_id, item_id)"
+        )
+
+    def _ensure_item_reply_uniqueness(self, cursor):
+        """确保 item_replay 按账号+商品唯一，并在建索引前清理历史重复。"""
+        cleanup_result = self._cleanup_table_duplicates_by_cookie_item(cursor, "item_replay")
+        if cleanup_result["removed"]:
+            logger.warning(
+                f"清理 item_replay 历史重复记录: groups={cleanup_result['groups']}, removed={cleanup_result['removed']}"
+            )
+        self._execute_sql(
+            cursor,
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_item_replay_cookie_item_unique ON item_replay(cookie_id, item_id)"
+        )
 
     def _update_cards_table_constraints(self, cursor):
         """更新cards表的CHECK约束以支持image类型"""
@@ -5311,67 +5386,47 @@ class DBManager:
             with self.lock:
                 cursor = self.conn.cursor()
 
-                # 检查商品是否已存在
-                cursor.execute('''
-                SELECT id, item_detail FROM item_info
-                WHERE cookie_id = ? AND item_id = ?
-                ''', (cookie_id, item_id))
-
-                existing = cursor.fetchone()
-
-                if existing:
-                    # 如果传入的商品详情有值，则用最新数据覆盖
-                    if item_data is not None and item_data:
-                        # 处理字符串类型的详情数据
-                        if isinstance(item_data, str):
-                            cursor.execute('''
-                            UPDATE item_info SET
-                                item_detail = ?, updated_at = CURRENT_TIMESTAMP
-                            WHERE cookie_id = ? AND item_id = ?
-                            ''', (item_data, cookie_id, item_id))
-                        else:
-                            # 处理字典类型的详情数据（向后兼容）
-                            cursor.execute('''
-                            UPDATE item_info SET
-                                item_title = ?, item_description = ?, item_category = ?,
-                                item_price = ?, item_detail = ?, updated_at = CURRENT_TIMESTAMP
-                            WHERE cookie_id = ? AND item_id = ?
-                            ''', (
-                                item_data.get('title', ''),
-                                item_data.get('description', ''),
-                                item_data.get('category', ''),
-                                item_data.get('price', ''),
-                                json.dumps(item_data, ensure_ascii=False),
-                                cookie_id, item_id
-                            ))
-                        logger.info(f"更新商品信息（覆盖）: {item_id}")
-                    else:
-                        # 如果商品详情没有数据，则不更新，只记录存在
-                        logger.debug(f"商品信息已存在，无新数据，跳过更新: {item_id}")
-                        return True
+                if isinstance(item_data, str):
+                    self._execute_sql(
+                        cursor,
+                        '''
+                        INSERT INTO item_info (cookie_id, item_id, item_detail, created_at, updated_at)
+                        VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                        ON CONFLICT(cookie_id, item_id) DO UPDATE SET
+                            item_detail = excluded.item_detail,
+                            updated_at = CURRENT_TIMESTAMP
+                        ''',
+                        (cookie_id, item_id, item_data),
+                    )
                 else:
-                    # 新增商品信息
-                    if isinstance(item_data, str):
-                        # 直接保存字符串详情
-                        cursor.execute('''
-                        INSERT INTO item_info (cookie_id, item_id, item_detail)
-                        VALUES (?, ?, ?)
-                        ''', (cookie_id, item_id, item_data))
-                    else:
-                        # 处理字典类型的详情数据（向后兼容）
-                        cursor.execute('''
-                        INSERT INTO item_info (cookie_id, item_id, item_title, item_description,
-                                             item_category, item_price, item_detail)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        ''', (
-                            cookie_id, item_id,
+                    self._execute_sql(
+                        cursor,
+                        '''
+                        INSERT INTO item_info (
+                            cookie_id, item_id, item_title, item_description,
+                            item_category, item_price, item_detail, created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                        ON CONFLICT(cookie_id, item_id) DO UPDATE SET
+                            item_title = excluded.item_title,
+                            item_description = excluded.item_description,
+                            item_category = excluded.item_category,
+                            item_price = excluded.item_price,
+                            item_detail = excluded.item_detail,
+                            updated_at = CURRENT_TIMESTAMP
+                        ''',
+                        (
+                            cookie_id,
+                            item_id,
                             item_data.get('title', '') if item_data else '',
                             item_data.get('description', '') if item_data else '',
                             item_data.get('category', '') if item_data else '',
                             item_data.get('price', '') if item_data else '',
-                            json.dumps(item_data, ensure_ascii=False) if item_data else ''
-                        ))
-                    logger.info(f"新增商品信息: {item_id}")
+                            json.dumps(item_data, ensure_ascii=False) if item_data else '',
+                        ),
+                    )
+
+                logger.info(f"保存商品信息成功: {item_id}")
 
                 self.conn.commit()
                 return True
@@ -5397,6 +5452,8 @@ class DBManager:
                 cursor.execute('''
                 SELECT * FROM item_info
                 WHERE cookie_id = ? AND item_id = ?
+                ORDER BY updated_at DESC, created_at DESC, id DESC
+                LIMIT 1
                 ''', (cookie_id, item_id))
 
                 row = cursor.fetchone()
@@ -6792,6 +6849,8 @@ class DBManager:
                     SELECT reply_content, reply_once, created_at, updated_at
                     FROM item_replay
                     WHERE cookie_id = ? AND item_id = ?
+                    ORDER BY updated_at DESC, created_at DESC, id DESC
+                    LIMIT 1
                 ''', (cookie_id, item_id))
 
                 row = cursor.fetchone()
@@ -6807,6 +6866,33 @@ class DBManager:
             logger.error(f"获取指定商品回复失败: {e}")
             self._rollback_quietly()
             return None
+
+    def _cleanup_item_reply_duplicates(self, cursor, cookie_id: str, item_id: str) -> int:
+        """清理同一账号同一商品的历史重复回复，仅保留最新一条。"""
+        cursor.execute(
+            '''
+                SELECT id
+                FROM item_replay
+                WHERE cookie_id = ? AND item_id = ?
+                ORDER BY updated_at DESC, created_at DESC, id DESC
+            ''',
+            (cookie_id, item_id),
+        )
+        duplicate_rows = cursor.fetchall()
+        if len(duplicate_rows) <= 1:
+            return 0
+
+        keep_id = duplicate_rows[0][0]
+        delete_ids = [row[0] for row in duplicate_rows[1:] if row and row[0] != keep_id]
+        if not delete_ids:
+            return 0
+
+        placeholders = ",".join(["?"] * len(delete_ids))
+        cursor.execute(
+            f"DELETE FROM item_replay WHERE id IN ({placeholders})",
+            tuple(delete_ids),
+        )
+        return len(delete_ids)
 
     def update_item_reply(self, cookie_id: str, item_id: str, reply_content: str, reply_once: bool = False) -> bool:
         """
@@ -6836,6 +6922,12 @@ class DBManager:
                         INSERT INTO item_replay (item_id, cookie_id, reply_content, reply_once, created_at, updated_at)
                         VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                     ''', (item_id, cookie_id, reply_content, bool(reply_once)))
+
+                duplicate_count = self._cleanup_item_reply_duplicates(cursor, cookie_id, item_id)
+                if duplicate_count:
+                    logger.info(
+                        f"清理商品回复重复记录: cookie_id={cookie_id}, item_id={item_id}, removed={duplicate_count}"
+                    )
 
                 self.conn.commit()
             return True
@@ -6943,19 +7035,26 @@ class DBManager:
 
                 sql = f'''
                 SELECT
+                    r.id,
                     {", ".join(select_fields)}
                 FROM item_replay r
                 {' '.join(joins)}
                 WHERE r.cookie_id = ?
-                ORDER BY {updated_at_expr} DESC
+                ORDER BY {updated_at_expr} DESC, {created_at_expr} DESC, r.id DESC
                 '''
                 cursor.execute(sql, (cookie_id,))
 
                 columns = [description[0] for description in cursor.description]
                 items = []
+                seen_item_ids = set()
 
                 for row in cursor.fetchall():
                     item_info = dict(zip(columns, row))
+                    current_item_id = str(item_info.get('item_id') or '')
+                    if not current_item_id or current_item_id in seen_item_ids:
+                        continue
+                    seen_item_ids.add(current_item_id)
+                    item_info.pop('id', None)
 
                     items.append(item_info)
 
