@@ -14,7 +14,9 @@ import { ElMessage, ElMessageBox, type ElTable } from "element-plus";
 import { getAccountDetails } from "@/api/accounts";
 import {
   batchDeleteItemDefaultReply,
+  batchDeleteItems,
   batchSaveItemDefaultReply,
+  deleteItem,
   deleteItemDefaultReply,
   fetchAllItemsFromAccount,
   getItemDefaultReply,
@@ -25,7 +27,7 @@ import {
   uploadItemDefaultReplyImage,
   updateItem,
 } from "@/api/items";
-import type { AccountDetail, Item } from "@/types";
+import type { AccountDetail, ApiResponse, Item } from "@/types";
 
 type StatusFilter =
   | "all"
@@ -39,6 +41,8 @@ const loading = ref(true);
 const fetching = ref(false);
 const actionLoading = ref<string | null>(null);
 const batchAction = ref<"relist" | "polish" | null>(null);
+const itemDeletingKey = ref<string | null>(null);
+const batchDeletingItems = ref(false);
 const accounts = ref<AccountDetail[]>([]);
 const items = ref<Item[]>([]);
 const selectedRows = ref<Item[]>([]);
@@ -197,13 +201,26 @@ const activeFilterCount = computed(() => {
   if (statusFilter.value !== "all") count += 1;
   return count;
 });
-const selectedRowsCookieId = computed(() => {
-  if (!selectedRows.value.length) return null;
-  const firstCookieId = selectedRows.value[0].cookie_id;
-  const sameAccount = selectedRows.value.every(
-    (item) => item.cookie_id === firstCookieId,
+const selectedRowsGroupedByCookie = computed(() => {
+  const groups = new Map<string, Item[]>();
+  selectedRows.value.forEach((item) => {
+    const cookieId = item.cookie_id;
+    if (!cookieId) return;
+    const list = groups.get(cookieId) || [];
+    list.push(item);
+    groups.set(cookieId, list);
+  });
+  return groups;
+});
+const selectedCookieCount = computed(
+  () => selectedRowsGroupedByCookie.value.size,
+);
+const isAllFilteredSelected = computed(() => {
+  if (!filteredItems.value.length) return false;
+  const selectedKeys = new Set(selectedRows.value.map(getDefaultReplyKey));
+  return filteredItems.value.every((item) =>
+    selectedKeys.has(getDefaultReplyKey(item)),
   );
-  return sameAccount ? firstCookieId : null;
 });
 
 const filteredItems = computed(() => {
@@ -300,6 +317,44 @@ const handleSelectFilteredItems = () => {
     tableRef.value?.toggleRowSelection(item, true);
   });
   ElMessage.success(`已勾选当前筛选结果 ${filteredItems.value.length} 个商品`);
+};
+
+const handleToggleSelectAllFiltered = () => {
+  if (!filteredItems.value.length) {
+    ElMessage.warning("当前没有可勾选的商品");
+    return;
+  }
+
+  if (isAllFilteredSelected.value) {
+    clearTableSelection();
+    ElMessage.success("已取消当前列表全选");
+    return;
+  }
+
+  handleSelectFilteredItems();
+};
+
+const getBatchActionGroups = () =>
+  Array.from(selectedRowsGroupedByCookie.value.entries()).map(
+    ([cookieId, rows]) => ({
+      cookieId,
+      itemIds: rows.map((item) => item.item_id).filter(Boolean),
+      rows,
+    }),
+  );
+
+const getBatchResponseCount = (
+  response: ApiResponse,
+  field: "success_count" | "fail_count",
+) => {
+  const data =
+    response.data && typeof response.data === "object"
+      ? (response.data as Record<string, unknown>)
+      : undefined;
+  const dataValue = data?.[field];
+  if (typeof dataValue === "number") return dataValue;
+  const topLevelValue = (response as unknown as Record<string, unknown>)[field];
+  return typeof topLevelValue === "number" ? topLevelValue : 0;
 };
 
 const downloadTextFile = (
@@ -594,6 +649,91 @@ const handleBatchPolish = async () => {
   await loadItems();
 };
 
+const handleDeleteItem = async (item: Item) => {
+  try {
+    await ElMessageBox.confirm(
+      `确定删除商品 ${getItemTitle(item)}（${item.item_id}）吗？`,
+      "删除确认",
+      {
+        type: "warning",
+        confirmButtonText: "删除",
+        cancelButtonText: "取消",
+      },
+    );
+  } catch {
+    return;
+  }
+
+  itemDeletingKey.value = getDefaultReplyKey(item);
+  try {
+    const response = await deleteItem(item.cookie_id, item.item_id);
+    if (!response.success) {
+      throw new Error(
+        response.detail || response.message || response.msg || "商品删除失败",
+      );
+    }
+
+    ElMessage.success("商品已删除");
+    await loadItems();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "商品删除失败";
+    ElMessage.error(message);
+  } finally {
+    itemDeletingKey.value = null;
+  }
+};
+
+const handleBatchDeleteItems = async () => {
+  if (!selectedRows.value.length) {
+    ElMessage.warning("请先勾选要删除的商品");
+    return;
+  }
+
+  try {
+    await ElMessageBox.confirm(
+      `确定批量删除 ${selectedRows.value.length} 个商品吗？`,
+      "批量删除确认",
+      {
+        type: "warning",
+        confirmButtonText: "批量删除",
+        cancelButtonText: "取消",
+      },
+    );
+  } catch {
+    return;
+  }
+
+  batchDeletingItems.value = true;
+  try {
+    const response = await batchDeleteItems(
+      selectedRows.value.map((item) => ({
+        cookie_id: item.cookie_id,
+        item_id: item.item_id,
+      })),
+    );
+    if (!response.success) {
+      throw new Error(
+        response.detail || response.message || response.msg || "批量删除失败",
+      );
+    }
+
+    const successCount = response.data?.success_count ?? 0;
+    const failedCount =
+      response.data?.failed_count ??
+      Math.max(selectedRows.value.length - successCount, 0);
+    ElMessage[failedCount ? "warning" : "success"](
+      `批量删除完成：成功 ${successCount}，失败 ${failedCount}`,
+    );
+    clearTableSelection();
+    await loadItems();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "批量删除失败";
+    ElMessage.error(message);
+  } finally {
+    batchDeletingItems.value = false;
+  }
+};
+
 const resetDefaultReplyForm = () => {
   defaultReplyForm.value = {
     replyContent: "",
@@ -774,11 +914,6 @@ const openBatchDefaultReplyDialog = () => {
     return;
   }
 
-  if (!selectedRowsCookieId.value) {
-    ElMessage.warning("批量默认回复只能对同一账号的商品操作");
-    return;
-  }
-
   resetBatchDefaultReplyForm();
   batchDefaultReplyDialogVisible.value = true;
 };
@@ -789,29 +924,33 @@ const closeBatchDefaultReplyDialog = () => {
 };
 
 const handleBatchSaveDefaultReply = async () => {
-  if (!selectedCount.value || !selectedRowsCookieId.value) {
-    ElMessage.warning("请先选择同一账号下的商品");
+  if (!selectedCount.value) {
+    ElMessage.warning("请先勾选商品");
     return;
   }
 
   batchDefaultReplySaving.value = true;
   try {
-    const itemIds = selectedRows.value.map((item) => item.item_id);
-    const response = await batchSaveItemDefaultReply(
-      selectedRowsCookieId.value,
-      {
-        item_ids: itemIds,
+    let successCount = 0;
+    let failCount = 0;
+
+    for (const group of getBatchActionGroups()) {
+      const response = await batchSaveItemDefaultReply(group.cookieId, {
+        item_ids: group.itemIds,
         reply_content: batchDefaultReplyForm.value.replyContent,
         reply_image_url: batchDefaultReplyForm.value.replyImage || undefined,
         enabled: batchDefaultReplyForm.value.enabled,
         reply_once: batchDefaultReplyForm.value.replyOnce,
-      },
-    );
+      });
 
-    if (!response.success) {
-      throw new Error(
-        response.detail || response.message || response.msg || "批量保存失败",
-      );
+      if (!response.success) {
+        throw new Error(
+          response.detail || response.message || response.msg || "批量保存失败",
+        );
+      }
+
+      successCount += getBatchResponseCount(response, "success_count");
+      failCount += getBatchResponseCount(response, "fail_count");
     }
 
     for (const item of selectedRows.value) {
@@ -821,7 +960,9 @@ const handleBatchSaveDefaultReply = async () => {
       };
     }
 
-    ElMessage.success(`批量保存成功，共 ${itemIds.length} 个商品`);
+    ElMessage[failCount ? "warning" : "success"](
+      `批量保存完成：成功 ${successCount}，失败 ${failCount}`,
+    );
     closeBatchDefaultReplyDialog();
     clearTableSelection();
   } catch (error) {
@@ -833,8 +974,8 @@ const handleBatchSaveDefaultReply = async () => {
 };
 
 const handleBatchDeleteDefaultReply = async () => {
-  if (!selectedCount.value || !selectedRowsCookieId.value) {
-    ElMessage.warning("请先选择同一账号下的商品");
+  if (!selectedCount.value) {
+    ElMessage.warning("请先勾选商品");
     return;
   }
 
@@ -854,15 +995,22 @@ const handleBatchDeleteDefaultReply = async () => {
 
   batchDefaultReplyDeleting.value = true;
   try {
-    const itemIds = selectedRows.value.map((item) => item.item_id);
-    const response = await batchDeleteItemDefaultReply(
-      selectedRowsCookieId.value,
-      itemIds,
-    );
-    if (!response.success) {
-      throw new Error(
-        response.detail || response.message || response.msg || "批量删除失败",
+    let successCount = 0;
+    let failCount = 0;
+
+    for (const group of getBatchActionGroups()) {
+      const response = await batchDeleteItemDefaultReply(
+        group.cookieId,
+        group.itemIds,
       );
+      if (!response.success) {
+        throw new Error(
+          response.detail || response.message || response.msg || "批量删除失败",
+        );
+      }
+
+      successCount += getBatchResponseCount(response, "success_count");
+      failCount += getBatchResponseCount(response, "fail_count");
     }
 
     for (const item of selectedRows.value) {
@@ -872,7 +1020,9 @@ const handleBatchDeleteDefaultReply = async () => {
       };
     }
 
-    ElMessage.success(`批量删除成功，共 ${itemIds.length} 个商品`);
+    ElMessage[failCount ? "warning" : "success"](
+      `批量删除完成：成功 ${successCount}，失败 ${failCount}`,
+    );
     clearTableSelection();
     closeBatchDefaultReplyDialog();
   } catch (error) {
@@ -945,14 +1095,24 @@ onMounted(async () => {
           :disabled="!selectedRows.length"
           @click="openBatchDefaultReplyDialog"
         >
-          批量默认回复
+          批量设置自动回复
         </el-button>
         <el-button
           :icon="Delete"
-          :disabled="!selectedRows.length || !selectedRowsCookieId"
+          :disabled="!selectedRows.length"
           @click="handleBatchDeleteDefaultReply"
         >
           批量删回复
+        </el-button>
+        <el-button
+          type="danger"
+          plain
+          :icon="Delete"
+          :loading="batchDeletingItems"
+          :disabled="!selectedRows.length"
+          @click="handleBatchDeleteItems"
+        >
+          批量删商品
         </el-button>
         <el-button :icon="RefreshRight" @click="loadItems">刷新列表</el-button>
         <el-button
@@ -1018,7 +1178,7 @@ onMounted(async () => {
             {{ items.length }} 个商品，已勾选 {{ selectedRows.length }} 个
           </div>
           <div class="toolbar-submeta">
-            支持导出筛选结果、复制商品 ID 和执行批量运营动作
+            支持全选当前列表、一键批量设置自动回复，也支持逐个单独设置
           </div>
         </div>
         <div class="table-toolbar-actions">
@@ -1054,9 +1214,9 @@ onMounted(async () => {
             link
             :icon="Select"
             :disabled="!filteredItems.length"
-            @click="handleSelectFilteredItems"
+            @click="handleToggleSelectAllFiltered"
           >
-            勾选筛选结果
+            {{ isAllFilteredSelected ? "取消全选当前列表" : "全选当前列表" }}
           </el-button>
           <el-button
             link
@@ -1081,10 +1241,11 @@ onMounted(async () => {
         ref="tableRef"
         v-loading="loading"
         :data="filteredItems"
+        :row-key="getDefaultReplyKey"
         style="width: 100%; margin-top: 16px"
         @selection-change="handleSelectionChange"
       >
-        <el-table-column type="selection" width="52" />
+        <el-table-column type="selection" width="52" reserve-selection />
 
         <el-table-column label="账号" min-width="180">
           <template #default="{ row }">
@@ -1237,6 +1398,15 @@ onMounted(async () => {
               </el-button>
               <el-button link @click="openDefaultReplyDialog(row)">
                 默认回复
+              </el-button>
+              <el-button
+                link
+                type="danger"
+                :icon="Delete"
+                :loading="itemDeletingKey === getDefaultReplyKey(row)"
+                @click="handleDeleteItem(row)"
+              >
+                删除
               </el-button>
             </div>
           </template>
@@ -1445,7 +1615,7 @@ onMounted(async () => {
               已选择 {{ selectedCount }} 个商品
             </div>
             <div class="reply-item-meta">
-              账号：{{ selectedRowsCookieId || "-" }}
+              涉及 {{ selectedCookieCount }} 个账号
             </div>
           </div>
         </el-form-item>
