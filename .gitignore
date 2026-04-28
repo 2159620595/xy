@@ -129,10 +129,15 @@ session_*
 session_tokens.json
 temp_*.py
 tmp_*.py
+_tmp_*.py
 quick_*.py
+_quick_*.py
 fix_*.py
+_fix_*.py
 check_*.py
+_check_*.py
 debug_*.py
+_debug_*.py
 export_*.csv
 export_*.json
 export_*.xlsx
