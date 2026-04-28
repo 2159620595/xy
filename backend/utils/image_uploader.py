@@ -68,7 +68,7 @@ class ImageUploader:
                         new_width = int((original_width * max_dimension) / original_height)
                     
                     img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                    logger.info(f"图片尺寸调整: {original_width}x{original_height} -> {new_width}x{new_height}")
+                    logger.debug(f"图片尺寸调整: {original_width}x{original_height} -> {new_width}x{new_height}")
                 
                 # 创建临时文件
                 temp_fd, temp_path = tempfile.mkstemp(suffix='.jpg')
@@ -84,9 +84,9 @@ class ImageUploader:
                     quality = max(30, quality - 20)
                     img.save(temp_path, 'JPEG', quality=quality, optimize=True)
                     file_size = os.path.getsize(temp_path)
-                    logger.info(f"图片质量调整为 {quality}%，文件大小: {file_size / 1024:.1f}KB")
+                    logger.debug(f"图片质量调整为 {quality}%，文件大小: {file_size / 1024:.1f}KB")
                 
-                logger.info(f"图片压缩完成: {file_size / 1024:.1f}KB")
+                logger.debug(f"图片压缩完成: {file_size / 1024:.1f}KB")
                 return temp_path
                 
         except Exception as e:
@@ -135,7 +135,7 @@ class ImageUploader:
             data.add_field('file', image_data, filename=filename, content_type='image/jpeg')
             
             # 发送上传请求
-            logger.info(f"开始上传图片到闲鱼CDN: {filename}")
+            logger.debug(f"开始上传图片到闲鱼CDN: {filename}")
             async with self.session.post(self.upload_url, data=data, headers=headers) as response:
                 if response.status == 200:
                     response_text = await response.text()
@@ -192,7 +192,7 @@ class ImageUploader:
             if 'object' in response_data and isinstance(response_data['object'], dict):
                 obj = response_data['object']
                 if 'url' in obj:
-                    logger.info(f"从object.url提取到图片URL: {obj['url']}")
+                    logger.debug(f"从object.url提取到图片URL: {obj['url']}")
                     return obj['url']
 
             # 方式3: 直接在根级别

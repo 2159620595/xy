@@ -463,28 +463,14 @@ import asyncio
 import threading
 import uvicorn
 from urllib.parse import urlparse
-from loguru import logger
-
-def _setup_global_logging():
-    """在导入业务模块前统一控制台日志格式和级别。"""
-    level = os.getenv("LOG_LEVEL", "INFO").upper()
-    try:
-        logger.remove()
-    except Exception:
-        pass
-
-    logger.add(
-        sys.stdout,
-        level=level,
-        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {message}",
-        enqueue=True,
-        backtrace=False,
-        diagnose=False,
-    )
-
-_setup_global_logging()
+from app_logging import configure_logging, get_logger
 
 # 修复Linux环境下的asyncio子进程问题
+from config import AUTO_REPLY, COOKIES_LIST, LOG_CONFIG
+
+configure_logging(LOG_CONFIG)
+logger = get_logger("start")
+
 if sys.platform.startswith('linux'):
     try:
         # 在程序启动时就设置正确的事件循环策略
@@ -493,7 +479,6 @@ if sys.platform.startswith('linux'):
     except Exception as e:
         logger.debug(f"设置事件循环策略失败: {e}")
 
-from config import AUTO_REPLY, COOKIES_LIST
 import cookie_manager as cm
 from db_manager import db_manager
 from file_log_collector import setup_file_logging

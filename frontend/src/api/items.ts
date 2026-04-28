@@ -24,6 +24,54 @@ export const updateItem = (
   return put(`/items/${cookieId}/${itemId}`, data);
 };
 
+export const deleteItem = async (
+  cookieId: string,
+  itemId: string,
+): Promise<ApiResponse> => {
+  const result = await del<ApiResponse>(`/items/${cookieId}/${itemId}`);
+  return {
+    success: result.success ?? true,
+    message: result.message,
+    detail: result.detail,
+    msg: result.msg,
+    data: result.data,
+  };
+};
+
+export const batchDeleteItems = async (
+  items: Array<{ cookie_id: string; item_id: string }>,
+): Promise<
+  ApiResponse<{
+    success_count?: number;
+    failed_count?: number;
+    total_count?: number;
+  }>
+> => {
+  const result = await del<
+    ApiResponse<{
+      success_count?: number;
+      failed_count?: number;
+      total_count?: number;
+    }>
+  >("/items/batch", {
+    data: { items },
+  });
+  return {
+    success: result.success ?? true,
+    message: result.message,
+    detail: result.detail,
+    msg: result.msg,
+    data: result.data ?? {
+      success_count:
+        (result as { success_count?: number }).success_count ?? undefined,
+      failed_count:
+        (result as { failed_count?: number }).failed_count ?? undefined,
+      total_count:
+        (result as { total_count?: number }).total_count ?? undefined,
+    },
+  };
+};
+
 export const relistItem = (
   cookieId: string,
   itemId: string,
@@ -150,4 +198,34 @@ export const deleteItemReply = (
   itemId: string,
 ): Promise<ApiResponse> => {
   return del(`/item-reply/${cookieId}/${itemId}`);
+};
+
+export const batchDeleteItemReplies = async (
+  items: Array<{ cookie_id: string; item_id: string }>,
+): Promise<
+  ApiResponse<{
+    success_count?: number;
+    failed_count?: number;
+  }>
+> => {
+  const result = await del<
+    ApiResponse<{
+      success_count?: number;
+      failed_count?: number;
+    }>
+  >("/item-reply/batch", {
+    data: { items },
+  });
+  return {
+    success: result.success ?? true,
+    message: result.message,
+    detail: result.detail,
+    msg: result.msg,
+    data: result.data ?? {
+      success_count:
+        (result as { success_count?: number }).success_count ?? undefined,
+      failed_count:
+        (result as { failed_count?: number }).failed_count ?? undefined,
+    },
+  };
 };

@@ -30,9 +30,9 @@ from sqlalchemy import func, or_, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from sqlalchemy.orm import Session
-from loguru import logger
 from pydantic import BaseModel
 
+from app_logging import configure_logging, get_logger
 
 from . import models
 from .database import (
@@ -77,21 +77,8 @@ if sys.platform == "win32":
     _patch_windows_subprocess_text_decoding()
 
 # ── 日志 ──────────────────────────────────────────────────────
-
-logger.remove()
-logger.add("logs/app.log", rotation="10 MB", retention="7 days",
-           level="INFO", enqueue=True,
-           format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}")
-
-log_level = os.environ.get("LOG_LEVEL", "INFO")
-
-def _safe_console_sink(message):
-    text = str(message)
-    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
-    sys.stdout.write(text.encode(encoding, errors="ignore").decode(encoding, errors="ignore"))
-    sys.stdout.flush()
-
-logger.add(_safe_console_sink, level=log_level, colorize=True)
+configure_logging()
+logger = get_logger("netdisk")
 
 
 # ── Redis 实例 ────────────────────────────────────────────────

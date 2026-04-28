@@ -59,17 +59,17 @@ class CookieManager:
     # ------------------------ 内部协程 ------------------------
     async def _run_xianyu(self, cookie_id: str, cookie_value: str, user_id: int = None):
         """在事件循环中启动 XianyuLive.main"""
-        logger.info(f"【{cookie_id}】_run_xianyu方法开始执行...")
+        logger.debug(f"【{cookie_id}】_run_xianyu方法开始执行")
 
         try:
-            logger.info(f"【{cookie_id}】正在导入XianyuLive...")
+            logger.debug(f"【{cookie_id}】正在导入XianyuLive")
             from XianyuAutoAsync import XianyuLive  # 延迟导入，避免循环
-            logger.info(f"【{cookie_id}】XianyuLive导入成功")
+            logger.debug(f"【{cookie_id}】XianyuLive导入成功")
 
-            logger.info(f"【{cookie_id}】开始创建XianyuLive实例...")
-            logger.info(f"【{cookie_id}】Cookie值长度: {len(cookie_value)}")
+            logger.debug(f"【{cookie_id}】开始创建XianyuLive实例")
+            logger.debug(f"【{cookie_id}】Cookie值长度: {len(cookie_value)}")
             live = XianyuLive(cookie_value, cookie_id=cookie_id, user_id=user_id)
-            logger.info(f"【{cookie_id}】XianyuLive实例创建成功，开始调用main()...")
+            logger.debug(f"【{cookie_id}】XianyuLive实例创建成功，开始调用main()")
             
             # 强制刷新日志，确保日志被写入
             try:
@@ -81,7 +81,7 @@ class CookieManager:
             await live.main()
             
             # main() 正常退出（不应该发生，因为main()内部有无限循环）
-            logger.warning(f"【{cookie_id}】XianyuLive.main() 正常退出（这通常不应该发生）")
+            logger.info(f"【{cookie_id}】XianyuLive.main() 已退出")
         except asyncio.CancelledError:
             logger.info(f"【{cookie_id}】XianyuLive 任务已取消")
             # 强制刷新日志
@@ -101,7 +101,7 @@ class CookieManager:
             except:
                 pass
         finally:
-            logger.info(f"【{cookie_id}】_run_xianyu方法执行结束")
+            logger.debug(f"【{cookie_id}】_run_xianyu方法执行结束")
             # 确保日志被刷新
             try:
                 import sys
@@ -130,11 +130,11 @@ class CookieManager:
                         logger.error(f"等待旧任务停止时出错: {cookie_id}, {e}")
                     # 从字典中移除
                     self.tasks.pop(cookie_id, None)
-                    logger.info(f"【{cookie_id}】旧任务已停止")
+                    logger.debug(f"【{cookie_id}】旧任务已停止")
                 else:
                     # 任务已完成，直接移除
                     self.tasks.pop(cookie_id, None)
-                    logger.info(f"【{cookie_id}】旧任务已完成，已移除")
+                    logger.debug(f"【{cookie_id}】旧任务已完成，已移除")
             
             self.cookies[cookie_id] = cookie_value
             # 保存到数据库，如果没有指定user_id，则保持原有绑定关系
@@ -244,7 +244,7 @@ class CookieManager:
                 # 先移除任务（但不删除数据库记录）
                 task = self.tasks.pop(cookie_id, None)
                 if task:
-                    logger.info(f"【{cookie_id}】正在停止旧任务...")
+                    logger.debug(f"【{cookie_id}】正在停止旧任务")
                     task.cancel()
                     try:
                         # 等待任务完全清理，确保资源释放
@@ -257,7 +257,7 @@ class CookieManager:
                         pass
                     except Exception as e:
                         logger.error(f"等待任务清理时出错: {cookie_id}, {e}")
-                    logger.info(f"【{cookie_id}】旧任务已停止")
+                    logger.debug(f"【{cookie_id}】旧任务已停止")
 
                 # 更新Cookie值
                 self.cookies[cookie_id] = new_value

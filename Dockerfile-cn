@@ -35,7 +35,7 @@ RUN npm install
 
 # 复制前端源码并构建
 COPY frontend/ ./
-RUN npm run build
+RUN FRONTEND_BUILD_BASE=/static/ npm run build
 
 # ==================== Python Builder Stage ====================
 FROM base AS builder

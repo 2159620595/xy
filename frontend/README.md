@@ -40,10 +40,13 @@ npm run dev
 
 ```bash
 cd frontend
+$env:FRONTEND_OUT_DIR="../backend/static"
+$env:FRONTEND_BUILD_BASE="/static/"
 npm run build
 ```
 
-这意味着整合版发布时不需要再手动把 `dist/` 拷贝到别处。
+如果只是独立产出到 `dist/`，直接执行 `npm run build` 即可。
+集成构建时必须同时设置 `FRONTEND_BUILD_BASE=/static/`，否则生成的资源链接会指向 `/assets/...`，被后端 SPA 回退路由错误返回成 `index.html`。
 
 ## 环境变量
 

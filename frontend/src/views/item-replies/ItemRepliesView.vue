@@ -20,6 +20,7 @@ type ItemReplyTableRow = ItemReply & {
 
 const loading = ref(true);
 const saving = ref(false);
+const deleting = ref(false);
 const fetchingItems = ref(false);
 const itemsLoading = ref(false);
 const batchDeleting = ref(false);
@@ -128,6 +129,7 @@ const selectedReplyRows = computed(() =>
   selectedRows.value.filter((row) => row.hasReply),
 );
 const selectedCount = computed(() => selectedRows.value.length);
+const selectedConfiguredCount = computed(() => selectedReplyRows.value.length);
 const selectedRowsGroupedByCookie = computed(() => {
   const groups = new Map<string, ItemReplyTableRow[]>();
   selectedRows.value.forEach((row) => {
@@ -204,6 +206,9 @@ const getAccountLabel = (cookieId: string) => {
 
 const getReplyRowKey = (row: Pick<ItemReply, "cookie_id" | "item_id">) =>
   `${row.cookie_id}:${row.item_id}`;
+
+const getReplyValue = (row: ItemReplyTableRow) =>
+  (row.reply || row.reply_content || row.content || "").trim();
 
 const handleSelectionChange = (rows: ItemReplyTableRow[]) => {
   selectedRows.value = rows;
@@ -348,13 +353,39 @@ const resetBatchForm = () => {
   };
 };
 
+const prefillBatchForm = () => {
+  resetBatchForm();
+
+  if (!selectedReplyRows.value.length) {
+    return;
+  }
+
+  const firstRow = selectedReplyRows.value[0];
+  const firstReply = getReplyValue(firstRow);
+  const firstReplyOnce = Boolean(firstRow.reply_once);
+  const sameReply = selectedReplyRows.value.every(
+    (row) => getReplyValue(row) === firstReply,
+  );
+  const sameReplyOnce = selectedReplyRows.value.every(
+    (row) => Boolean(row.reply_once) === firstReplyOnce,
+  );
+
+  batchForm.value = {
+    reply: selectedReplyRows.value.length === 1 || sameReply ? firstReply : "",
+    replyOnce:
+      selectedReplyRows.value.length === 1 || sameReplyOnce
+        ? firstReplyOnce
+        : false,
+  };
+};
+
 const openBatchDialog = () => {
   if (!selectedCount.value) {
     ElMessage.warning("请先勾选商品");
     return;
   }
 
-  resetBatchForm();
+  prefillBatchForm();
   batchDialogVisible.value = true;
 };
 
@@ -365,10 +396,24 @@ const closeBatchDialog = () => {
 
 const handleItemChange = (value: string) => {
   const matched = items.value.find((item) => item.item_id === value);
+  const matchedReply = tableRows.value.find(
+    (row) =>
+      row.cookie_id === (dialogAccountId.value || selectedAccount.value) &&
+      row.item_id === value &&
+      row.hasReply,
+  );
+
   form.value.itemId = value;
-  if (matched && !form.value.title) {
-    form.value.title = matched.item_title || matched.title || "";
+  if (matchedReply) {
+    form.value.title = getReplyTitle(matchedReply);
+    form.value.reply = getReplyValue(matchedReply);
+    form.value.replyOnce = Boolean(matchedReply.reply_once);
+    return;
   }
+
+  form.value.title = matched?.item_title || matched?.title || "";
+  form.value.reply = "";
+  form.value.replyOnce = false;
 };
 
 const handleSubmit = async () => {
@@ -465,39 +510,52 @@ const handleBatchSubmit = async () => {
   }
 };
 
-const handleDelete = async (reply: ItemReplyTableRow) => {
+const handleDelete = async (
+  reply: ItemReplyTableRow,
+  options?: { closeDialog?: boolean },
+) => {
   if (!reply.hasReply) {
     ElMessage.warning("该商品还没有配置回复");
     return;
   }
 
   try {
-    await ElMessageBox.confirm("确定要删除这条商品回复吗？", "删除确认", {
-      type: "warning",
-      confirmButtonText: "删除",
-      cancelButtonText: "取消",
-    });
+    await ElMessageBox.confirm(
+      "确定要取消这条商品的自动回复吗？",
+      "取消自动回复",
+      {
+        type: "warning",
+        confirmButtonText: "确认取消",
+        cancelButtonText: "取消",
+      },
+    );
+    deleting.value = true;
     await deleteItemReply(reply.cookie_id, reply.item_id);
-    ElMessage.success("删除成功");
+    ElMessage.success("已取消自动回复");
+    if (options?.closeDialog) {
+      closeDialog();
+    }
     await loadReplies();
   } catch {
     // ignore cancel
+  } finally {
+    deleting.value = false;
   }
 };
 
-const handleBatchDelete = async () => {
+const handleBatchDelete = async (options?: { closeDialog?: boolean }) => {
   if (!canBatchDelete.value) {
-    ElMessage.warning("请先勾选已配置回复的商品");
+    ElMessage.warning("请先勾选已配置自动回复的商品");
     return;
   }
 
   try {
     await ElMessageBox.confirm(
-      `确定批量删除 ${selectedReplyRows.value.length} 条商品回复吗？`,
-      "批量删除确认",
+      `确定批量取消 ${selectedReplyRows.value.length} 条商品的自动回复吗？`,
+      "批量取消自动回复",
       {
         type: "warning",
-        confirmButtonText: "批量删除",
+        confirmButtonText: "确认取消",
         cancelButtonText: "取消",
       },
     );
@@ -524,12 +582,16 @@ const handleBatchDelete = async () => {
       response.data?.failed_count ??
       Math.max(selectedReplyRows.value.length - successCount, 0);
     ElMessage[failedCount ? "warning" : "success"](
-      `批量删除完成：成功 ${successCount}，失败 ${failedCount}`,
+      `批量取消完成：成功 ${successCount}，失败 ${failedCount}`,
     );
+    if (options?.closeDialog) {
+      closeBatchDialog();
+    }
     clearSelection();
     await loadReplies();
   } catch (error) {
-    const message = error instanceof Error ? error.message : "批量删除失败";
+    const message =
+      error instanceof Error ? error.message : "批量取消自动回复失败";
     ElMessage.error(message);
   } finally {
     batchDeleting.value = false;
@@ -579,7 +641,7 @@ onMounted(async () => {
           :disabled="!canBatchDelete"
           @click="handleBatchDelete"
         >
-          批量删除
+          批量取消自动回复
         </el-button>
         <el-button type="primary" :icon="Plus" @click="openAddDialog"
           >添加回复</el-button
@@ -742,7 +804,7 @@ onMounted(async () => {
                 type="danger"
                 :icon="Delete"
                 @click="handleDelete(row)"
-                >删除</el-button
+                >取消自动回复</el-button
               >
             </div>
           </template>
@@ -823,6 +885,19 @@ onMounted(async () => {
 
       <template #footer>
         <el-button @click="closeDialog">取消</el-button>
+        <el-button
+          v-if="editingReply"
+          type="danger"
+          plain
+          :loading="deleting"
+          @click="
+            handleDelete(editingReply as ItemReplyTableRow, {
+              closeDialog: true,
+            })
+          "
+        >
+          取消自动回复
+        </el-button>
         <el-button type="primary" :loading="saving" @click="handleSubmit"
           >保存</el-button
         >
@@ -839,9 +914,18 @@ onMounted(async () => {
       <el-form label-position="top">
         <el-form-item label="批量范围">
           <div class="reply-item-summary">
-            <div class="reply-item-title">已选择 {{ selectedCount }} 个商品</div>
+            <div class="reply-item-title">
+              已选择 {{ selectedCount }} 个商品
+            </div>
             <div class="reply-item-meta">
-              涉及 {{ selectedCookieCount }} 个账号，保存后会覆盖这些商品当前回复
+              涉及 {{ selectedCookieCount }} 个账号，当前已有
+              {{
+                selectedConfiguredCount
+              }}
+              个商品配置了自动回复，保存后会统一覆盖
+            </div>
+            <div v-if="selectedConfiguredCount" class="reply-item-meta">
+              已为已配置商品自动回显一致的回复内容，便于直接重新设置
             </div>
           </div>
         </el-form-item>
@@ -862,7 +946,19 @@ onMounted(async () => {
 
       <template #footer>
         <el-button @click="closeBatchDialog">取消</el-button>
-        <el-button type="primary" :loading="batchSaving" @click="handleBatchSubmit"
+        <el-button
+          v-if="canBatchDelete"
+          type="danger"
+          plain
+          :loading="batchDeleting"
+          @click="handleBatchDelete({ closeDialog: true })"
+        >
+          取消所选自动回复
+        </el-button>
+        <el-button
+          type="primary"
+          :loading="batchSaving"
+          @click="handleBatchSubmit"
           >批量保存</el-button
         >
       </template>

@@ -22,6 +22,14 @@ import asyncio
 from collections import defaultdict
 
 import cookie_manager
+from app_logging import (
+    configure_logging,
+    find_latest_log_file,
+    get_log_relative_path,
+    get_logger,
+    list_log_files,
+    resolve_log_file,
+)
 from db_manager import db_manager
 from file_log_collector import setup_file_logging, get_file_log_collector
 from ai_reply_engine import ai_reply_engine
@@ -30,7 +38,8 @@ from utils.qr_login import qr_login_manager
 from utils.xianyu_utils import generate_sign, trans_cookies
 from utils.image_utils import image_manager
 
-from loguru import logger
+configure_logging()
+logger = get_logger(__name__)
 
 
 _xianyu_nickname_fetch_limiter: Dict[str, float] = {}
@@ -848,26 +857,24 @@ if cors_allowed_origins:
 # 注册刮刮乐远程控制路由
 if CAPTCHA_ROUTER_AVAILABLE:
     app.include_router(captcha_router)
-    logger.info("✅ 已注册刮刮乐远程控制路由: /api/captcha")
+    logger.debug("✅ 已注册刮刮乐远程控制路由: /api/captcha")
 else:
     logger.warning("⚠️ 刮刮乐远程控制路由未注册")
 
 # 初始化文件日志收集器
 setup_file_logging()
 
-# 添加一条测试日志
-from loguru import logger
-logger.info("Web服务器启动，文件日志收集器已初始化")
+logger.debug("Web服务器启动，文件日志收集器已初始化")
 
 @app.on_event("startup")
 async def startup_item_automation():
-    logger.info(f"LOCAL_ONLY_MODE={'true' if LOCAL_ONLY_MODE else 'false'}")
+    logger.debug(f"LOCAL_ONLY_MODE={'true' if LOCAL_ONLY_MODE else 'false'}")
     if LOCAL_ONLY_MODE:
         logger.warning(f"已启用仅本机访问模式，允许网段: {LOCAL_ONLY_ALLOW_CIDR}")
     global item_automation_task
     if item_automation_task is None or item_automation_task.done():
         item_automation_task = asyncio.create_task(item_automation_loop())
-        logger.info("商品自动任务巡检已启动")
+        logger.debug("商品自动任务巡检已启动")
 
 @app.middleware("http")
 async def local_only_guard(request, call_next):
@@ -921,13 +928,13 @@ app.mount('/static', StaticFiles(directory=static_dir), name='static')
 if not any(getattr(route, "path", None) == "/netdisk_api" for route in app.router.routes):
     # 将网盘子应用挂载到统一前缀下，复用前端现有请求路径。
     app.mount("/netdisk_api", embedded_netdisk_app)
-    logger.info("已挂载网盘子应用: /netdisk_api")
+    logger.debug("已挂载网盘子应用: /netdisk_api")
 
 # 确保图片上传目录存在
 uploads_dir = os.path.join(static_dir, 'uploads', 'images')
 if not os.path.exists(uploads_dir):
     os.makedirs(uploads_dir, exist_ok=True)
-    logger.info(f"创建图片上传目录: {uploads_dir}")
+    logger.debug(f"创建图片上传目录: {uploads_dir}")
 
 # 健康检查端点
 @app.get('/health')
@@ -4693,26 +4700,16 @@ def get_items_list(cid: str, current_user: Dict[str, Any] = Depends(get_current_
         raise HTTPException(status_code=403, detail="无权限访问该Cookie")
 
     try:
-        # 获取该账号的所有商品
-        with db_manager.lock:
-            cursor = db_manager.conn.cursor()
-            cursor.execute('''
-            SELECT item_id, item_title, item_price, created_at
-            FROM item_info
-            WHERE cookie_id = ?
-            ORDER BY created_at DESC
-            ''', (cid,))
-
-            items = []
-            for row in cursor.fetchall():
-                items.append({
-                    'item_id': row[0],
-                    'item_title': row[1] or '未知商品',
-                    'item_price': row[2] or '价格未知',
-                    'created_at': row[3]
-                })
-
-            return {"items": items, "count": len(items)}
+        items = [
+            {
+                'item_id': item.get('item_id', ''),
+                'item_title': item.get('item_title') or '未知商品',
+                'item_price': item.get('item_price') or '价格未知',
+                'created_at': item.get('created_at'),
+            }
+            for item in db_manager.get_items_by_cookie(cid)
+        ]
+        return {"items": items, "count": len(items)}
 
     except Exception as e:
         logger.error(f"获取商品列表失败: {e}")
@@ -6012,17 +6009,29 @@ class AIReplySettings(BaseModel):
 @app.delete("/items/batch")
 def batch_delete_items(
     request: BatchDeleteRequest,
-    _: None = Depends(require_auth)
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """批量删除商品信息"""
     try:
         if not request.items:
             raise HTTPException(status_code=400, detail="删除列表不能为空")
 
-        success_count = db_manager.batch_delete_item_info(request.items)
-        total_count = len(request.items)
+        user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+        normalized_items = []
+        for item in request.items:
+            cookie_id = str(item.get('cookie_id') or '').strip()
+            item_id = str(item.get('item_id') or '').strip()
+            if not cookie_id or not item_id:
+                raise HTTPException(status_code=400, detail="删除列表包含无效商品")
+            if cookie_id not in user_cookies:
+                raise HTTPException(status_code=403, detail=f"无权限操作账号 {cookie_id}")
+            normalized_items.append({"cookie_id": cookie_id, "item_id": item_id})
+
+        success_count = db_manager.batch_delete_item_info(normalized_items)
+        total_count = len(normalized_items)
 
         return {
+            "success": True,
             "message": f"批量删除完成",
             "success_count": success_count,
             "total_count": total_count,
@@ -6625,24 +6634,16 @@ def get_system_logs(admin_user: Dict[str, Any] = Depends(require_admin),
                    lines: int = 100,
                    level: str = None):
     """获取系统日志（管理员专用）"""
-    import os
-    import glob
-    from datetime import datetime
-
     try:
         log_with_user('info', f"查询系统日志，行数: {lines}, 级别: {level}", admin_user)
 
-        # 查找日志文件
-        log_files = glob.glob("logs/xianyu_*.log")
-        logger.info(f"找到日志文件: {log_files}")
+        target_level = "error" if str(level or "").upper() in {"ERROR", "CRITICAL"} else "info"
+        latest_log_file = find_latest_log_file(target_level)
+        logger.info(f"当前读取日志级别目录: {target_level}, 文件: {latest_log_file}")
 
-        if not log_files:
+        if not latest_log_file:
             logger.warning("未找到日志文件")
             return {"logs": [], "message": "未找到日志文件", "success": False}
-
-        # 获取最新的日志文件
-        latest_log_file = max(log_files, key=os.path.getctime)
-        logger.info(f"使用最新日志文件: {latest_log_file}")
 
         logs = []
         try:
@@ -6674,7 +6675,7 @@ def get_system_logs(admin_user: Dict[str, Any] = Depends(require_admin),
 
         return {
             "logs": logs,
-            "log_file": latest_log_file,
+            "log_file": get_log_relative_path(latest_log_file),
             "total_lines": len(logs),
             "success": True
         }
@@ -6687,27 +6688,23 @@ def get_system_logs(admin_user: Dict[str, Any] = Depends(require_admin),
 @app.get('/admin/log-files')
 def list_log_files(admin_user: Dict[str, Any] = Depends(require_admin)):
     """列出所有可用的系统日志文件"""
-    import os
-    import glob
     from datetime import datetime
 
     try:
         log_with_user('info', "查询日志文件列表", admin_user)
 
-        log_dir = "logs"
-        if not os.path.exists(log_dir):
+        available_files = list_log_files(include_archives=True)
+        if not available_files:
             logger.warning("日志目录不存在")
             return {"success": True, "files": []}
 
-        log_pattern = os.path.join(log_dir, "xianyu_*.log")
-        log_files = glob.glob(log_pattern)
-
         files_info = []
-        for file_path in log_files:
+        for file_path in available_files:
             try:
-                stat_info = os.stat(file_path)
+                stat_info = file_path.stat()
                 files_info.append({
-                    "name": os.path.basename(file_path),
+                    "name": get_log_relative_path(file_path),
+                    "basename": file_path.name,
                     "size": stat_info.st_size,
                     "modified_at": datetime.fromtimestamp(stat_info.st_mtime).isoformat(),
                     "modified_ts": stat_info.st_mtime
@@ -6729,28 +6726,22 @@ def list_log_files(admin_user: Dict[str, Any] = Depends(require_admin)):
 @app.get('/admin/logs/export')
 def export_log_file(file: str, admin_user: Dict[str, Any] = Depends(require_admin)):
     """导出指定的日志文件"""
-    import os
     from fastapi.responses import StreamingResponse
 
     try:
         if not file:
             raise HTTPException(status_code=400, detail="缺少文件参数")
 
-        safe_name = os.path.basename(file)
-        log_dir = os.path.abspath("logs")
-        target_path = os.path.abspath(os.path.join(log_dir, safe_name))
-
-        # 防止目录遍历
-        if not target_path.startswith(log_dir):
-            log_with_user('warning', f"尝试访问非法日志文件: {file}", admin_user)
-            raise HTTPException(status_code=400, detail="非法的日志文件路径")
-
-        if not os.path.exists(target_path):
+        try:
+            target_path = resolve_log_file(file)
+        except FileNotFoundError:
             log_with_user('warning', f"日志文件不存在: {file}", admin_user)
             raise HTTPException(status_code=404, detail="日志文件不存在")
 
-        log_with_user('info', f"导出日志文件: {safe_name}", admin_user)
-        def iter_file(path: str):
+        safe_name = target_path.name
+        log_with_user('info', f"导出日志文件: {get_log_relative_path(target_path)}", admin_user)
+
+        def iter_file(path: Path):
             file_handle = open(path, 'rb')
             try:
                 while True:
@@ -6766,7 +6757,7 @@ def export_log_file(file: str, admin_user: Dict[str, Any] = Depends(require_admi
         }
         return StreamingResponse(
             iter_file(target_path),
-            media_type='text/plain; charset=utf-8',
+            media_type='application/zip' if target_path.suffix == '.zip' else 'text/plain; charset=utf-8',
             headers=headers
         )
 
@@ -6883,12 +6874,14 @@ def update_item_reply(
             raise HTTPException(status_code=400, detail="回复内容不能为空")
 
         reply_once = bool(data.get("reply_once", False))
-        db_manager.update_item_reply(
+        success = db_manager.update_item_reply(
             cookie_id=cookie_id,
             item_id=item_id,
             reply_content=reply_content,
             reply_once=reply_once,
         )
+        if not success:
+            raise HTTPException(status_code=500, detail="商品回复保存失败，请检查后端日志")
 
         return {"message": "商品回复更新成功"}
 

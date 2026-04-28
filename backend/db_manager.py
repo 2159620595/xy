@@ -364,6 +364,7 @@ class DBManager:
             ("delivery_rules", "description", "TEXT"),
             ("notification_channels", "user_id", "INTEGER"),
             ("email_verifications", "type", "TEXT DEFAULT 'register'"),
+            ("item_replay", "reply_once", "BOOLEAN DEFAULT FALSE"),
             ("item_images", "thumbnail_url", "TEXT"),
             ("item_info", "multi_quantity_delivery", "BOOLEAN DEFAULT FALSE"),
             ("item_info", "seller_nick", "TEXT"),
@@ -2360,6 +2361,7 @@ class DBManager:
                 return [(row[0], row[1]) for row in cursor.fetchall()]
             except Exception as e:
                 logger.error(f"获取关键字失败: {e}")
+                self._rollback_quietly()
                 return []
 
     def get_keywords_with_item_id(self, cookie_id: str) -> List[Tuple[str, str, str]]:
@@ -2371,6 +2373,7 @@ class DBManager:
                 return [(row[0], row[1], row[2]) for row in cursor.fetchall()]
             except Exception as e:
                 logger.error(f"获取关键字失败: {e}")
+                self._rollback_quietly()
                 return []
 
     def check_keyword_duplicate(self, cookie_id: str, keyword: str, item_id: str = None) -> bool:
@@ -2440,6 +2443,7 @@ class DBManager:
                 return results
             except Exception as e:
                 logger.error(f"获取关键字失败: {e}")
+                self._rollback_quietly()
                 return []
 
     def update_keyword_image_url(self, cookie_id: str, keyword: str, new_image_url: str) -> bool:
@@ -2678,6 +2682,7 @@ class DBManager:
                     }
             except Exception as e:
                 logger.error(f"获取AI回复设置失败: {e}")
+                self._rollback_quietly()
                 return {
                     'ai_enabled': False,
                     'model_name': 'qwen-plus',
@@ -2802,6 +2807,7 @@ class DBManager:
                 return None
             except Exception as e:
                 logger.error(f"获取默认回复设置失败: {e}")
+                self._rollback_quietly()
                 return None
 
     def get_item_default_reply(self, cookie_id: str, item_id: str) -> Optional[Dict[str, any]]:
@@ -5482,6 +5488,22 @@ class DBManager:
         item_info['seller_nick'] = seller_nick
         return item_info
 
+    def _dedupe_items_for_view(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """按账号+商品ID去重，保留排序结果中的第一条（通常是最新记录）"""
+        deduped_items: List[Dict[str, Any]] = []
+        seen_keys: set[tuple[str, str]] = set()
+
+        for item in items:
+            cookie_id = str(item.get('cookie_id') or '').strip()
+            item_id = str(item.get('item_id') or '').strip()
+            dedupe_key = (cookie_id, item_id)
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+            deduped_items.append(item)
+
+        return deduped_items
+
     def get_next_item_image_sort_order(self, cookie_id: str, item_id: str) -> int:
         """获取商品图片下一个排序值"""
         with self.lock:
@@ -5725,7 +5747,7 @@ class DBManager:
 
                     items.append(item_info)
 
-                return items
+                return self._dedupe_items_for_view(items)
 
         except Exception as e:
             logger.error(f"获取Cookie商品信息失败: {e}")
@@ -5762,7 +5784,7 @@ class DBManager:
 
                     items.append(item_info)
 
-                return items
+                return self._dedupe_items_for_view(items)
 
         except Exception as e:
             logger.error(f"获取所有商品信息失败: {e}")
@@ -6783,6 +6805,7 @@ class DBManager:
                 return None
         except Exception as e:
             logger.error(f"获取指定商品回复失败: {e}")
+            self._rollback_quietly()
             return None
 
     def update_item_reply(self, cookie_id: str, item_id: str, reply_content: str, reply_once: bool = False) -> bool:
@@ -6805,19 +6828,20 @@ class DBManager:
                     UPDATE item_replay
                     SET reply_content = ?, reply_once = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE cookie_id = ? AND item_id = ?
-                ''', (reply_content, int(reply_once), cookie_id, item_id))
+                ''', (reply_content, bool(reply_once), cookie_id, item_id))
 
                 if cursor.rowcount == 0:
                     # 如果没更新到，说明该条记录不存在，可以考虑插入
                     cursor.execute('''
                         INSERT INTO item_replay (item_id, cookie_id, reply_content, reply_once, created_at, updated_at)
                         VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                    ''', (item_id, cookie_id, reply_content, int(reply_once)))
+                    ''', (item_id, cookie_id, reply_content, bool(reply_once)))
 
                 self.conn.commit()
             return True
         except Exception as e:
             logger.error(f"更新商品回复失败: {e}")
+            self._rollback_quietly()
             return False
 
     def get_itemReplays_by_cookie(self, cookie_id: str) -> List[Dict]:
@@ -6832,36 +6856,100 @@ class DBManager:
         try:
             with self.lock:
                 cursor = self.conn.cursor()
-                cursor.execute('''
+                if not self._table_exists(cursor, 'item_replay'):
+                    return []
+
+                item_replay_columns = set(self._get_table_columns(cursor, 'item_replay'))
+                item_info_exists = self._table_exists(cursor, 'item_info')
+                item_images_exists = self._table_exists(cursor, 'item_images')
+                item_info_columns = set(self._get_table_columns(cursor, 'item_info')) if item_info_exists else set()
+                item_image_columns = set(self._get_table_columns(cursor, 'item_images')) if item_images_exists else set()
+
+                reply_once_expr = 'r.reply_once' if 'reply_once' in item_replay_columns else '0'
+                created_at_expr = 'r.created_at' if 'created_at' in item_replay_columns else 'NULL'
+                updated_at_expr = 'r.updated_at' if 'updated_at' in item_replay_columns else 'NULL'
+
+                select_fields = [
+                    'r.item_id',
+                    'r.cookie_id',
+                    'r.reply_content',
+                    f'{reply_once_expr} AS reply_once',
+                    f'{created_at_expr} AS created_at',
+                    f'{updated_at_expr} AS updated_at',
+                ]
+                joins = []
+
+                if item_info_exists:
+                    select_fields.extend([
+                        'i.item_title AS item_title' if 'item_title' in item_info_columns else "'' AS item_title",
+                        'i.item_detail AS item_detail' if 'item_detail' in item_info_columns else "'' AS item_detail",
+                        'i.primary_image_url AS primary_image_url'
+                        if 'primary_image_url' in item_info_columns
+                        else "'' AS primary_image_url",
+                    ])
+                    joins.append('LEFT JOIN item_info i ON i.item_id = r.item_id AND i.cookie_id = r.cookie_id')
+                else:
+                    select_fields.extend([
+                        "'' AS item_title",
+                        "'' AS item_detail",
+                        "'' AS primary_image_url",
+                    ])
+
+                if item_images_exists and {'item_id', 'cookie_id'} <= item_image_columns:
+                    thumb_source = (
+                        'COALESCE(ii.thumbnail_url, ii.image_url, \'\')'
+                        if 'thumbnail_url' in item_image_columns and 'image_url' in item_image_columns
+                        else 'COALESCE(ii.image_url, \'\')'
+                        if 'image_url' in item_image_columns
+                        else "''"
+                    )
+                    image_source = 'ii.image_url' if 'image_url' in item_image_columns else "''"
+                    image_order_parts = []
+                    if 'is_primary' in item_image_columns:
+                        image_order_parts.append('ii.is_primary DESC')
+                    if 'sort_order' in item_image_columns:
+                        image_order_parts.append('ii.sort_order ASC')
+                    if 'id' in item_image_columns:
+                        image_order_parts.append('ii.id ASC')
+                    if not image_order_parts:
+                        image_order_parts.append('ii.item_id ASC')
+                    image_order_by = ', '.join(image_order_parts)
+
+                    select_fields.extend([
+                        f'''
+                        (
+                            SELECT {thumb_source}
+                            FROM item_images ii
+                            WHERE ii.item_id = r.item_id AND ii.cookie_id = r.cookie_id
+                            ORDER BY {image_order_by}
+                            LIMIT 1
+                        ) AS thumbnail_url
+                        ''',
+                        f'''
+                        (
+                            SELECT {image_source}
+                            FROM item_images ii
+                            WHERE ii.item_id = r.item_id AND ii.cookie_id = r.cookie_id
+                            ORDER BY {image_order_by}
+                            LIMIT 1
+                        ) AS image_url
+                        ''',
+                    ])
+                else:
+                    select_fields.extend([
+                        "'' AS thumbnail_url",
+                        "'' AS image_url",
+                    ])
+
+                sql = f'''
                 SELECT
-                    r.item_id,
-                    r.cookie_id,
-                    r.reply_content,
-                    r.reply_once,
-                    r.created_at,
-                    r.updated_at,
-                    i.item_title,
-                    i.item_detail,
-                    i.primary_image_url,
-                    (
-                        SELECT COALESCE(ii.thumbnail_url, ii.image_url, '')
-                        FROM item_images ii
-                        WHERE ii.item_id = r.item_id AND ii.cookie_id = r.cookie_id
-                        ORDER BY ii.is_primary DESC, ii.sort_order ASC, ii.id ASC
-                        LIMIT 1
-                    ) AS thumbnail_url,
-                    (
-                        SELECT ii.image_url
-                        FROM item_images ii
-                        WHERE ii.item_id = r.item_id AND ii.cookie_id = r.cookie_id
-                        ORDER BY ii.is_primary DESC, ii.sort_order ASC, ii.id ASC
-                        LIMIT 1
-                    ) AS image_url
-                    FROM item_replay r
-                    LEFT JOIN item_info i ON i.item_id = r.item_id AND i.cookie_id = r.cookie_id
-                    WHERE r.cookie_id = ?
-                    ORDER BY r.updated_at DESC
-                ''', (cookie_id,))
+                    {", ".join(select_fields)}
+                FROM item_replay r
+                {' '.join(joins)}
+                WHERE r.cookie_id = ?
+                ORDER BY {updated_at_expr} DESC
+                '''
+                cursor.execute(sql, (cookie_id,))
 
                 columns = [description[0] for description in cursor.description]
                 items = []

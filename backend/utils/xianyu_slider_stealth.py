@@ -10,6 +10,7 @@ import random
 import json
 import os
 import math
+import traceback
 import threading
 import tempfile
 import shutil
@@ -30,6 +31,28 @@ except ImportError:
     SLIDER_WAIT_TIMEOUT = 60
 
 # 使用loguru日志库，与主程序保持一致
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_verbose_slider_logging_enabled() -> bool:
+    return _as_bool(os.getenv("VERBOSE_SLIDER_LOGGING"), False)
+
+
+def _log_slider_traceback(user_id: str, context: str) -> None:
+    if _is_verbose_slider_logging_enabled():
+        logger.debug(f"【{user_id}】{context}详细堆栈:\n{traceback.format_exc()}")
+        return
+
+    logger.debug(
+        f"【{user_id}】{context}详细堆栈已省略；设置 VERBOSE_SLIDER_LOGGING=1 可查看完整堆栈"
+    )
 
 # 全局并发控制
 class SliderConcurrencyManager:
@@ -230,7 +253,7 @@ class RetryStrategyStats:
     def log_summary(self):
         """输出统计摘要到日志"""
         summary = self.get_stats_summary()
-        if summary:
+        if summary and _is_verbose_slider_logging_enabled():
             logger.info("=" * 60)
             logger.info("📊 重试策略成功率统计")
             logger.info("=" * 60)
@@ -308,9 +331,9 @@ class XianyuSliderStealth:
         """初始化浏览器 - 增强反检测版本"""
         try:
             # 启动 Playwright
-            logger.info(f"【{self.pure_user_id}】启动Playwright...")
+            logger.debug(f"【{self.pure_user_id}】启动Playwright...")
             self.playwright = sync_playwright().start()
-            logger.info(f"【{self.pure_user_id}】Playwright启动成功")
+            logger.debug(f"【{self.pure_user_id}】Playwright启动成功")
             
             # 随机选择浏览器特征
             browser_features = self._get_random_browser_features()
@@ -394,21 +417,21 @@ class XianyuSliderStealth:
             }
             if chromium_executable:
                 launch_options["executable_path"] = chromium_executable
-                logger.info(f"【{self.pure_user_id}】使用系统Chromium: {chromium_executable}")
+                logger.debug(f"【{self.pure_user_id}】使用系统Chromium: {chromium_executable}")
             else:
                 logger.warning(f"【{self.pure_user_id}】未找到系统Chromium，将使用Playwright默认浏览器")
 
             # 启动浏览器，使用随机特征
-            logger.info(f"【{self.pure_user_id}】启动浏览器，headless模式: {self.headless}")
+            logger.debug(f"【{self.pure_user_id}】启动浏览器，headless模式: {self.headless}")
             self.browser = self.playwright.chromium.launch(**launch_options)
             
             # 验证浏览器已启动
             if not self.browser or not self.browser.is_connected():
                 raise Exception("浏览器启动失败或连接已断开")
-            logger.info(f"【{self.pure_user_id}】浏览器启动成功，已连接: {self.browser.is_connected()}")
+            logger.debug(f"【{self.pure_user_id}】浏览器启动成功，已连接: {self.browser.is_connected()}")
             
             # 创建上下文，使用随机特征
-            logger.info(f"【{self.pure_user_id}】创建浏览器上下文...")
+            logger.debug(f"【{self.pure_user_id}】创建浏览器上下文...")
             
             # 🔑 关键优化：添加更多真实浏览器特征
             context_options = {
@@ -444,27 +467,30 @@ class XianyuSliderStealth:
             # 验证上下文已创建
             if not self.context:
                 raise Exception("浏览器上下文创建失败")
-            logger.info(f"【{self.pure_user_id}】浏览器上下文创建成功")
+            logger.debug(f"【{self.pure_user_id}】浏览器上下文创建成功")
             
             # 创建新页面
-            logger.info(f"【{self.pure_user_id}】创建新页面...")
+            logger.debug(f"【{self.pure_user_id}】创建新页面...")
             self.page = self.context.new_page()
             
             # 验证页面已创建
             if not self.page:
                 raise Exception("页面创建失败")
-            logger.info(f"【{self.pure_user_id}】页面创建成功（{'最大化窗口模式' if not self.headless else '无头模式'}）")
+            logger.debug(f"【{self.pure_user_id}】页面创建成功（{'最大化窗口模式' if not self.headless else '无头模式'}）")
             
             # 添加增强反检测脚本
-            logger.info(f"【{self.pure_user_id}】添加反检测脚本...")
+            logger.debug(f"【{self.pure_user_id}】添加反检测脚本...")
             self.page.add_init_script(self._get_stealth_script(browser_features))
-            logger.info(f"【{self.pure_user_id}】浏览器初始化完成")
+            browser_source = "system-chromium" if chromium_executable else "playwright-default"
+            logger.info(
+                f"【{self.pure_user_id}】浏览器初始化完成 "
+                f"(headless={self.headless}, browser={browser_source})"
+            )
             
             return self.page
         except Exception as e:
             logger.error(f"【{self.pure_user_id}】初始化浏览器失败: {e}")
-            import traceback
-            logger.error(f"【{self.pure_user_id}】详细错误堆栈: {traceback.format_exc()}")
+            _log_slider_traceback(self.pure_user_id, "初始化浏览器失败")
             # 确保在异常时也清理已创建的资源
             self._cleanup_on_init_failure()
             raise
@@ -1958,16 +1984,16 @@ class XianyuSliderStealth:
                 # 如果不是第一次尝试，短暂等待后重试
                 if attempt > 1:
                     retry_delay = random.uniform(1.0, 1.8)
-                    logger.info(f"【{self.pure_user_id}】等待{retry_delay:.2f}秒后重试...")
+                    logger.debug(f"【{self.pure_user_id}】等待{retry_delay:.2f}秒后重试...")
                     time.sleep(retry_delay)
                     
                     # 不刷新页面，直接在原来的frame中重试
                     # 保留frame引用，让重试时可以直接使用原来的frame查找滑块
                     if hasattr(self, '_detected_slider_frame'):
                         frame_info = "主页面" if self._detected_slider_frame is None else "Frame"
-                        logger.info(f"【{self.pure_user_id}】保留frame引用，将在原来的{frame_info}中重试")
+                        logger.debug(f"【{self.pure_user_id}】保留frame引用，将在原来的{frame_info}中重试")
                     else:
-                        logger.info(f"【{self.pure_user_id}】未找到frame引用，将重新检测滑块位置")
+                        logger.debug(f"【{self.pure_user_id}】未找到frame引用，将重新检测滑块位置")
                 
                 # 1. 查找滑块元素（使用快速模式）
                 slider_container, slider_button, slider_track = self.find_slider_elements(fast_mode=fast_mode)
@@ -1998,16 +2024,16 @@ class XianyuSliderStealth:
                     
                     # 📊 记录策略成功
                     strategy_stats.record_attempt(attempt, current_strategy, success=True)
-                    logger.info(f"【{self.pure_user_id}】📊 记录策略: 第{attempt}次-{current_strategy}策略-成功")
+                    logger.debug(f"【{self.pure_user_id}】记录策略成功: 第{attempt}次-{current_strategy}")
                     
                     # 保存成功记录用于学习
                     if self.enable_learning and hasattr(self, 'current_trajectory_data'):
                         self._save_success_record(self.current_trajectory_data)
-                        logger.info(f"【{self.pure_user_id}】已保存成功记录用于参数优化")
+                        logger.debug(f"【{self.pure_user_id}】已保存成功记录用于参数优化")
                     
                     # 如果不是第一次就成功，记录重试信息
                     if attempt > 1:
-                        logger.info(f"【{self.pure_user_id}】经过{attempt}次尝试后验证成功")
+                        logger.debug(f"【{self.pure_user_id}】经过{attempt}次尝试后验证成功")
                     
                     # 输出当前统计摘要
                     strategy_stats.log_summary()
@@ -2018,7 +2044,7 @@ class XianyuSliderStealth:
                     
                     # 📊 记录策略失败
                     strategy_stats.record_attempt(attempt, current_strategy, success=False)
-                    logger.info(f"【{self.pure_user_id}】📊 记录策略: 第{attempt}次-{current_strategy}策略-失败")
+                    logger.debug(f"【{self.pure_user_id}】记录策略失败: 第{attempt}次-{current_strategy}")
                     
                     # 分析失败原因
                     if hasattr(self, 'current_trajectory_data'):
@@ -2043,12 +2069,13 @@ class XianyuSliderStealth:
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 screenshot_path = os.path.join(screenshots_dir, f"slider_fail_{self.pure_user_id}_{timestamp}.jpg")
                 self.page.screenshot(path=screenshot_path, full_page=False)
-                logger.info(f"【{self.pure_user_id}】滑块失败截图已保存: {screenshot_path.replace('\\', '/')}")
+                screenshot_path_display = screenshot_path.replace("\\", "/")
+                logger.info(f"【{self.pure_user_id}】滑块失败截图已保存: {screenshot_path_display}")
         except Exception as screenshot_e:
             logger.warning(f"【{self.pure_user_id}】保存滑块失败截图时出错: {screenshot_e}")
         
         # 输出失败分析摘要
-        if failure_records:
+        if failure_records and _is_verbose_slider_logging_enabled():
             logger.info(f"【{self.pure_user_id}】失败分析摘要:")
             for record in failure_records:
                 logger.info(f"  - 第{record['attempt']}次: 距离{record['slide_distance']}px, "
@@ -2061,7 +2088,7 @@ class XianyuSliderStealth:
     
     def close_browser(self):
         """安全关闭浏览器并清理资源"""
-        logger.info(f"【{self.pure_user_id}】开始清理资源...")
+        logger.debug(f"【{self.pure_user_id}】开始清理资源...")
         
         # 清理页面
         try:
@@ -2085,7 +2112,7 @@ class XianyuSliderStealth:
         try:
             if hasattr(self, 'browser') and self.browser:
                 self.browser.close()  # 直接同步关闭，不使用异步任务
-                logger.info(f"【{self.pure_user_id}】浏览器已关闭")
+                logger.debug(f"【{self.pure_user_id}】浏览器已关闭")
                 self.browser = None
         except Exception as e:
             logger.warning(f"【{self.pure_user_id}】关闭浏览器时出错: {e}")
@@ -3942,7 +3969,7 @@ class XianyuSliderStealth:
             self.init_browser()
             
             # 导航到目标URL，快速加载
-            logger.info(f"【{self.pure_user_id}】导航到URL: {url}")
+            logger.debug(f"【{self.pure_user_id}】导航到URL: {url}")
             try:
                 self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
             except Exception as e:
@@ -3952,7 +3979,7 @@ class XianyuSliderStealth:
             
             # 短暂延迟，快速处理
             delay = random.uniform(0.3, 0.8)
-            logger.info(f"【{self.pure_user_id}】等待页面加载: {delay:.2f}秒")
+            logger.debug(f"【{self.pure_user_id}】等待页面加载: {delay:.2f}秒")
             time.sleep(delay)
             
             # 快速滚动（可选）
@@ -3963,12 +3990,12 @@ class XianyuSliderStealth:
             
             # 检查页面标题
             page_title = self.page.title()
-            logger.info(f"【{self.pure_user_id}】页面标题: {page_title}")
+            logger.debug(f"【{self.pure_user_id}】页面标题: {page_title}")
             
             # 检查页面内容
             page_content = self.page.content()
             if any(keyword in page_content for keyword in ["验证码", "captcha", "滑块", "slider"]):
-                logger.info(f"【{self.pure_user_id}】页面内容包含验证码相关关键词")
+                logger.info(f"【{self.pure_user_id}】检测到验证码页面，开始滑块验证")
                 
                 # 处理滑块验证
                 success = self.solve_slider()
@@ -3978,14 +4005,14 @@ class XianyuSliderStealth:
                     
                     # 等待页面完全加载和跳转，让新的cookie生效（快速模式）
                     try:
-                        logger.info(f"【{self.pure_user_id}】等待页面加载...")
+                        logger.debug(f"【{self.pure_user_id}】等待验证成功后的页面稳定...")
                         time.sleep(1)  # 快速等待，从3秒减少到1秒
                         
                         # 等待页面跳转或刷新
                         self.page.wait_for_load_state("networkidle", timeout=10000)
                         time.sleep(0.5)  # 快速确认，从2秒减少到0.5秒
                         
-                        logger.info(f"【{self.pure_user_id}】页面加载完成，开始获取cookie")
+                        logger.debug(f"【{self.pure_user_id}】页面加载完成，开始获取cookie")
                     except Exception as e:
                         logger.warning(f"【{self.pure_user_id}】等待页面加载时出错: {str(e)}")
                     
@@ -3999,7 +4026,7 @@ class XianyuSliderStealth:
                 
                 return success, cookies
             else:
-                logger.info(f"【{self.pure_user_id}】页面内容不包含验证码相关关键词，可能不需要验证")
+                logger.debug(f"【{self.pure_user_id}】页面内容不包含验证码相关关键词，可能不需要验证")
                 return True, None
                 
         except Exception as e:

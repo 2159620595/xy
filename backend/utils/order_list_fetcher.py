@@ -158,8 +158,20 @@ class OrderListFetcher:
         amount = self._extract_amount(
             self._find_first(
                 data,
-                ("amount", "payAmount", "actualFee", "realPayFee", "price", "totalFee", "payment"),
-            )
+                (
+                    "amount",
+                    "payAmount",
+                    "actualFee",
+                    "realPayFee",
+                    "price",
+                    "totalFee",
+                    "payment",
+                    "payFee",
+                    "settlementAmount",
+                    "orderAmount",
+                    "priceInfo",
+                ),
+            ),
         )
         quantity = self._extract_quantity(
             self._find_first(data, ("num", "quantity", "buyAmount", "count"))
@@ -230,15 +242,69 @@ class OrderListFetcher:
             return candidate
         return ""
 
-    def _extract_amount(self, value: Any) -> Optional[str]:
+    def _extract_amount(self, value: Any, key_hint: str = "") -> Optional[str]:
         if value in (None, "", [], {}):
             return None
+        if isinstance(value, dict):
+            prioritized_keys = (
+                "amount",
+                "amountYuan",
+                "displayAmount",
+                "payAmount",
+                "actualFee",
+                "realPayFee",
+                "totalFee",
+                "price",
+                "payment",
+                "payFee",
+                "settlementAmount",
+                "orderAmount",
+                "value",
+                "text",
+                "label",
+            )
+            lowered_map = {str(k).lower(): v for k, v in value.items()}
+            for key in prioritized_keys:
+                matched_key = next(
+                    (existing for existing in lowered_map if existing == key.lower()),
+                    None,
+                )
+                if matched_key is None:
+                    continue
+                parsed = self._extract_amount(lowered_map[matched_key], matched_key)
+                if parsed:
+                    return parsed
+
+            for nested_key, nested_value in value.items():
+                parsed = self._extract_amount(nested_value, str(nested_key))
+                if parsed:
+                    return parsed
+            return None
+
+        if isinstance(value, list):
+            for item in value:
+                parsed = self._extract_amount(item, key_hint)
+                if parsed:
+                    return parsed
+            return None
+
         if isinstance(value, (int, float)):
+            if isinstance(value, int) and any(token in key_hint.lower() for token in ("cent", "fen")):
+                return f"{value / 100:.2f}"
             return f"{value:.2f}"
 
         text = str(value).strip()
-        match = re.search(r"(\d+(?:\.\d+)?)", text.replace(",", ""))
-        return match.group(1) if match else text or None
+        if not text:
+            return None
+
+        normalized_text = text.replace(",", "").replace("¥", "").replace("￥", "").strip()
+        if re.fullmatch(r"\d+", normalized_text) and any(
+            token in key_hint.lower() for token in ("cent", "fen")
+        ):
+            return f"{int(normalized_text) / 100:.2f}"
+
+        match = re.search(r"(\d+(?:\.\d+)?)", normalized_text)
+        return match.group(1) if match else normalized_text or None
 
     def _extract_quantity(self, value: Any) -> int:
         if value in (None, "", [], {}):

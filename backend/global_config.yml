@@ -53,6 +53,8 @@ LOG_CONFIG:
   level: INFO
   retention: 7 days
   rotation: 1 day
+  verbose_token_refresh_logging: false
+  verbose_websocket_logging: false
 MANUAL_MODE:
   enabled: false
   timeout: 3600
