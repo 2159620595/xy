@@ -157,8 +157,6 @@ export const judianApi = {
     sessionId: string,
     data: Record<string, unknown>,
   ) => axios.post(buildJudianApiUrl(`/public/unlock/${sessionId}/batch`), data),
-  publicUnlockBatchCancel: (sessionId: string) =>
-    axios.post(buildJudianApiUrl(`/public/unlock/${sessionId}/batch/cancel`)),
   publicUnlockConfirm: (sessionId: string) =>
     axios.post(buildJudianApiUrl(`/public/unlock/${sessionId}/confirm`)),
   publicUnlockComplete: (sessionId: string) =>

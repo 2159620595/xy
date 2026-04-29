@@ -130,18 +130,8 @@
                     {{ batchStatusText }}
                   </div>
                 </div>
-                <div class="batch-progress-card__header-actions">
-                  <div class="batch-progress-card__meta">
-                    {{ batchProgressText }}
-                  </div>
-                  <button
-                    v-if="canCancelBatchTask"
-                    class="action-button action-button--danger batch-progress-card__action"
-                    :disabled="batchCancelling"
-                    @click="cancelBatchTask"
-                  >
-                    {{ batchCancelling ? "正在取消..." : "取消任务" }}
-                  </button>
+                <div class="batch-progress-card__meta">
+                  {{ batchProgressText }}
                 </div>
               </div>
               <div class="batch-progress-card__desc">
@@ -252,19 +242,15 @@
             <div class="actions-row actions-row--stack">
               <button
                 class="action-button action-button--primary action-button--secondary"
-                :disabled="scanSubmitting || batchSubmitting || batchCancelling"
-                @click="handleBatchPrimaryAction"
+                :disabled="scanSubmitting || batchSubmitting || isBatchRunning"
+                @click="openBatchOrderModal"
               >
                 {{
                   batchSubmitting
                     ? "批量下单提交中..."
-                    : batchCancelling
-                      ? "正在取消批量任务..."
-                      : canCancelBatchTask
-                        ? "取消批量任务"
-                        : isBatchRunning
-                          ? "批量任务执行中..."
-                          : "批量下单"
+                    : isBatchRunning
+                      ? "批量任务执行中..."
+                      : "批量下单"
                 }}
               </button>
               <button
@@ -301,52 +287,6 @@
               style="display: none"
               @change="handleQrImageChange"
             />
-
-            <div class="paste-panel">
-              <div class="paste-panel__title">粘贴二维码</div>
-              <div class="paste-panel__desc">
-                支持直接粘贴二维码链接/文本，也支持从剪贴板粘贴二维码图片。
-              </div>
-              <textarea
-                v-model.trim="pastedQrText"
-                class="paste-panel__textarea"
-                placeholder="在这里粘贴二维码链接、tradeNo、orderNo，或直接 Ctrl+V / 长按粘贴二维码图片"
-                :disabled="
-                  scanSubmitting ||
-                  batchSubmitting ||
-                  isBatchRunning ||
-                  clipboardReading
-                "
-                @paste="handlePasteIntoTextarea"
-              />
-              <div class="actions-row">
-                <button
-                  class="action-button"
-                  :disabled="
-                    scanSubmitting ||
-                    batchSubmitting ||
-                    isBatchRunning ||
-                    clipboardReading ||
-                    !pastedQrText
-                  "
-                  @click="submitPastedQrText"
-                >
-                  {{ scanSubmitting ? "识别中..." : "提交粘贴内容" }}
-                </button>
-                <button
-                  class="action-button"
-                  :disabled="
-                    scanSubmitting ||
-                    batchSubmitting ||
-                    isBatchRunning ||
-                    clipboardReading
-                  "
-                  @click="readClipboardPayload"
-                >
-                  {{ clipboardReading ? "读取剪贴板中..." : "读取剪贴板" }}
-                </button>
-              </div>
-            </div>
           </article>
         </section>
       </template>
@@ -668,6 +608,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
+import jsQR from "jsqr";
 
 import { judianApi } from "@/api/judian";
 
@@ -686,10 +627,8 @@ const pageRefreshing = ref(false);
 const syncingState = ref(false);
 const scanSubmitting = ref(false);
 const batchSubmitting = ref(false);
-const batchCancelling = ref(false);
 const confirmSubmitting = ref(false);
 const cameraBusy = ref(false);
-const clipboardReading = ref(false);
 
 const showCameraModal = ref(false);
 const showBatchOrderModal = ref(false);
@@ -713,10 +652,8 @@ const cameraTip = ref("请将摄像头对准聚点购买二维码");
 const videoRef = ref(null);
 const qrImageInputRef = ref(null);
 const showPayResult = ref(false);
-const pastedQrText = ref("");
 
-const DEFAULT_POLL_INTERVAL_MS = 10000;
-const BATCH_RUNNING_POLL_INTERVAL_MS = 5000;
+const POLL_INTERVAL_MS = 2500;
 
 let clockTimer = null;
 let toastTimer = null;
@@ -724,8 +661,6 @@ let cameraStream = null;
 let cameraAnimation = null;
 let liveSyncTimer = null;
 let lastPayResultKey = "";
-let qrDecoder = null;
-let qrDecoderPromise = null;
 
 const currentSession = computed(() => redeemInfo.value.session || null);
 const currentSessionId = computed(() =>
@@ -745,11 +680,6 @@ const resultMessage = computed(
 const isBatchRunning = computed(
   () => String(currentBatchTask.value?.status || "") === "running",
 );
-const canCancelBatchTask = computed(() => {
-  const status = String(currentBatchTask.value?.status || "");
-  if (!["pending", "running"].includes(status)) return false;
-  return currentBatchTask.value?.cancelRequested !== true;
-});
 const isUnlockCompleted = computed(() => {
   const sessionStatus = String(currentSession.value?.status || "");
   const orderStatus = String(currentOrder.value?.status || "");
@@ -876,8 +806,6 @@ const canConfirmUnlock = computed(
 );
 const batchStatusText = computed(() => {
   const status = String(currentBatchTask.value?.status || "");
-  if (currentBatchTask.value?.cancelRequested) return "批量任务取消中";
-  if (status === "canceled") return "批量任务已取消";
   if (status === "completed") return "批量下单已完成";
   if (status === "failed") return "批量下单失败";
   if (status === "running") return "批量下单进行中";
@@ -885,8 +813,6 @@ const batchStatusText = computed(() => {
 });
 const batchStatusClass = computed(() => {
   const status = String(currentBatchTask.value?.status || "");
-  if (currentBatchTask.value?.cancelRequested) return "warning";
-  if (status === "canceled") return "warning";
   if (status === "completed") return "success";
   if (status === "failed") return "failed";
   return "running";
@@ -958,21 +884,14 @@ const batchPreviewHintText = computed(() => {
 });
 const shouldAutoSync = computed(() => {
   if (state.value !== "ready" || !currentSessionId.value) return false;
-  if (currentBatchTask.value?.cancelRequested) return true;
   if (isBatchRunning.value) return true;
   return ["pending", "scanned", "confirmed"].includes(
     String(currentSession.value?.status || ""),
   );
 });
-const autoSyncIntervalMs = computed(() =>
-  isBatchRunning.value
-    ? BATCH_RUNNING_POLL_INTERVAL_MS
-    : DEFAULT_POLL_INTERVAL_MS,
-);
 
 onMounted(() => {
   document.addEventListener("visibilitychange", handleVisibilityChange);
-  document.addEventListener("paste", handleGlobalPaste);
   clockTimer = window.setInterval(() => {
     nowTimestamp.value = Math.floor(Date.now() / 1000);
   }, 1000);
@@ -1003,7 +922,6 @@ watch(
 
 onUnmounted(() => {
   document.removeEventListener("visibilitychange", handleVisibilityChange);
-  document.removeEventListener("paste", handleGlobalPaste);
   stopLiveSync();
   if (clockTimer) {
     clearInterval(clockTimer);
@@ -1046,7 +964,7 @@ function restartLiveSync() {
     )
       return;
     syncCurrentState({ silent: true }).catch(() => {});
-  }, autoSyncIntervalMs.value);
+  }, POLL_INTERVAL_MS);
 }
 
 function createEmptyRedeemInfo() {
@@ -1167,8 +1085,6 @@ function normalizeBatchTask(batchTask) {
     currentTradeNo: String(batchTask.currentTradeNo || ""),
     createdAt: String(batchTask.createdAt || ""),
     updatedAt: String(batchTask.updatedAt || ""),
-    cancelRequested: batchTask.cancelRequested === true,
-    cancelRequestedAt: String(batchTask.cancelRequestedAt || ""),
     requiredDiamond: Number(payload.requiredDiamond || 0),
     beforeDiamond: Number(payload.beforeDiamond ?? -1),
     afterDiamond: Number(payload.afterDiamond ?? -1),
@@ -1283,59 +1199,6 @@ function showError(code, message) {
   state.value = "error";
 }
 
-function extractErrorStatus(error, fallback = 500) {
-  const status = Number(error?.response?.status || 0);
-  return Number.isFinite(status) && status > 0 ? status : fallback;
-}
-
-function extractErrorMessage(error, fallback = "请求失败，请稍后重试") {
-  const response = error?.response || {};
-  const data = response?.data;
-  const status = extractErrorStatus(error, 0);
-  const statusText = String(response?.statusText || "").trim();
-
-  const normalizeText = (value) => {
-    if (typeof value !== "string") return "";
-    const text = value.trim();
-    if (!text) return "";
-    if (text.startsWith("<")) {
-      const titleMatch = text.match(/<title>([^<]+)<\/title>/i);
-      return String(titleMatch?.[1] || "").trim();
-    }
-    return text;
-  };
-
-  const detail = data?.detail;
-  if (Array.isArray(detail)) {
-    const messages = detail
-      .map((item) => {
-        if (typeof item === "string") return item.trim();
-        const message = String(item?.msg || item?.message || "").trim();
-        const location = Array.isArray(item?.loc)
-          ? item.loc.filter(Boolean).join(".")
-          : "";
-        if (location && message) return `${location}: ${message}`;
-        return message;
-      })
-      .filter(Boolean);
-    if (messages.length) return messages.join("; ");
-  }
-
-  const candidates = [
-    normalizeText(detail),
-    normalizeText(data?.message),
-    normalizeText(data?.error),
-    normalizeText(typeof data === "string" ? data : ""),
-    normalizeText(error?.message),
-  ].filter(Boolean);
-
-  if (candidates.length) return candidates[0];
-  if (status && statusText)
-    return `${fallback}（HTTP ${status} ${statusText}）`;
-  if (status) return `${fallback}（HTTP ${status}）`;
-  return fallback;
-}
-
 async function loadPage() {
   const code = getCurrentCode();
   if (!code) {
@@ -1357,8 +1220,8 @@ async function loadPage() {
       router.replace({ query: nextQuery }).catch(() => {});
     }
   } catch (error) {
-    const status = extractErrorStatus(error, 500);
-    const detail = extractErrorMessage(error, "网络错误，请刷新后重试");
+    const status = error?.response?.status || 500;
+    const detail = error?.response?.data?.detail || "网络错误，请刷新后重试";
     showError(status, detail);
   } finally {
     pageRefreshing.value = false;
@@ -1382,8 +1245,8 @@ async function syncCurrentState(options = {}) {
     applyRedeemPayload(data);
     state.value = "ready";
   } catch (error) {
-    const status = extractErrorStatus(error, 500);
-    const detail = extractErrorMessage(error, "同步状态失败");
+    const status = error?.response?.status || 500;
+    const detail = error?.response?.data?.detail || "同步状态失败";
     if ([404, 409, 410].includes(status)) {
       showError(status, detail);
       return;
@@ -1420,7 +1283,7 @@ async function refreshSession() {
 
     showToast("已创建新的解锁会话");
   } catch (error) {
-    const detail = extractErrorMessage(error, "新建会话失败");
+    const detail = error?.response?.data?.detail || "新建会话失败";
     showToast(detail);
   } finally {
     pageRefreshing.value = false;
@@ -1435,7 +1298,7 @@ async function openCamera() {
   }
 
   cameraBusy.value = true;
-  cameraTip.value = "正在加载扫码组件...";
+  cameraTip.value = "正在加载摄像头...";
   showCameraModal.value = true;
 
   const getMedia = async (constraints) => {
@@ -1454,7 +1317,6 @@ async function openCamera() {
   };
 
   try {
-    const decoderPromise = ensureQrDecoder();
     try {
       cameraStream = await getMedia({
         video: { facingMode: { ideal: "environment" } },
@@ -1462,7 +1324,6 @@ async function openCamera() {
     } catch {
       cameraStream = await getMedia({ video: true });
     }
-    await decoderPromise;
 
     const video = videoRef.value;
     if (!video) throw new Error("未找到视频节点");
@@ -1505,10 +1366,6 @@ function closeCamera() {
 function scanVideoFrame() {
   const video = videoRef.value;
   if (!showCameraModal.value || !video) return;
-  if (!qrDecoder) {
-    cameraAnimation = window.requestAnimationFrame(scanVideoFrame);
-    return;
-  }
 
   if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
     const canvas = document.createElement("canvas");
@@ -1518,7 +1375,7 @@ function scanVideoFrame() {
     if (context) {
       context.drawImage(video, 0, 0, canvas.width, canvas.height);
       const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
-      const result = qrDecoder(imageData.data, canvas.width, canvas.height, {
+      const result = jsQR(imageData.data, canvas.width, canvas.height, {
         inversionAttempts: "dontInvert",
       });
       if (result?.data) {
@@ -1551,10 +1408,9 @@ async function submitScan(qrText) {
       applyRedeemPayload(data);
     } catch {}
 
-    const detail = extractErrorMessage(
-      error,
-      "二维码识别失败，请确认扫到的是包含 tradeNo 的聚点购买二维码",
-    );
+    const detail =
+      error?.response?.data?.detail ||
+      "二维码识别失败，请确认扫到的是包含 tradeNo 的聚点购买二维码";
     showToast(detail);
   } finally {
     scanSubmitting.value = false;
@@ -1566,16 +1422,6 @@ function openQrImagePicker() {
     return;
   }
   qrImageInputRef.value?.click();
-}
-
-function isEditableTarget(target) {
-  if (!target || typeof target.closest !== "function") return false;
-  if (target.isContentEditable) return true;
-  return Boolean(
-    target.closest(
-      'input, textarea, select, [contenteditable="true"], [contenteditable=""]',
-    ),
-  );
 }
 
 function loadImageElementFromFile(file) {
@@ -1594,58 +1440,6 @@ function loadImageElementFromFile(file) {
   });
 }
 
-async function ensureQrDecoder() {
-  if (qrDecoder) {
-    return qrDecoder;
-  }
-  if (!qrDecoderPromise) {
-    qrDecoderPromise = import("jsqr")
-      .then((module) => {
-        qrDecoder = module.default;
-        return qrDecoder;
-      })
-      .finally(() => {
-        qrDecoderPromise = null;
-      });
-  }
-  return qrDecoderPromise;
-}
-
-async function decodeQrFromImageSource(source) {
-  const decode = await ensureQrDecoder();
-  const image = await loadImageElementFromFile(source);
-  const canvas = document.createElement("canvas");
-  canvas.width = image.naturalWidth || image.width;
-  canvas.height = image.naturalHeight || image.height;
-  const context = canvas.getContext("2d");
-  if (!context) {
-    throw new Error("无法读取图片内容");
-  }
-  context.drawImage(image, 0, 0, canvas.width, canvas.height);
-  const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
-  const result = decode(imageData.data, canvas.width, canvas.height, {
-    inversionAttempts: "attemptBoth",
-  });
-  if (!result?.data) {
-    throw new Error("未识别到二维码，请换一张清晰的二维码图片");
-  }
-  return String(result.data || "").trim();
-}
-
-async function processQrText(text) {
-  const normalized = String(text || "").trim();
-  if (!normalized) {
-    throw new Error("未读取到可用的二维码内容");
-  }
-  pastedQrText.value = normalized;
-  await submitScan(normalized);
-}
-
-async function processQrImageBlob(blob) {
-  const qrText = await decodeQrFromImageSource(blob);
-  await processQrText(qrText);
-}
-
 async function handleQrImageChange(event) {
   const input = event?.target;
   const file = input?.files?.[0];
@@ -1659,7 +1453,23 @@ async function handleQrImageChange(event) {
 
   try {
     scanSubmitting.value = true;
-    await processQrImageBlob(file);
+    const image = await loadImageElementFromFile(file);
+    const canvas = document.createElement("canvas");
+    canvas.width = image.naturalWidth || image.width;
+    canvas.height = image.naturalHeight || image.height;
+    const context = canvas.getContext("2d");
+    if (!context) {
+      throw new Error("无法读取图片内容");
+    }
+    context.drawImage(image, 0, 0, canvas.width, canvas.height);
+    const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+    const result = jsQR(imageData.data, canvas.width, canvas.height, {
+      inversionAttempts: "attemptBoth",
+    });
+    if (!result?.data) {
+      throw new Error("未识别到二维码，请换一张清晰的购买二维码图片");
+    }
+    await submitScan(result.data);
   } catch (error) {
     showToast(error?.message || "图片识别失败");
   } finally {
@@ -1667,156 +1477,8 @@ async function handleQrImageChange(event) {
   }
 }
 
-async function submitPastedQrText() {
-  if (!pastedQrText.value) {
-    showToast("请先粘贴二维码文本或链接");
-    return;
-  }
-  try {
-    await processQrText(pastedQrText.value);
-  } catch (error) {
-    showToast(error?.message || "粘贴内容识别失败");
-  }
-}
-
-async function handlePasteIntoTextarea(event) {
-  const clipboard = event?.clipboardData;
-  if (!clipboard) return;
-
-  const imageItem = Array.from(clipboard.items || []).find((item) =>
-    String(item.type || "").startsWith("image/"),
-  );
-  if (imageItem) {
-    event.preventDefault();
-    const file = imageItem.getAsFile();
-    if (!file) {
-      showToast("剪贴板图片读取失败");
-      return;
-    }
-    try {
-      scanSubmitting.value = true;
-      await processQrImageBlob(file);
-    } catch (error) {
-      showToast(error?.message || "剪贴板图片识别失败");
-    } finally {
-      scanSubmitting.value = false;
-    }
-    return;
-  }
-
-  const text = String(clipboard.getData("text/plain") || "").trim();
-  if (!text) return;
-  event.preventDefault();
-  pastedQrText.value = text;
-  try {
-    await processQrText(text);
-  } catch (error) {
-    showToast(error?.message || "粘贴内容识别失败");
-  }
-}
-
-async function handleGlobalPaste(event) {
-  if (
-    scanSubmitting.value ||
-    batchSubmitting.value ||
-    isBatchRunning.value ||
-    clipboardReading.value
-  ) {
-    return;
-  }
-
-  const target = event?.target;
-  if (isEditableTarget(target)) {
-    return;
-  }
-
-  const clipboard = event?.clipboardData;
-  if (!clipboard) return;
-
-  const imageItem = Array.from(clipboard.items || []).find((item) =>
-    String(item.type || "").startsWith("image/"),
-  );
-  if (imageItem) {
-    const file = imageItem.getAsFile();
-    if (!file) return;
-    event.preventDefault();
-    try {
-      scanSubmitting.value = true;
-      await processQrImageBlob(file);
-    } catch (error) {
-      showToast(error?.message || "剪贴板图片识别失败");
-    } finally {
-      scanSubmitting.value = false;
-    }
-    return;
-  }
-
-  const text = String(clipboard.getData("text/plain") || "").trim();
-  if (!text) return;
-  event.preventDefault();
-  pastedQrText.value = text;
-  try {
-    await processQrText(text);
-  } catch (error) {
-    showToast(error?.message || "粘贴内容识别失败");
-  }
-}
-
-async function readClipboardPayload() {
-  if (
-    scanSubmitting.value ||
-    batchSubmitting.value ||
-    isBatchRunning.value ||
-    clipboardReading.value
-  ) {
-    return;
-  }
-
-  if (window.isSecureContext === false) {
-    showToast("需要 HTTPS 或 localhost 才能读取系统剪贴板");
-    return;
-  }
-
-  clipboardReading.value = true;
-  try {
-    const clipboardApi = navigator?.clipboard;
-    if (!clipboardApi) {
-      throw new Error("当前浏览器不支持读取系统剪贴板");
-    }
-
-    if (typeof clipboardApi.read === "function") {
-      const items = await clipboardApi.read();
-      for (const item of items) {
-        const imageType = item.types.find((type) =>
-          String(type || "").startsWith("image/"),
-        );
-        if (imageType) {
-          const blob = await item.getType(imageType);
-          await processQrImageBlob(blob);
-          return;
-        }
-      }
-    }
-
-    if (typeof clipboardApi.readText === "function") {
-      const text = String((await clipboardApi.readText()) || "").trim();
-      if (text) {
-        await processQrText(text);
-        return;
-      }
-    }
-
-    throw new Error("剪贴板里没有可用的二维码文本或图片");
-  } catch (error) {
-    showToast(error?.message || "读取剪贴板失败");
-  } finally {
-    clipboardReading.value = false;
-  }
-}
-
 function openBatchOrderModal() {
-  if (batchSubmitting.value || batchCancelling.value || isBatchRunning.value)
-    return;
+  if (batchSubmitting.value || isBatchRunning.value) return;
   batchOrderCount.value = Math.min(
     365,
     Math.max(1, Number(batchOrderCount.value || 1) || 1),
@@ -1831,19 +1493,10 @@ function openBatchOrderModal() {
 }
 
 function closeBatchOrderModal() {
-  if (batchSubmitting.value || batchCancelling.value || isBatchRunning.value)
-    return;
+  if (batchSubmitting.value || isBatchRunning.value) return;
   batchOrderPassword.value = "";
   batchPreviewLoading.value = false;
   showBatchOrderModal.value = false;
-}
-
-function handleBatchPrimaryAction() {
-  if (canCancelBatchTask.value) {
-    cancelBatchTask();
-    return;
-  }
-  openBatchOrderModal();
 }
 
 function applyBatchCountPreset(option) {
@@ -1912,7 +1565,8 @@ async function refreshBatchPreview() {
     };
   } catch (error) {
     const responseStatus = Number(error?.response?.status || 0);
-    const rawDetail = String(error?.response?.data?.detail || "").trim();
+    const responseDetail = String(error?.response?.data?.detail || "").trim();
+    const normalizedDetail = responseDetail.toLowerCase();
     batchPreview.value = {
       ...createEmptyBatchPreview(),
       availableDiamond: Number(redeemInfo.value.account?.diamondQuantity || 0),
@@ -1926,9 +1580,9 @@ async function refreshBatchPreview() {
           : -1,
       canSubmit: false,
       error:
-        responseStatus === 404 || rawDetail.toLowerCase() === "not found"
+        responseStatus === 404 || normalizedDetail === "not found"
           ? "预估接口未生效，请重启后端服务后再试。"
-          : extractErrorMessage(error, "额度校验失败，请稍后重试。"),
+          : responseDetail || "额度校验失败，请稍后重试。",
     };
   } finally {
     batchPreviewLoading.value = false;
@@ -1991,34 +1645,11 @@ async function submitBatchOrder() {
       applyRedeemPayload(data);
     } catch {}
 
-    const detail = extractErrorMessage(error, "批量下单提交失败，请稍后重试");
+    const detail =
+      error?.response?.data?.detail || "批量下单提交失败，请稍后重试";
     showToast(detail);
   } finally {
     batchSubmitting.value = false;
-  }
-}
-
-async function cancelBatchTask() {
-  const sessionId = String(currentSession.value?.sessionId || "");
-  if (!sessionId) {
-    showToast("当前解锁会话不存在，请刷新页面后重试");
-    return;
-  }
-  if (!canCancelBatchTask.value || batchCancelling.value) return;
-
-  batchCancelling.value = true;
-  try {
-    const { data } = await judianApi.publicUnlockBatchCancel(sessionId);
-    applyRedeemPayload(data);
-    showToast(data?.message || "已请求取消批量任务");
-  } catch (error) {
-    try {
-      const { data } = await judianApi.publicUnlockDetail(sessionId);
-      applyRedeemPayload(data);
-    } catch {}
-    showToast(extractErrorMessage(error, "取消批量任务失败，请稍后重试"));
-  } finally {
-    batchCancelling.value = false;
   }
 }
 
@@ -2059,7 +1690,7 @@ async function confirmOrder() {
       applyRedeemPayload(data);
     } catch {}
 
-    const detail = extractErrorMessage(error, "自动扣钻失败，请稍后重试");
+    const detail = error?.response?.data?.detail || "自动扣钻失败，请稍后重试";
     showToast(detail);
   } finally {
     confirmSubmitting.value = false;
@@ -2581,17 +2212,6 @@ function showToast(message) {
   border-color: #0d8777;
 }
 
-.action-button--danger {
-  background: linear-gradient(135deg, #b91c1c, #dc2626);
-  border-color: #dc2626;
-  box-shadow: 0 10px 24px rgba(220, 38, 38, 0.22);
-}
-
-.action-button--danger:hover:not(:disabled) {
-  background: linear-gradient(135deg, #991b1b, #b91c1c);
-  border-color: #b91c1c;
-}
-
 .batch-progress-card {
   margin-bottom: 14px;
   padding: 14px;
@@ -2606,10 +2226,6 @@ function showToast(message) {
 
 .batch-progress-card--success {
   border-color: rgba(34, 197, 94, 0.35);
-}
-
-.batch-progress-card--warning {
-  border-color: rgba(251, 191, 36, 0.4);
 }
 
 .batch-progress-card--failed {
@@ -2636,18 +2252,6 @@ function showToast(message) {
   font-size: 13px;
   font-weight: 700;
   color: #93c5fd;
-}
-
-.batch-progress-card__header-actions {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.batch-progress-card__action {
-  min-width: 88px;
-  padding: 8px 12px;
-  font-size: 12px;
 }
 
 .batch-progress-card__desc,
@@ -2758,55 +2362,6 @@ function showToast(message) {
   font-size: 12px;
   color: #7f8cab;
   line-height: 1.7;
-}
-
-.paste-panel {
-  margin-top: 14px;
-  padding: 14px;
-  border-radius: 16px;
-  background: #101726;
-  border: 1px solid #1f2940;
-}
-
-.paste-panel__title {
-  font-size: 13px;
-  font-weight: 800;
-  color: #fff;
-}
-
-.paste-panel__desc {
-  margin-top: 6px;
-  font-size: 12px;
-  color: #7f8cab;
-  line-height: 1.7;
-}
-
-.paste-panel__textarea {
-  width: 100%;
-  min-height: 104px;
-  margin-top: 12px;
-  padding: 12px 14px;
-  border-radius: 14px;
-  border: 1px solid #2a3552;
-  background: #0d1422;
-  color: #fff;
-  font-size: 14px;
-  line-height: 1.6;
-  resize: vertical;
-  outline: none;
-  transition:
-    border-color 0.15s ease,
-    box-shadow 0.15s ease;
-}
-
-.paste-panel__textarea:focus {
-  border-color: #3b82f6;
-  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.16);
-}
-
-.paste-panel__textarea:disabled {
-  opacity: 0.7;
-  cursor: not-allowed;
 }
 
 .batch-order-field {

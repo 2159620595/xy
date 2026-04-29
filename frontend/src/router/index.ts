@@ -1,41 +1,36 @@
 import { createRouter, createWebHistory } from "vue-router";
+import AppLayout from "@/components/layout/AppLayout.vue";
+import LoginView from "@/views/auth/LoginView.vue";
+import DashboardView from "@/views/dashboard/DashboardView.vue";
+import AccountsView from "@/views/accounts/AccountsView.vue";
+import CardsView from "@/views/cards/CardsView.vue";
+import KeywordsView from "@/views/keywords/KeywordsView.vue";
+import DeliveryView from "@/views/delivery/DeliveryView.vue";
+import ItemsView from "@/views/items/ItemsView.vue";
+import ItemRepliesView from "@/views/item-replies/ItemRepliesView.vue";
+import NotificationChannelsView from "@/views/notifications/NotificationChannelsView.vue";
+import MessageNotificationsView from "@/views/notifications/MessageNotificationsView.vue";
+import OrdersView from "@/views/orders/OrdersView.vue";
+import SettingsView from "@/views/settings/SettingsView.vue";
+import UsersView from "@/views/admin/UsersView.vue";
+import LogsView from "@/views/admin/LogsView.vue";
+import RiskLogsView from "@/views/admin/RiskLogsView.vue";
+import DataManagementView from "@/views/admin/DataManagementView.vue";
+import AboutView from "@/views/about/AboutView.vue";
+import DisclaimerView from "@/views/disclaimer/DisclaimerView.vue";
+import NotFoundView from "@/views/NotFoundView.vue";
+import NetdiskDashboardView from "@/views/netdisk/DashboardView.vue";
+import NetdiskAccountsView from "@/views/netdisk/AccountsView.vue";
+import NetdiskCdKeysView from "@/views/netdisk/CdKeysView.vue";
+import NetdiskDeviceLogsView from "@/views/netdisk/DeviceLogsView.vue";
+import NetdiskLoginLogsView from "@/views/netdisk/LoginLogsView.vue";
+import NetdiskRedeemView from "@/views/netdisk/RedeemView.vue";
+import JudianDashboardView from "@/views/judian/DashboardView.vue";
+import JudianAccountsView from "@/views/judian/AccountsView.vue";
+import JudianCdKeysView from "@/views/judian/CdKeysView.vue";
+import JudianRedeemView from "@/views/judian/RedeemView.vue";
 import { useAuthStore } from "@/stores/auth";
 import { initializeAuth } from "@/utils/auth-bootstrap";
-
-const AppLayout = () => import("@/components/layout/AppLayout.vue");
-const LoginView = () => import("@/views/auth/LoginView.vue");
-const DashboardView = () => import("@/views/dashboard/DashboardView.vue");
-const AccountsView = () => import("@/views/accounts/AccountsView.vue");
-const CardsView = () => import("@/views/cards/CardsView.vue");
-const KeywordsView = () => import("@/views/keywords/KeywordsView.vue");
-const DeliveryView = () => import("@/views/delivery/DeliveryView.vue");
-const ItemsView = () => import("@/views/items/ItemsView.vue");
-const ItemRepliesView = () => import("@/views/item-replies/ItemRepliesView.vue");
-const NotificationChannelsView = () =>
-  import("@/views/notifications/NotificationChannelsView.vue");
-const MessageNotificationsView = () =>
-  import("@/views/notifications/MessageNotificationsView.vue");
-const OrdersView = () => import("@/views/orders/OrdersView.vue");
-const SettingsView = () => import("@/views/settings/SettingsView.vue");
-const UsersView = () => import("@/views/admin/UsersView.vue");
-const LogsView = () => import("@/views/admin/LogsView.vue");
-const RiskLogsView = () => import("@/views/admin/RiskLogsView.vue");
-const DataManagementView = () => import("@/views/admin/DataManagementView.vue");
-const AboutView = () => import("@/views/about/AboutView.vue");
-const DisclaimerView = () => import("@/views/disclaimer/DisclaimerView.vue");
-const NotFoundView = () => import("@/views/NotFoundView.vue");
-const NetdiskDashboardView = () => import("@/views/netdisk/DashboardView.vue");
-const NetdiskAccountsView = () => import("@/views/netdisk/AccountsView.vue");
-const NetdiskCdKeysView = () => import("@/views/netdisk/CdKeysView.vue");
-const NetdiskDeviceLogsView = () =>
-  import("@/views/netdisk/DeviceLogsView.vue");
-const NetdiskLoginLogsView = () =>
-  import("@/views/netdisk/LoginLogsView.vue");
-const NetdiskRedeemView = () => import("@/views/netdisk/RedeemView.vue");
-const JudianDashboardView = () => import("@/views/judian/DashboardView.vue");
-const JudianAccountsView = () => import("@/views/judian/AccountsView.vue");
-const JudianCdKeysView = () => import("@/views/judian/CdKeysView.vue");
-const JudianRedeemView = () => import("@/views/judian/RedeemView.vue");
 
 const router = createRouter({
   history: createWebHistory(),
@@ -315,15 +310,12 @@ const router = createRouter({
 
 router.beforeEach(async (to) => {
   const authStore = useAuthStore();
-  const isPublicRoute = Boolean(to.meta.public);
-  const shouldResolveAuth =
-    !isPublicRoute || to.path === "/login" || to.path === "/register";
 
-  if (shouldResolveAuth && !authStore.initialized) {
+  if (!authStore.initialized) {
     await initializeAuth();
   }
 
-  if (isPublicRoute) {
+  if (to.meta.public) {
     if (authStore.isAuthenticated && (to.path === "/login" || to.path === "/register")) {
       return "/dashboard";
     }

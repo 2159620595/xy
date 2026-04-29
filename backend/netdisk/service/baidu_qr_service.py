@@ -79,30 +79,6 @@ def _parse_jsonp(text):
     except: return {}
 
 
-def _page_indicates_scanned(page) -> bool:
-    try:
-        page_url = str(page.url or "")
-    except Exception:
-        page_url = ""
-
-    try:
-        body_text = page.locator("body").inner_text(timeout=500)
-    except Exception:
-        body_text = ""
-
-    combined = f"{page_url}\n{body_text}"
-    scan_markers = (
-        "请在手机上确认登录",
-        "请在手机确认登录",
-        "请在手机上点击确认",
-        "请在手机确认",
-        "扫码成功",
-        "已扫码",
-        "scan-ok",
-    )
-    return any(marker in combined for marker in scan_markers)
-
-
 def _prune_memory_ctx_store():
     now = time.time()
     expired = [key for key, value in _memory_ctx_store.items() if float(value.get('_expires_at') or 0) <= now]
@@ -150,45 +126,6 @@ async def _del_ctx(sign):
         await _redis.delete(SIGN_KEY.format(sign))
     except Exception as exc:
         logger.warning(f"[QrService] Redis del_ctx failed, cleared memory cache only: {exc}")
-
-
-def _ensure_store_alias(store: dict, sign: str, stop: Event | None = None) -> None:
-    aliases = store.setdefault("aliases", [])
-    if sign not in aliases:
-        aliases.append(sign)
-    _thread_store[sign] = store
-    if stop is not None:
-        _stop_events[sign] = stop
-
-
-async def _ensure_ready_sign_exposed(requested_sign: str, store: dict) -> dict | None:
-    actual_sign = str(store.get("actual_sign") or "").strip()
-    img_url = str(store.get("imgurl") or "").strip()
-    if not actual_sign or not img_url:
-        return None
-
-    stop = _stop_events.get(requested_sign)
-    _ensure_store_alias(store, requested_sign, stop)
-    if requested_sign != actual_sign:
-        _ensure_store_alias(store, actual_sign, stop)
-        await _set_ctx(actual_sign, {"gid": store.get("gid", "")})
-    return {"status": "ready", "sign": actual_sign, "imgurl": img_url}
-
-
-async def _cleanup_store(sign: str, store: dict) -> None:
-    aliases = [str(alias or "").strip() for alias in store.get("aliases", [])]
-    if sign not in aliases:
-        aliases.append(sign)
-    actual_sign = str(store.get("actual_sign") or "").strip()
-    if actual_sign and actual_sign not in aliases:
-        aliases.append(actual_sign)
-    for alias in aliases:
-        if not alias:
-            continue
-        _stop_events.get(alias, Event()).set()
-        _thread_store.pop(alias, None)
-        _stop_events.pop(alias, None)
-        await _del_ctx(alias)
 
 
 
@@ -245,9 +182,6 @@ def _browser_login_thread(sign: str, gid: str, store: dict, stop: Event):
             for _ in range(90):
                 if stop.is_set(): break
                 time.sleep(1)
-                if not store.get("scanned") and _page_indicates_scanned(page):
-                    store["scanned"] = True
-                    logger.info(f"[browser] QR scanned sign={actual_sign[:8]}")
                 cookies = ctx.cookies()
                 bduss = next((c["value"] for c in cookies if c["name"] == "BDUSS"), None)
                 if bduss:
@@ -274,14 +208,44 @@ async def generate_qr_code() -> dict:
     sign = f"pending_{gid}"
     logger.info(f"[QrService] generateQrCode GID={gid}")
 
-    store = {"gid": gid, "ready": False, "actual_sign": "", "imgurl": "",
-             "bduss": None, "cookie_str": None, "done": None, "scanned": False, "aliases": [sign]}
+    store = {"ready": False, "actual_sign": "", "imgurl": "",
+             "bduss": None, "cookie_str": None, "done": None}
     stop  = Event()
-    _ensure_store_alias(store, sign, stop)
+    _thread_store[sign] = store
+    _stop_events[sign]  = stop
 
     Thread(target=_browser_login_thread, args=(sign, gid, store, stop), daemon=True).start()
-    await _set_ctx(sign, {"gid": gid, "pending": True})
-    return {"sign": sign, "imgurl": ""}
+
+    # 等浏览器打开并拿到二维码（最多 20 秒）
+    for _ in range(40):
+        await asyncio.sleep(0.5)
+        if store.get("ready"): break
+    else:
+        stop.set()
+        raise ValueError("浏览器启动超时")
+
+    if store.get("error"):
+        raise ValueError(store["error"])
+
+    actual  = store["actual_sign"]
+    img_url = store["imgurl"]
+    logger.debug(f"[QrService] actual_sign={actual!r} imgurl={img_url!r}")
+
+    if not actual:
+        raise ValueError("二维码 sign 为空，请重试")
+    if not img_url:
+        raise ValueError("二维码图片地址为空，请重试")
+
+    _thread_store[actual] = store
+    _stop_events[actual]  = stop
+    _thread_store.pop(sign, None)
+    _stop_events.pop(sign, None)
+
+    await _set_ctx(actual, {"gid": gid})
+
+    logger.info(f"[QrService] generateQrCode ok sign={actual[:8]}...")
+
+    return {"sign": actual, "imgurl": img_url}
 
 
 async def check_login_status(sign: str, tenant_id: str, db: Session) -> dict:
@@ -290,19 +254,16 @@ async def check_login_status(sign: str, tenant_id: str, db: Session) -> dict:
         # sign 可能已经完成并被清理，或者是旧的 sign
         return {"status": "pending"}
 
-    if store.get("ready"):
-        ready_payload = await _ensure_ready_sign_exposed(sign, store)
-        if ready_payload is not None and sign != ready_payload["sign"]:
-            return ready_payload
-
     done = store.get("done")
 
     if not done:
-        if store.get("scanned"):
-            return {"status": "scanned"}
         return {"status": "pending"}
 
-    await _cleanup_store(sign, store)
+    # 清理
+    _stop_events.get(sign, Event()).set()
+    _thread_store.pop(sign, None)
+    _stop_events.pop(sign, None)
+    await _del_ctx(sign)
 
     if done != "success":
         return {"status": "failed", "msg": f"{done}，请重新扫码"}

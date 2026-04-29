@@ -4,7 +4,6 @@ import base64
 import hashlib
 import hmac
 import json
-import logging
 import os
 import queue
 import random
@@ -13,13 +12,12 @@ import subprocess
 import sys
 import threading
 import time
-import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Callable
 
-from urllib.parse import parse_qs, quote, urlparse, urlsplit
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 
 
@@ -30,33 +28,22 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding as rsa_padding
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import PlainTextResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
-from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 try:
     from backend.netdisk import models
     from backend.netdisk.database import SessionLocal, get_db
-    from backend.perf_cache import build_cache_key, cached_call, invalidate_cache_prefix
 except ModuleNotFoundError:
     from netdisk import models
     from netdisk.database import SessionLocal, get_db
-    from perf_cache import build_cache_key, cached_call, invalidate_cache_prefix
 
 app = FastAPI(title='Judian API')
-app.add_middleware(
-    GZipMiddleware,
-    minimum_size=max(256, int(os.environ.get('API_GZIP_MINIMUM_SIZE', '1024'))),
-)
-logger = logging.getLogger(__name__)
 security = HTTPBearer(auto_error=False)
 JWT_SECRET = os.environ.get('JUDIAN_JWT_SECRET') or f"{os.environ.get('API_SECRET_KEY', 'judian-secret')}-judian"
 DEFAULT_TRUSTED_UI_ORIGINS = str(os.environ.get('CORS_ALLOW_ORIGINS', '') or '').strip()
-JUDIAN_DASHBOARD_CACHE_TTL = max(0, int(os.environ.get('PERF_JUDIAN_DASHBOARD_CACHE_TTL', '5')))
-JUDIAN_LIST_CACHE_TTL = max(0, int(os.environ.get('PERF_JUDIAN_LIST_CACHE_TTL', '3')))
 JUDIAN_DEFAULT_TRUSTED_UI_ORIGINS = [
     'http://localhost:5173',
     'http://127.0.0.1:5173',
@@ -79,7 +66,6 @@ ORDER_PAY_URL = 'http://111.230.160.82/v2/order/info/payApiOrder'
 BATCH_VIP_PRICE_LIST_URL = 'http://bkbf.xn--vhqr42drhf5k7b.com/pc/vip_price/list'
 REMOTE_TIMEOUT_SECONDS = 20
 REMOTE_SUPPLEMENTAL_TIMEOUT_SECONDS = 8
-PUBLIC_VIP_PLANS_CACHE_TTL_SECONDS = max(30, int(os.environ.get('PUBLIC_VIP_PLANS_CACHE_TTL_SECONDS', '180')))
 ANDROID_MODELS = ['22041211AC', 'SM-G9910', 'KB2000', 'V2049A', 'M2102K1C']
 PUBLIC_WEB_APP_ID = '4150439554430627'
 PUBLIC_WEB_APP_VERSION = '1.1.9'
@@ -91,8 +77,6 @@ PUBLIC_WEB_AUTH_IV = b'WonrnVkxeIxDcFbv'
 
 ACCOUNT_ID_PATTERN = re.compile(r'(\d+)$')
 _JUDIAN_SCHEMA_READY = False
-_PUBLIC_VIP_PLANS_CACHE: list[dict[str, Any]] = []
-_PUBLIC_VIP_PLANS_CACHE_AT = 0.0
 
 
 class JudianRemoteError(RuntimeError):
@@ -415,18 +399,6 @@ def get_current_user(
         'sub': username,
         'is_admin': True,
     }
-
-
-def build_judian_user_cache_key(user: dict[str, Any], *parts: Any) -> str:
-    username = str(user.get('username') or '').strip() or 'admin'
-    return build_cache_key('judian', username, *parts)
-
-
-def invalidate_judian_owner_cache(owner_username: str) -> None:
-    normalized_owner = str(owner_username or '').strip()
-    if not normalized_owner:
-        return
-    invalidate_cache_prefix(f"{build_cache_key('judian', normalized_owner)}::")
 
 
 def resolve_claim_api_token(request: Request) -> str:
@@ -778,25 +750,6 @@ def remote_get_fund(session: requests.Session, *, timeout: int | float = REMOTE_
 
 
 def remote_get_public_vip_plans(*, timeout: int | float = REMOTE_SUPPLEMENTAL_TIMEOUT_SECONDS) -> list[dict[str, Any]]:
-    def normalize_plans(value: Any) -> list[dict[str, Any]]:
-        if not isinstance(value, list):
-            raise JudianRemoteError('聚点套餐列表响应结构异常')
-        return [item for item in value if isinstance(item, dict)]
-
-    def update_cache(plans: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        global _PUBLIC_VIP_PLANS_CACHE, _PUBLIC_VIP_PLANS_CACHE_AT
-        _PUBLIC_VIP_PLANS_CACHE = list(plans)
-        _PUBLIC_VIP_PLANS_CACHE_AT = time.time()
-        return list(_PUBLIC_VIP_PLANS_CACHE)
-
-    def get_cached_plans(*, allow_stale: bool = False) -> list[dict[str, Any]]:
-        if not _PUBLIC_VIP_PLANS_CACHE:
-            return []
-        age_seconds = max(0.0, time.time() - _PUBLIC_VIP_PLANS_CACHE_AT)
-        if allow_stale or age_seconds <= PUBLIC_VIP_PLANS_CACHE_TTL_SECONDS:
-            return list(_PUBLIC_VIP_PLANS_CACHE)
-        return []
-
     script_root = get_batch_script_root()
     script_path = os.path.join(script_root, 'test-vip.js')
     if os.path.isfile(script_path):
@@ -815,18 +768,15 @@ def remote_get_public_vip_plans(*, timeout: int | float = REMOTE_SUPPLEMENTAL_TI
             if completed.returncode == 0:
                 plans = result_payload.get('data')
                 if isinstance(plans, list):
-                    return update_cache(normalize_plans(plans))
+                    return [item for item in plans if isinstance(item, dict)]
                 message = pick_text(
                     result_payload.get('msg'),
                     result_payload.get('message'),
                     str(completed.stderr or '').strip(),
                 )
                 raise JudianRemoteError(message or '批量下单脚本未返回可用套餐列表')
-        except Exception as exc:
-            cached_plans = get_cached_plans()
-            if cached_plans:
-                logger.warning('remote_get_public_vip_plans use cached plans after script failure: %s', exc)
-                return cached_plans
+        except Exception:
+            pass
 
     session = requests.Session()
     session.headers.update(build_public_web_headers())
@@ -837,10 +787,6 @@ def remote_get_public_vip_plans(*, timeout: int | float = REMOTE_SUPPLEMENTAL_TI
         )
         response.raise_for_status()
     except requests.RequestException as exc:
-        cached_plans = get_cached_plans(allow_stale=True)
-        if cached_plans:
-            logger.warning('remote_get_public_vip_plans use cached plans after http failure: %s', exc)
-            return cached_plans
         raise JudianRemoteError(f'聚点套餐列表获取失败：{exc}') from exc
 
     try:
@@ -853,21 +799,15 @@ def remote_get_public_vip_plans(*, timeout: int | float = REMOTE_SUPPLEMENTAL_TI
         code = str(payload.get('code') or '').strip()
         if code and code not in {'200', '20000'}:
             message = pick_text(payload.get('msg'), payload.get('message'))
-            cached_plans = get_cached_plans(allow_stale=True)
-            if cached_plans:
-                logger.warning(
-                    'remote_get_public_vip_plans use cached plans after remote code=%s message=%s',
-                    code,
-                    message,
-                )
-                return cached_plans
             raise JudianRemoteError(message or f'聚点套餐列表请求失败，code={code}')
 
     if isinstance(payload, dict):
         plans = payload.get('data')
     else:
         plans = payload
-    return update_cache(normalize_plans(plans))
+    if not isinstance(plans, list):
+        raise JudianRemoteError('聚点套餐列表响应结构异常')
+    return [item for item in plans if isinstance(item, dict)]
 
 
 def extract_public_vip_plan_diamond_cost(plan: dict[str, Any]) -> int:
@@ -1674,8 +1614,6 @@ def serialize_public_batch_task(row: models.JudianBatchPurchaseTask | None) -> d
         'currentTradeNo': row.current_trade_no or '',
         'createdAt': row.created_at or '',
         'updatedAt': row.updated_at or '',
-        'cancelRequested': bool(payload.get('cancelRequested')),
-        'cancelRequestedAt': pick_text(payload.get('cancelRequestedAt')),
         'items': items,
         'payload': payload,
     }
@@ -2410,99 +2348,16 @@ def execute_public_unlock_payment(
     }
 
 
-_PUBLIC_UNLOCK_AUTOPAY_RUNNING: set[str] = set()
-_PUBLIC_UNLOCK_AUTOPAY_LOCK = threading.Lock()
-
-
-def _set_public_unlock_autopay_pending(
-    db: Session,
-    session_row: models.JudianScanSession,
-    order_row: models.JudianOrder | None,
-    *,
-    message: str,
-) -> None:
-    session_row.status = 'confirmed' if session_row.order_id else (session_row.status or 'pending')
-    session_row.message = message
-    session_row.updated_at = now_text()
-    session_row.payload = {
-        **dict_like(session_row.payload),
-        'autoPay': True,
-        'autoPayQueued': True,
-        'autoPayQueuedAt': int(time.time()),
-    }
-    if order_row is not None and str(order_row.order_status or '') != 'completed':
-        order_row.order_status = 'confirmed'
-        order_row.updated_at = now_text()
-    db.commit()
-    db.refresh(session_row)
-    if order_row is not None:
-        db.refresh(order_row)
-
-
-def run_public_unlock_payment_job(session_id: str) -> None:
-    db = SessionLocal()
-    try:
-        session_row, cdkey_row, account = get_public_unlock_session_or_404(db, session_id)
-        order_row = db.query(models.JudianOrder).filter_by(order_id=session_row.order_id).first() if session_row.order_id else None
-        if order_row is None:
-            logger.warning('public_unlock_payment_job skipped: session_id=%s order_missing', session_id)
-            return
-        execute_public_unlock_payment(db, session_row, cdkey_row, account, order_row)
-        logger.info('public_unlock_payment_job completed: session_id=%s order_id=%s', session_id, session_row.order_id)
-    except HTTPException as exc:
-        logger.warning(
-            'public_unlock_payment_job rejected: session_id=%s status=%s detail=%s',
-            session_id,
-            exc.status_code,
-            exc.detail,
-        )
-    except Exception as exc:
-        logger.error(
-            'public_unlock_payment_job failed: session_id=%s error=%s\n%s',
-            session_id,
-            exc,
-            traceback.format_exc(),
-        )
-    finally:
-        try:
-            db.close()
-        finally:
-            with _PUBLIC_UNLOCK_AUTOPAY_LOCK:
-                _PUBLIC_UNLOCK_AUTOPAY_RUNNING.discard(str(session_id or '').strip())
-
-
-def start_public_unlock_payment_job(session_id: str) -> bool:
-    normalized_session_id = str(session_id or '').strip()
-    if not normalized_session_id:
-        return False
-    with _PUBLIC_UNLOCK_AUTOPAY_LOCK:
-        if normalized_session_id in _PUBLIC_UNLOCK_AUTOPAY_RUNNING:
-            return False
-        _PUBLIC_UNLOCK_AUTOPAY_RUNNING.add(normalized_session_id)
-    worker = threading.Thread(
-        target=run_public_unlock_payment_job,
-        args=(normalized_session_id,),
-        daemon=True,
-    )
-    worker.start()
-    return True
 
 
 def build_public_unlock_url(code: str, session_id: str) -> str:
-    safe_code = quote(str(code or '').strip(), safe='')
-    safe_session = quote(str(session_id or '').strip(), safe='')
-    query_parts: list[str] = []
+
+
+    safe_code = str(code or '').strip()
+    safe_session = str(session_id or '').strip()
     if safe_code:
-        query_parts.append(f'code={safe_code}')
-    if safe_session:
-        query_parts.append(f'session={safe_session}')
-    query = '&'.join(query_parts)
-    if query:
-        return f'/judian/redeem?{query}'
-    return '/judian/redeem'
-
-
-
+        return f'/judian/redeem?code={safe_code}&session={safe_session}'
+    return f'/judian/unlock?session={safe_session}'
 
 
 
@@ -2882,71 +2737,6 @@ def make_public_batch_failed_items(count: int, message: str) -> list[dict[str, A
         }
         for index in range(1, max(1, int(count)) + 1)
     ]
-
-
-def is_public_batch_task_cancel_requested(row: models.JudianBatchPurchaseTask | None) -> bool:
-    if row is None:
-        return False
-    payload = dict_like(row.payload)
-    return bool(payload.get('cancelRequested'))
-
-
-def mark_public_batch_task_cancel_requested(
-    db: Session,
-    session_row: models.JudianScanSession,
-    row: models.JudianBatchPurchaseTask,
-) -> models.JudianBatchPurchaseTask:
-    now = now_text()
-    row.payload = {
-        **dict_like(row.payload),
-        'cancelRequested': True,
-        'cancelRequestedAt': now,
-    }
-    row.message = '已请求取消批量任务，等待当前步骤结束'
-    row.updated_at = now
-    session_row.message = row.message
-    session_row.updated_at = now
-    db.commit()
-    db.refresh(row)
-    db.refresh(session_row)
-    return row
-
-
-def cancel_public_batch_task(
-    db: Session,
-    session_row: models.JudianScanSession,
-    row: models.JudianBatchPurchaseTask,
-    *,
-    message: str = '批量任务已取消',
-) -> models.JudianBatchPurchaseTask:
-    existing_items = dict_like(row.result_payload).get('items')
-    items_result = [dict_like(item) for item in existing_items] if isinstance(existing_items, list) else []
-    total_consumed_diamond = sum(max(0, pick_int(item.get('consumedDiamond'))) for item in items_result)
-    row = finalize_public_batch_task(
-        db,
-        row,
-        status='canceled',
-        message=message,
-        items_result=items_result,
-        current_index=pick_int(row.current_index),
-        current_trade_no=str(row.current_trade_no or ''),
-        total_consumed_diamond=total_consumed_diamond,
-    )
-    row.payload = {
-        **dict_like(row.payload),
-        'cancelRequested': True,
-        'cancelRequestedAt': pick_text(dict_like(row.payload).get('cancelRequestedAt'), now_text()),
-    }
-    session_row.message = row.message
-    session_row.updated_at = now_text()
-    session_row.result_payload = {
-        **dict_like(session_row.result_payload),
-        'latestBatchId': row.batch_id,
-    }
-    db.commit()
-    db.refresh(row)
-    db.refresh(session_row)
-    return row
 
 
 def get_batch_script_root() -> str:
@@ -3388,21 +3178,6 @@ def run_public_batch_purchase(
     results: list[dict[str, Any]] = []
 
     for index, item in enumerate(items, start=1):
-        db.refresh(batch_task_row)
-        if is_public_batch_task_cancel_requested(batch_task_row):
-            batch_task_row = cancel_public_batch_task(
-                db,
-                session_row,
-                batch_task_row,
-                message=f'批量任务已取消，已处理 {len(results)}/{len(items)} 单',
-            )
-            return build_public_unlock_response(
-                db,
-                cdkey_row,
-                account,
-                session_row,
-                batch_task_row=batch_task_row,
-            ), batch_task_row
         batch_task_row.current_index = index
         batch_task_row.current_trade_no = str(item.get('tradeNo') or item.get('orderNo') or '')
         batch_task_row.message = f'正在处理第 {index}/{len(items)} 单'
@@ -3676,9 +3451,6 @@ def run_public_batch_script_job(
         batch_task_row.updated_at = now_text()
         db.commit()
         db.refresh(batch_task_row)
-        if is_public_batch_task_cancel_requested(batch_task_row):
-            cancel_public_batch_task(db, session_row, batch_task_row, message='批量任务已取消，脚本未启动')
-            return
 
         process = subprocess.Popen(
             command,
@@ -3711,7 +3483,6 @@ def run_public_batch_script_job(
         reader_thread.start()
         deadline = time.time() + timeout_seconds
         timed_out = False
-        canceled = False
         while True:
             wait_timeout = max(0.1, min(0.5, deadline - time.time()))
             try:
@@ -3727,12 +3498,6 @@ def run_public_batch_script_job(
                     )
                 continue
             except queue.Empty:
-                db.refresh(batch_task_row)
-                if is_public_batch_task_cancel_requested(batch_task_row):
-                    canceled = True
-                    if process.poll() is None:
-                        process.kill()
-                    break
                 if process.poll() is not None:
                     break
                 if time.time() >= deadline:
@@ -3751,14 +3516,6 @@ def run_public_batch_script_job(
                     session_row,
                     event_payload,
                 )
-        if canceled:
-            cancel_public_batch_task(
-                db,
-                session_row,
-                batch_task_row,
-                message=f'批量任务已取消，已处理 {int(batch_task_row.processed_count or 0)}/{count} 单',
-            )
-            return
         if timed_out:
             raise RuntimeError(f'批量下单脚本执行超时，超过 {timeout_seconds} 秒')
         stdout_text = ''.join(stdout_lines)
@@ -3920,207 +3677,72 @@ def public_unlock_scan(session_id: str, body: JudianPublicUnlockScanRequest, db:
         trade_no=body.tradeNo or '',
         order_no=body.orderNo or '',
     )
-    _set_public_unlock_autopay_pending(
+    return execute_public_unlock_payment(
         db,
         session_row,
+        cdkey_row,
+        account,
         order_row,
-        message='订单已同步，正在后台自动扣钻，请稍候查看结果',
+        remote_session=remote_session,
     )
-    started = start_public_unlock_payment_job(session_row.session_id)
-    if not started:
-        logger.info('public_unlock_scan reuse_running_autopay: session_id=%s order_id=%s', session_row.session_id, session_row.order_id)
-    db.refresh(cdkey_row)
-    db.refresh(account)
-    return {
-        'success': True,
-        'pending': True,
-        'message': session_row.message,
-        **build_public_unlock_response(db, cdkey_row, account, session_row, order_row),
-    }
 
 
 @app.post('/public/unlock/{session_id}/batch')
 def public_unlock_batch_purchase(session_id: str, body: JudianPublicBatchPurchaseRequest, db: Session = Depends(get_db)):
-    stage = 'init'
-    is_script_mode = body.count is not None and not (body.items or [])
-    request_count = body.count
-    request_vip_id = pick_text(body.vipId)
-    request_package_type = pick_text(body.packageType)
-    request_account = pick_text(body.account)
-    try:
-        stage = 'load_session'
-        session_row, cdkey_row, account = get_public_unlock_session_or_404(db, session_id)
-        logger.info(
-            'public_unlock_batch_purchase start: session_id=%s mode=%s count=%s vipId=%s packageType=%s account=%s has_password=%s',
-            session_id,
-            'script' if is_script_mode else 'items',
-            request_count,
-            request_vip_id,
-            request_package_type,
-            request_account,
-            bool(pick_text(body.password)),
-        )
-        if is_script_mode:
-            stage = 'normalize_count'
-            count = normalize_public_batch_order_count(body)
-            stage = 'resolve_script_auth'
-            remote_token, remote_login_email, remote_login_password, target_login_email, target_login_password = resolve_public_batch_script_auth(account, body)
-            stage = 'resolve_package_type'
-            package_type = pick_text(body.packageType).lower()
-            stage = 'resolve_required_diamond'
-            vip_id, unit_diamond, required_diamond = resolve_public_batch_required_diamond(
-                count,
-                vip_id=pick_text(body.vipId),
-                package_type=package_type,
-            )
-            logger.info(
-                'public_unlock_batch_purchase resolved pricing: session_id=%s stage=%s count=%s vipId=%s packageType=%s unit_diamond=%s required_diamond=%s',
-                session_id,
-                stage,
-                count,
-                vip_id,
-                package_type,
-                unit_diamond,
-                required_diamond,
-            )
-            stage = 'ensure_quota'
-            ensure_public_cdkey_quota_sufficient(cdkey_row, required_diamond)
-            stage = 'create_script_task'
-            batch_task_row = create_public_batch_script_task(
-                db,
-                session_row,
-                cdkey_row,
-                account,
-                count,
-                vip_id=vip_id,
-                package_type=package_type,
-                unit_diamond=unit_diamond,
-                required_diamond=required_diamond,
-            )
-            logger.info(
-                'public_unlock_batch_purchase task_created: session_id=%s stage=%s batch_id=%s mode=script count=%s vipId=%s packageType=%s',
-                session_id,
-                stage,
-                batch_task_row.batch_id,
-                count,
-                vip_id,
-                package_type,
-            )
-            stage = 'start_script_worker'
-            worker = threading.Thread(
-                target=run_public_batch_script_job,
-                args=(
-                    session_row.session_id,
-                    batch_task_row.batch_id,
-                    remote_token,
-                    remote_login_email,
-                    remote_login_password,
-                    target_login_email,
-                    target_login_password,
-                ),
-                daemon=True,
-            )
-            worker.start()
-        else:
-            stage = 'normalize_items'
-            items = normalize_public_batch_purchase_items(body)
-            logger.info(
-                'public_unlock_batch_purchase normalized_items: session_id=%s stage=%s item_count=%s',
-                session_id,
-                stage,
-                len(items),
-            )
-            stage = 'create_items_task'
-            batch_task_row = create_public_batch_purchase_task(db, session_row, cdkey_row, account, items)
-            logger.info(
-                'public_unlock_batch_purchase task_created: session_id=%s stage=%s batch_id=%s mode=items item_count=%s',
-                session_id,
-                stage,
-                batch_task_row.batch_id,
-                len(items),
-            )
-            stage = 'start_items_worker'
-            worker = threading.Thread(
-                target=run_public_batch_purchase_job,
-                args=(session_row.session_id, batch_task_row.batch_id),
-                daemon=True,
-            )
-            worker.start()
-        stage = 'build_response'
-        order_row = db.query(models.JudianOrder).filter_by(order_id=session_row.order_id).first() if session_row.order_id else None
-        return build_public_unlock_response(
-            db,
-            cdkey_row,
-            account,
-            session_row,
-            order_row,
-            batch_task_row=batch_task_row,
-        )
-    except HTTPException as exc:
-        logger.warning(
-            'public_unlock_batch_purchase rejected: session_id=%s mode=%s stage=%s status=%s detail=%s count=%s vipId=%s packageType=%s account=%s',
-            session_id,
-            'script' if is_script_mode else 'items',
-            stage,
-            exc.status_code,
-            exc.detail,
-            request_count,
-            request_vip_id,
-            request_package_type,
-            request_account,
-        )
-        raise
-    except Exception as exc:
-        logger.error(
-            'public_unlock_batch_purchase failed: session_id=%s mode=%s stage=%s count=%s vipId=%s packageType=%s account=%s error=%s\n%s',
-            session_id,
-            'script' if is_script_mode else 'items',
-            stage,
-            request_count,
-            request_vip_id,
-            request_package_type,
-            request_account,
-            exc,
-            traceback.format_exc(),
-        )
-        raise HTTPException(status_code=500, detail=f'批量下单创建失败: {exc}') from exc
-
-
-@app.post('/public/unlock/{session_id}/batch/cancel')
-def public_unlock_batch_cancel(session_id: str, db: Session = Depends(get_db)):
     session_row, cdkey_row, account = get_public_unlock_session_or_404(db, session_id)
-    batch_task_row = get_latest_public_batch_task(db, session_row)
-    if batch_task_row is None:
-        raise HTTPException(status_code=404, detail='当前会话暂无批量购买任务')
-
-    status = str(batch_task_row.status or '').strip().lower()
-    if status in {'completed', 'failed', 'canceled'}:
-        return {
-            'success': True,
-            'pending': False,
-            'message': batch_task_row.message or '当前批量任务已结束',
-            **build_public_unlock_response(
-                db,
-                cdkey_row,
-                account,
-                session_row,
-                batch_task_row=batch_task_row,
-            ),
-        }
-
-    batch_task_row = mark_public_batch_task_cancel_requested(db, session_row, batch_task_row)
-    return {
-        'success': True,
-        'pending': True,
-        'message': batch_task_row.message,
-        **build_public_unlock_response(
+    if body.count is not None and not (body.items or []):
+        count = normalize_public_batch_order_count(body)
+        remote_token, remote_login_email, remote_login_password, target_login_email, target_login_password = resolve_public_batch_script_auth(account, body)
+        package_type = pick_text(body.packageType).lower()
+        vip_id, unit_diamond, required_diamond = resolve_public_batch_required_diamond(
+            count,
+            vip_id=pick_text(body.vipId),
+            package_type=package_type,
+        )
+        ensure_public_cdkey_quota_sufficient(cdkey_row, required_diamond)
+        batch_task_row = create_public_batch_script_task(
             db,
+            session_row,
             cdkey_row,
             account,
-            session_row,
-            batch_task_row=batch_task_row,
-        ),
-    }
+            count,
+            vip_id=vip_id,
+            package_type=package_type,
+            unit_diamond=unit_diamond,
+            required_diamond=required_diamond,
+        )
+        worker = threading.Thread(
+            target=run_public_batch_script_job,
+            args=(
+                session_row.session_id,
+                batch_task_row.batch_id,
+                remote_token,
+                remote_login_email,
+                remote_login_password,
+                target_login_email,
+                target_login_password,
+            ),
+            daemon=True,
+        )
+        worker.start()
+    else:
+        items = normalize_public_batch_purchase_items(body)
+        batch_task_row = create_public_batch_purchase_task(db, session_row, cdkey_row, account, items)
+        worker = threading.Thread(
+            target=run_public_batch_purchase_job,
+            args=(session_row.session_id, batch_task_row.batch_id),
+            daemon=True,
+        )
+        worker.start()
+    order_row = db.query(models.JudianOrder).filter_by(order_id=session_row.order_id).first() if session_row.order_id else None
+    return build_public_unlock_response(
+        db,
+        cdkey_row,
+        account,
+        session_row,
+        order_row,
+        batch_task_row=batch_task_row,
+    )
 
 
 @app.post('/public/unlock/{session_id}/confirm')
@@ -4128,52 +3750,42 @@ def public_unlock_confirm(session_id: str, db: Session = Depends(get_db)):
     session_row, cdkey_row, account = get_public_unlock_session_or_404(db, session_id)
     if not session_row.order_id:
         raise HTTPException(status_code=400, detail='当前会话还没有识别到订单，请先扫码')
-    order_row = db.query(models.JudianOrder).filter_by(order_id=session_row.order_id).first()
-    if order_row is None:
-        raise HTTPException(status_code=400, detail='当前订单尚未同步，请重新扫码后再试')
+
+    def load_order(runtime_session: requests.Session):
+        order_payload = remote_get_order_info(runtime_session, session_row.order_id)
+        return ensure_public_order_payload_or_raise(order_payload)
+
+    try:
+        account, remote_session, order_payload = run_public_remote_action_with_relogin(db, account, load_order)
+    except JudianRemoteError as exc:
+        raise_public_remote_error(str(exc), default_status_code=502)
+
+    order_row = upsert_public_order(db, session_row, cdkey_row, order_payload, trade_no=session_row.order_id, account=account)
+    order_row.order_status = 'confirmed'
+    session_row.status = 'confirmed'
+    session_row.message = '订单校验完成，正在使用已保存 token 自动扣钻'
     session_row.confirmed_at = int(time.time())
-    _set_public_unlock_autopay_pending(
+    session_row.updated_at = now_text()
+
+    db.commit()
+    db.refresh(session_row)
+    db.refresh(order_row)
+    db.refresh(account)
+    return execute_public_unlock_payment(
         db,
         session_row,
+        cdkey_row,
+        account,
         order_row,
-        message='已重新触发后台自动扣钻，请稍候查看结果',
+        remote_session=remote_session,
     )
-    started = start_public_unlock_payment_job(session_row.session_id)
-    if not started:
-        logger.info('public_unlock_confirm reuse_running_autopay: session_id=%s order_id=%s', session_row.session_id, session_row.order_id)
-    db.refresh(cdkey_row)
-    db.refresh(account)
-    return {
-        'success': True,
-        'pending': True,
-        'message': session_row.message,
-        **build_public_unlock_response(db, cdkey_row, account, session_row, order_row),
-    }
 
 
 @app.post('/public/unlock/{session_id}/complete')
 def public_unlock_complete(session_id: str, db: Session = Depends(get_db)):
     session_row, cdkey_row, account = get_public_unlock_session_or_404(db, session_id)
     order_row = db.query(models.JudianOrder).filter_by(order_id=session_row.order_id).first() if session_row.order_id else None
-    if order_row is None:
-        raise HTTPException(status_code=400, detail='当前订单尚未同步，请重新扫码后再试')
-    _set_public_unlock_autopay_pending(
-        db,
-        session_row,
-        order_row,
-        message='正在后台继续处理自动扣钻，请稍候查看结果',
-    )
-    started = start_public_unlock_payment_job(session_row.session_id)
-    if not started:
-        logger.info('public_unlock_complete reuse_running_autopay: session_id=%s order_id=%s', session_row.session_id, session_row.order_id)
-    db.refresh(cdkey_row)
-    db.refresh(account)
-    return {
-        'success': True,
-        'pending': True,
-        'message': session_row.message,
-        **build_public_unlock_response(db, cdkey_row, account, session_row, order_row),
-    }
+    return execute_public_unlock_payment(db, session_row, cdkey_row, account, order_row)
 
 
 
@@ -4191,149 +3803,69 @@ def verify(user: dict[str, Any] = Depends(get_current_user)):
 
 @app.get('/dashboard/summary')
 def dashboard_summary(user: dict[str, Any] = Depends(get_current_user), db: Session = Depends(get_db)):
-    cache_key = build_judian_user_cache_key(user, 'dashboard_summary')
+    account_rows = owner_scoped_account_query(db, user).order_by(models.JudianAccount.updated_at.desc(), models.JudianAccount.id.desc()).all()
+    cdkey_rows = owner_scoped_cdkey_query(db, user).order_by(models.JudianCdKey.updated_at.desc(), models.JudianCdKey.id.desc()).all()
 
-    def load_dashboard_summary() -> dict[str, Any]:
-        account_query = owner_scoped_account_query(db, user)
-        cdkey_query = owner_scoped_cdkey_query(db, user)
-
-        account_summary = account_query.with_entities(
-            func.count(models.JudianAccount.id).label('accounts'),
-            func.coalesce(
-                func.sum(
-                    case(
-                        (
-                            (models.JudianAccount.status == 'active')
-                            & (func.coalesce(models.JudianAccount.session_token, '') != ''),
-                            1,
-                        ),
-                        else_=0,
-                    )
-                ),
-                0,
-            ).label('active_sessions'),
-            func.coalesce(
-                func.sum(case((models.JudianAccount.enabled.is_(True), 1), else_=0)),
-                0,
-            ).label('enabled_accounts'),
-            func.coalesce(func.sum(func.coalesce(models.JudianAccount.diamond_quantity, 0)), 0).label('total_diamonds'),
-            func.max(models.JudianAccount.updated_at).label('latest_account_updated_at'),
-            func.max(models.JudianAccount.last_login_at).label('latest_account_login_at'),
-        ).one()
-        cdkey_summary = cdkey_query.with_entities(
-            func.count(models.JudianCdKey.id).label('cdkeys'),
-            func.coalesce(
-                func.sum(case((models.JudianCdKey.status.in_(['unused', 'active']), 1), else_=0)),
-                0,
-            ).label('available_cdkeys'),
-            func.coalesce(
-                func.sum(case((models.JudianCdKey.status.in_(['expired', 'void']), 1), else_=0)),
-                0,
-            ).label('invalid_cdkeys'),
-            func.coalesce(func.sum(case((models.JudianCdKey.status == 'unused', 1), else_=0)), 0).label('unused_count'),
-            func.coalesce(func.sum(case((models.JudianCdKey.status == 'active', 1), else_=0)), 0).label('active_count'),
-            func.coalesce(func.sum(case((models.JudianCdKey.status == 'expired', 1), else_=0)), 0).label('expired_count'),
-            func.coalesce(func.sum(case((models.JudianCdKey.status == 'void', 1), else_=0)), 0).label('void_count'),
-            func.max(models.JudianCdKey.updated_at).label('latest_cdkey_updated_at'),
-            func.max(models.JudianCdKey.created_at).label('latest_cdkey_created_at'),
-        ).one()
-
-        top_account_rows = account_query.order_by(
-            models.JudianAccount.diamond_quantity.desc(),
-            models.JudianAccount.updated_at.desc(),
-            models.JudianAccount.id.desc(),
-        ).limit(8).all()
-        activity_account_rows = account_query.order_by(
-            models.JudianAccount.updated_at.desc(),
-            models.JudianAccount.id.desc(),
-        ).limit(40).all()
-        activity_cdkey_rows = cdkey_query.order_by(
-            models.JudianCdKey.updated_at.desc(),
-            models.JudianCdKey.id.desc(),
-        ).limit(40).all()
-
-        active_count = int(account_summary.active_sessions or 0)
-        enabled_count = int(account_summary.enabled_accounts or 0)
-        total_diamonds = int(account_summary.total_diamonds or 0)
-        available_cdkeys = int(cdkey_summary.available_cdkeys or 0)
-        invalid_cdkeys = int(cdkey_summary.invalid_cdkeys or 0)
-        key_status_summary = [
-            {
-                'status': status,
-                'label': label,
-                'count': int(
-                    {
-                        'unused': cdkey_summary.unused_count,
-                        'active': cdkey_summary.active_count,
-                        'expired': cdkey_summary.expired_count,
-                        'void': cdkey_summary.void_count,
-                    }[status]
-                    or 0
-                ),
-                'description': description,
-            }
-            for status, label, description in [
-                ('unused', '待领取', '尚未领取、可继续发放的真实卡密'),
-                ('active', '已领取', '已经进入使用链路的真实卡密'),
-                ('expired', '已过期', '已过期、建议清理的真实卡密'),
-                ('void', '已作废', '手动作废后不再继续使用的卡密'),
-            ]
-        ]
-        top_accounts = [serialize_account(row) for row in top_account_rows]
-        activities = build_dashboard_activities(activity_account_rows, activity_cdkey_rows)
-        last_updated_at = max(
-            [str(item.get('createdAt') or '') for item in activities]
-            + [
-                str(account_summary.latest_account_updated_at or ''),
-                str(account_summary.latest_account_login_at or ''),
-                str(cdkey_summary.latest_cdkey_updated_at or ''),
-                str(cdkey_summary.latest_cdkey_created_at or ''),
-            ]
-            + [''],
-        )
-        return {
-            'accounts': int(account_summary.accounts or 0),
-            'activeSessions': active_count,
-            'enabledAccounts': enabled_count,
-            'totalDiamonds': total_diamonds,
-            'cdkeys': int(cdkey_summary.cdkeys or 0),
-            'availableCdkeys': available_cdkeys,
-            'invalidCdkeys': invalid_cdkeys,
-            'topAccounts': top_accounts,
-            'keyStatusSummary': key_status_summary,
-            'activities': activities,
-            'lastUpdatedAt': last_updated_at,
+    serialized_accounts = [serialize_account(row) for row in account_rows]
+    serialized_cdkeys = [serialize_cdkey(row) for row in cdkey_rows]
+    active_count = sum(1 for item in serialized_accounts if item['status'] == 'active' and item['sessionToken'])
+    enabled_count = sum(1 for item in serialized_accounts if item['enabled'])
+    total_diamonds = sum(int(item['diamondQuantity'] or 0) for item in serialized_accounts)
+    available_cdkeys = sum(1 for item in serialized_cdkeys if item['status'] in {'unused', 'active'})
+    invalid_cdkeys = sum(1 for item in serialized_cdkeys if item['status'] in {'expired', 'void'})
+    key_status_summary = [
+        {
+            'status': status,
+            'label': label,
+            'count': sum(1 for item in serialized_cdkeys if item['status'] == status),
+            'description': description,
         }
-
-    return cached_call(cache_key, JUDIAN_DASHBOARD_CACHE_TTL, load_dashboard_summary)
+        for status, label, description in [
+            ('unused', '待领取', '尚未领取、可继续发放的真实卡密'),
+            ('active', '已领取', '已经进入使用链路的真实卡密'),
+            ('expired', '已过期', '已过期、建议清理的真实卡密'),
+            ('void', '已作废', '手动作废后不再继续使用的卡密'),
+        ]
+    ]
+    top_accounts = sorted(serialized_accounts, key=lambda item: int(item['diamondQuantity'] or 0), reverse=True)[:8]
+    activities = build_dashboard_activities(account_rows, cdkey_rows)
+    last_updated_at = max(
+        [str(item.get('createdAt') or '') for item in activities]
+        + [str(item['updatedAt'] or item['lastLoginAt'] or '') for item in serialized_accounts]
+        + [str(item['updatedAt'] or item['createdAt'] or '') for item in serialized_cdkeys]
+        + [''],
+    )
+    return {
+        'accounts': len(serialized_accounts),
+        'activeSessions': active_count,
+        'enabledAccounts': enabled_count,
+        'totalDiamonds': total_diamonds,
+        'cdkeys': len(serialized_cdkeys),
+        'availableCdkeys': available_cdkeys,
+        'invalidCdkeys': invalid_cdkeys,
+        'topAccounts': top_accounts,
+        'keyStatusSummary': key_status_summary,
+        'activities': activities,
+        'lastUpdatedAt': last_updated_at,
+    }
 
 
 @app.get('/accounts')
 def list_accounts(user: dict[str, Any] = Depends(get_current_user), db: Session = Depends(get_db)):
-    cache_key = build_judian_user_cache_key(user, 'accounts')
-
-    def load_accounts() -> dict[str, Any]:
-        rows = owner_scoped_account_query(db, user).order_by(models.JudianAccount.updated_at.desc(), models.JudianAccount.id.desc()).all()
-        return {
-            'items': [serialize_account(row) for row in rows],
-            'total': len(rows),
-        }
-
-    return cached_call(cache_key, JUDIAN_LIST_CACHE_TTL, load_accounts)
+    rows = owner_scoped_account_query(db, user).order_by(models.JudianAccount.updated_at.desc(), models.JudianAccount.id.desc()).all()
+    return {
+        'items': [serialize_account(row) for row in rows],
+        'total': len(rows),
+    }
 
 
 @app.get('/cards')
 def list_cards(user: dict[str, Any] = Depends(get_current_user), db: Session = Depends(get_db)):
-    cache_key = build_judian_user_cache_key(user, 'cards')
-
-    def load_cards() -> dict[str, Any]:
-        rows = owner_scoped_card_query(db, user).order_by(models.JudianCard.updated_at.desc(), models.JudianCard.id.desc()).all()
-        return {
-            'items': [serialize_card(row) for row in rows],
-            'total': len(rows),
-        }
-
-    return cached_call(cache_key, JUDIAN_LIST_CACHE_TTL, load_cards)
+    rows = owner_scoped_card_query(db, user).order_by(models.JudianCard.updated_at.desc(), models.JudianCard.id.desc()).all()
+    return {
+        'items': [serialize_card(row) for row in rows],
+        'total': len(rows),
+    }
 
 
 def save_card_from_request(
@@ -4397,7 +3929,6 @@ def create_card(body: JudianCardCreateRequest, user: dict[str, Any] = Depends(ge
     row = save_card_from_request(db, user, body)
     db.commit()
     db.refresh(row)
-    invalidate_judian_owner_cache(row.owner_username)
     return {
         'message': '卡券创建成功',
         'id': row.id,
@@ -4413,7 +3944,6 @@ def update_card(card_id: int, body: JudianCardCreateRequest, user: dict[str, Any
     save_card_from_request(db, user, body, row)
     db.commit()
     db.refresh(row)
-    invalidate_judian_owner_cache(row.owner_username)
     return {
         'message': '卡券更新成功',
         'item': serialize_card(row),
@@ -4424,10 +3954,8 @@ def update_card(card_id: int, body: JudianCardCreateRequest, user: dict[str, Any
 @app.delete('/cards/{card_id}')
 def delete_card(card_id: int, user: dict[str, Any] = Depends(get_current_user), db: Session = Depends(get_db)):
     row = get_card_or_404(db, user, card_id)
-    owner_username = str(row.owner_username or '').strip()
     db.delete(row)
     db.commit()
-    invalidate_judian_owner_cache(owner_username)
     return {
         'message': '卡券删除成功',
         'success': True,
@@ -4436,16 +3964,12 @@ def delete_card(card_id: int, user: dict[str, Any] = Depends(get_current_user), 
 
 @app.get('/cdkeys')
 def list_cdkeys(user: dict[str, Any] = Depends(get_current_user), db: Session = Depends(get_db)):
-    cache_key = build_judian_user_cache_key(user, 'cdkeys')
 
-    def load_cdkeys() -> dict[str, Any]:
-        rows = owner_scoped_cdkey_query(db, user).order_by(models.JudianCdKey.created_at.desc(), models.JudianCdKey.id.desc()).all()
-        return {
-            'items': [serialize_cdkey(row) for row in rows],
-            'total': len(rows),
-        }
-
-    return cached_call(cache_key, JUDIAN_LIST_CACHE_TTL, load_cdkeys)
+    rows = owner_scoped_cdkey_query(db, user).order_by(models.JudianCdKey.created_at.desc(), models.JudianCdKey.id.desc()).all()
+    return {
+        'items': [serialize_cdkey(row) for row in rows],
+        'total': len(rows),
+    }
 
 
 @app.get('/cdkeys/claim')
@@ -4601,7 +4125,6 @@ def import_cdkeys(
     db.commit()
     for row in items:
         db.refresh(row)
-    invalidate_judian_owner_cache(owner_username)
 
     return {
         'message': f'导入完成：新增 {created}，跳过 {skipped}',
@@ -4677,7 +4200,6 @@ def import_cdkeys_from_netdisk(
     db.commit()
     for row in items:
         db.refresh(row)
-    invalidate_judian_owner_cache(owner_username)
 
     return {
         'message': f'导入完成：新增 {created}，跳过 {skipped}',
@@ -4732,7 +4254,6 @@ def import_card_codes_from_judian(
 
     db.commit()
     db.refresh(card)
-    invalidate_judian_owner_cache(card.owner_username)
     return {
         'message': f'已从聚点卡密导入到发货模板内容：新增 {appended} 个卡密',
         'appended': appended,
@@ -4779,7 +4300,6 @@ def import_card_codes_from_netdisk(
 
     db.commit()
     db.refresh(card)
-    invalidate_judian_owner_cache(card.owner_username)
     return {
         'message': f'已导入到发货模板内容：新增 {appended} 个卡密',
         'appended': appended,
@@ -4835,7 +4355,6 @@ def generate_cdkeys(
     db.commit()
     for row in rows:
         db.refresh(row)
-    invalidate_judian_owner_cache(owner_username)
     return {
         'message': f'已生成 {len(rows)} 张聚点卡密',
         'items': [serialize_cdkey(row) for row in rows],
@@ -4861,7 +4380,6 @@ def update_cdkey(
     row.updated_at = now_text()
     db.commit()
     db.refresh(row)
-    invalidate_judian_owner_cache(row.owner_username)
     return {
         'message': '聚点卡密更新成功',
         'item': serialize_cdkey(row),
@@ -4872,11 +4390,9 @@ def update_cdkey(
 def clean_inactive_cdkeys(user: dict[str, Any] = Depends(get_current_user), db: Session = Depends(get_db)):
     rows = owner_scoped_cdkey_query(db, user).filter(models.JudianCdKey.status.in_(['expired', 'void'])).all()
     removed = len(rows)
-    owner_username = str(user.get('username') or '').strip()
     for row in rows:
         db.delete(row)
     db.commit()
-    invalidate_judian_owner_cache(owner_username)
     return {
         'message': f'已清理 {removed} 张失效卡密',
         'removed': removed,
@@ -4921,7 +4437,6 @@ def login_account(
     except JudianRemoteError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    invalidate_judian_owner_cache(saved.owner_username)
     return {
         'message': '聚点账号登录成功',
         'item': serialize_account(saved),
@@ -4954,7 +4469,6 @@ def relogin_account(
     except JudianRemoteError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    invalidate_judian_owner_cache(saved.owner_username)
     return {
         'message': '聚点账号已重新登录',
         'item': serialize_account(saved),
@@ -4990,7 +4504,6 @@ def update_account(
     row.updated_at = now_text()
     db.commit()
     db.refresh(row)
-    invalidate_judian_owner_cache(row.owner_username)
     return {
         'message': '聚点账号更新成功',
         'item': serialize_account(row),
@@ -5004,10 +4517,8 @@ def delete_account(
     db: Session = Depends(get_db),
 ):
     row = get_account_or_404(db, user, row_id)
-    owner_username = str(row.owner_username or '').strip()
     db.delete(row)
     db.commit()
-    invalidate_judian_owner_cache(owner_username)
     return {
         'message': '聚点账号已删除',
         'success': True,

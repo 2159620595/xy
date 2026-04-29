@@ -1,5 +1,4 @@
 import asyncio
-import contextlib
 import json
 import re
 import time
@@ -31,8 +30,6 @@ from db_manager import db_manager
 
 configure_logging(LOG_CONFIG)
 logger = get_logger(__name__)
-
-_PASSWORD_LOGIN_RESULT_MARKER = "__PASSWORD_LOGIN_RESULT__"
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -113,127 +110,6 @@ def _log_startup_retry_traceback(cookie_id: str, context: str) -> None:
     logger.debug(
         f"【{cookie_id}】{context}详细堆栈已省略；设置 VERBOSE_STARTUP_RETRY_LOGGING=1 可查看完整堆栈"
     )
-
-
-def _is_container_runtime() -> bool:
-    return bool(os.getenv("DOCKER_ENV")) or os.path.exists("/.dockerenv")
-
-
-def _resolve_password_login_show_browser(requested_show_browser: bool) -> bool:
-    if not requested_show_browser:
-        return False
-
-    # Linux 容器通常没有图形环境，强制切到无头模式避免 Playwright 启动即崩。
-    if _is_container_runtime() and sys.platform.startswith("linux"):
-        return False
-
-    if sys.platform.startswith("linux") and not os.getenv("DISPLAY"):
-        return False
-
-    return True
-
-
-async def _run_password_login_in_subprocess(
-    *,
-    cookie_id: str,
-    username: str,
-    password: str,
-    show_browser: bool,
-) -> dict | None:
-    script = r"""
-import json
-import os
-import sys
-import traceback
-
-RESULT_MARKER = "__PASSWORD_LOGIN_RESULT__"
-
-backend_dir = sys.argv[1]
-payload = json.loads(sys.argv[2])
-os.chdir(backend_dir)
-
-try:
-    from utils.xianyu_slider_stealth import XianyuSliderStealth
-
-    slider = XianyuSliderStealth(
-        user_id=payload["cookie_id"],
-        enable_learning=False,
-        headless=not payload["show_browser"],
-    )
-    result = slider.login_with_password_playwright(
-        account=payload["username"],
-        password=payload["password"],
-        show_browser=payload["show_browser"],
-        notification_callback=None,
-        return_verification_result=True,
-    )
-    print(
-        RESULT_MARKER
-        + json.dumps({"ok": True, "result": result}, ensure_ascii=False)
-    )
-except Exception as exc:
-    print(
-        RESULT_MARKER
-        + json.dumps(
-            {
-                "ok": False,
-                "error": str(exc),
-                "traceback": traceback.format_exc(),
-            },
-            ensure_ascii=False,
-        )
-    )
-    sys.exit(1)
-"""
-
-    payload = json.dumps(
-        {
-            "cookie_id": str(cookie_id),
-            "username": username,
-            "password": password,
-            "show_browser": bool(show_browser),
-        },
-        ensure_ascii=False,
-    )
-    process = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-c",
-        script,
-        os.path.dirname(__file__),
-        payload,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await process.communicate()
-
-    stdout_text = stdout.decode("utf-8", errors="replace")
-    stderr_text = stderr.decode("utf-8", errors="replace")
-    marker_line = next(
-        (
-            line[len(_PASSWORD_LOGIN_RESULT_MARKER) :]
-            for line in reversed(stdout_text.splitlines())
-            if line.startswith(_PASSWORD_LOGIN_RESULT_MARKER)
-        ),
-        None,
-    )
-    if marker_line:
-        result_payload = json.loads(marker_line)
-        if result_payload.get("ok"):
-            return result_payload.get("result")
-
-        raise RuntimeError(
-            result_payload.get("error")
-            or "子进程密码登录失败"
-        )
-
-    error_parts = []
-    if process.returncode:
-        error_parts.append(f"exit_code={process.returncode}")
-    if stderr_text.strip():
-        error_parts.append(stderr_text.strip()[:800])
-    if stdout_text.strip():
-        error_parts.append(stdout_text.strip()[-800:])
-    raise RuntimeError(" | ".join(error_parts) or "未收到子进程登录结果")
 
 class ConnectionState(Enum):
     """WebSocket连接状态枚举"""
@@ -374,19 +250,6 @@ class XianyuLive:
     # 类级别的密码登录时间记录，用于防止重复登录
     _last_password_login_time = {}  # {cookie_id: timestamp}
     _password_login_cooldown = 60  # 密码登录冷却时间：60秒
-    _last_password_verification_time = {}  # {cookie_id: timestamp}
-    _password_verification_cooldown = 300  # 人工验证冷却时间：5分钟
-
-    class ManualVerificationPendingError(RuntimeError):
-        """当前账号处于人工验证等待期，暂不应继续自动重试。"""
-
-        def __init__(self, cookie_id: str, remaining_seconds: float, trigger_reason: str = ""):
-            self.cookie_id = cookie_id
-            self.remaining_seconds = max(0.0, float(remaining_seconds))
-            self.trigger_reason = trigger_reason
-            super().__init__(
-                f"账号 {cookie_id} 正在等待人工验证，剩余 {self.remaining_seconds:.1f} 秒"
-            )
     
     def _safe_str(self, e):
         """安全地将异常转换为字符串"""
@@ -419,32 +282,6 @@ class XianyuLive:
                 logger.success(state_msg)
             else:
                 logger.debug(state_msg)
-
-    def _get_manual_verification_remaining_seconds(self) -> float:
-        """返回当前账号距离人工验证冷却结束还剩多少秒。"""
-        last_verification_time = XianyuLive._last_password_verification_time.get(self.cookie_id, 0)
-        if last_verification_time <= 0:
-            return 0.0
-        elapsed = time.time() - last_verification_time
-        remaining = XianyuLive._password_verification_cooldown - elapsed
-        return max(0.0, remaining)
-
-    def _ensure_not_waiting_manual_verification(self, trigger_reason: str = "") -> None:
-        """如果当前仍在人工验证等待期，抛出专用异常阻断自动重试。"""
-        remaining = self._get_manual_verification_remaining_seconds()
-        if remaining <= 0:
-            return
-        remaining_minutes = int(remaining // 60)
-        remaining_seconds = int(remaining % 60)
-        self._set_connection_state(
-            ConnectionState.FAILED,
-            f"等待人工验证，还需 {remaining_minutes}分{remaining_seconds}秒",
-        )
-        raise XianyuLive.ManualVerificationPendingError(
-            self.cookie_id,
-            remaining,
-            trigger_reason=trigger_reason,
-        )
 
     async def _interruptible_sleep(self, duration: float):
         """可中断的sleep，将长时间sleep拆分成多个短时间sleep，以便及时响应取消信号
@@ -2506,28 +2343,6 @@ class XianyuLive:
         """
         logger.warning(f"【{self.cookie_id}】检测到{trigger_reason}，准备刷新Cookie并重启实例...")
 
-        # 如果上一次命中人工验证，短时间内不要重复拉起无头登录页面
-        current_time = time.time()
-        last_verification_time = XianyuLive._last_password_verification_time.get(self.cookie_id, 0)
-        time_since_last_verification = current_time - last_verification_time
-        if last_verification_time > 0 and time_since_last_verification < XianyuLive._password_verification_cooldown:
-            remaining_time = XianyuLive._password_verification_cooldown - time_since_last_verification
-            logger.warning(
-                f"【{self.cookie_id}】距离上次检测到人工验证仅 {time_since_last_verification:.1f} 秒，"
-                f"人工验证冷却中（还需等待 {remaining_time:.1f} 秒），跳过重复密码登录"
-            )
-            log_captcha_event(
-                self.cookie_id,
-                "人工验证冷却中，跳过重复密码登录",
-                None,
-                (
-                    f"触发原因: {trigger_reason}; "
-                    f"距上次人工验证: {time_since_last_verification:.1f}秒; "
-                    f"剩余冷却: {remaining_time:.1f}秒"
-                ),
-            )
-            return False
-
         # 检查是否在密码登录冷却期内，避免重复登录
         current_time = time.time()
         last_password_login = XianyuLive._last_password_login_time.get(self.cookie_id, 0)
@@ -2564,8 +2379,7 @@ class XianyuLive:
             
             username = account_info.get('username', '')
             password = account_info.get('password', '')
-            requested_show_browser = bool(account_info.get('show_browser', False))
-            show_browser = _resolve_password_login_show_browser(requested_show_browser)
+            show_browser = account_info.get('show_browser', False)
             
             # 检查是否配置了用户名和密码
             if not username or not password:
@@ -2578,70 +2392,33 @@ class XianyuLive:
             
             # 使用集成的 Playwright 登录方法（无需猴子补丁）
             from utils.xianyu_slider_stealth import XianyuSliderStealth
-            if requested_show_browser and not show_browser:
-                logger.warning(
-                    f"【{self.cookie_id}】当前运行环境不支持有头浏览器，自动切换为无头模式执行密码登录"
-                )
-
             browser_mode = "有头" if show_browser else "无头"
             logger.info(f"【{self.cookie_id}】开始使用{browser_mode}浏览器进行密码登录刷新Cookie...")
             logger.info(f"【{self.cookie_id}】使用账号: {username}")
-
-            # 在独立子进程中执行同步 Playwright 登录，隔离当前 asyncio 运行环境。
-            result = await _run_password_login_in_subprocess(
-                cookie_id=self.cookie_id,
-                username=username,
+            
+            # 创建一个通知回调包装函数，支持接收截图路径和验证链接
+            async def notification_callback_wrapper(message: str, screenshot_path: str = None, verification_url: str = None):
+                """通知回调包装函数，支持接收截图路径和验证链接"""
+                await self.send_token_refresh_notification(
+                    error_message=message,
+                    notification_type="token_refresh",
+                    chat_id=None,
+                    attachment_path=screenshot_path,
+                    verification_url=verification_url
+                )
+            
+            # 在单独的线程中运行同步的登录方法
+            import asyncio
+            slider = XianyuSliderStealth(user_id=self.cookie_id, enable_learning=False, headless=not show_browser)
+            result = await asyncio.to_thread(
+                slider.login_with_password_playwright,
+                account=username,
                 password=password,
                 show_browser=show_browser,
+                notification_callback=notification_callback_wrapper
             )
             
             if result:
-                if result.get("__password_login_status") == "verification_required":
-                    verification_url = result.get("verification_url")
-                    screenshot_path = result.get("verification_screenshot_path")
-                    XianyuLive._last_password_verification_time[self.cookie_id] = time.time()
-                    logger.warning(
-                        f"【{self.cookie_id}】已记录人工验证时间，冷却期 "
-                        f"{XianyuLive._password_verification_cooldown} 秒"
-                    )
-                    attachment_path = None
-                    if screenshot_path:
-                        attachment_path = screenshot_path
-                        if not os.path.isabs(attachment_path):
-                            attachment_path = os.path.join(
-                                os.path.dirname(__file__),
-                                attachment_path.replace("/", os.sep),
-                            )
-                        if not os.path.exists(attachment_path):
-                            attachment_path = None
-
-                    message = (
-                        f"检测到{trigger_reason}，账号密码登录需要扫码或人脸验证，"
-                        f"已暂停自动刷新等待人工处理"
-                    )
-                    logger.warning(
-                        f"【{self.cookie_id}】密码登录需要人工验证: "
-                        f"url={verification_url or '无'}; screenshot={screenshot_path or '无'}"
-                    )
-                    log_captcha_event(
-                        self.cookie_id,
-                        "密码登录需要人工验证",
-                        None,
-                        (
-                            f"触发原因: {trigger_reason}; "
-                            f"验证链接: {verification_url or '无'}; "
-                            f"截图: {screenshot_path or '无'}; "
-                            f"冷却时间: {XianyuLive._password_verification_cooldown}秒"
-                        ),
-                    )
-                    await self.send_token_refresh_notification(
-                        message,
-                        "password_login_verification_required",
-                        attachment_path=attachment_path,
-                        verification_url=verification_url,
-                    )
-                    return False
-
                 logger.info(f"【{self.cookie_id}】密码登录成功，获取到Cookie")
                 logger.debug(f"【{self.cookie_id}】Cookie内容: {result}")
                 
@@ -2695,11 +2472,6 @@ class XianyuLive:
 
         except Exception as refresh_e:
             logger.error(f"【{self.cookie_id}】Cookie刷新或实例重启失败: {self._safe_str(refresh_e)}")
-            with contextlib.suppress(Exception):
-                await self.send_token_refresh_notification(
-                    f"自动密码登录刷新失败: {self._safe_str(refresh_e)}",
-                    "password_login_failed",
-                )
             import traceback
             logger.error(f"【{self.cookie_id}】详细堆栈:\n{traceback.format_exc()}")
             return False
@@ -4654,15 +4426,8 @@ class XianyuLive:
             attachment_path: 附件路径（可选，用于发送截图）
         """
         try:
-            bypass_expiry_filter_types = {
-                "password_login_verification_required",
-            }
-
             # 检查是否是正常的令牌过期，这种情况不需要发送通知
-            if (
-                notification_type not in bypass_expiry_filter_types
-                and self._is_normal_token_expiry(error_message)
-            ):
+            if self._is_normal_token_expiry(error_message):
                 logger.warning(f"检测到正常的令牌过期，跳过通知: {error_message}")
                 return
 
@@ -4706,17 +4471,7 @@ class XianyuLive:
 
             # 构造通知消息
             # 判断异常信息中是否包含"滑块验证成功"
-            if notification_type == "password_login_verification_required":
-                notification_msg = (
-                    f"{error_message}\n\n"
-                    f"账号: {self.cookie_id}\n"
-                    f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                )
-                if verification_url:
-                    notification_msg += f"\n验证链接: {verification_url}\n"
-                if attachment_path:
-                    notification_msg += "\n已附上验证截图，请尽快人工处理。\n"
-            elif "滑块验证成功" in error_message:
+            if "滑块验证成功" in error_message:
                 notification_msg = f"{error_message}\n\n" \
                                   f"账号: {self.cookie_id}\n" \
                                   f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
@@ -5796,7 +5551,6 @@ class XianyuLive:
         # 如果没有token或者token过期，获取新token
         token_refresh_attempted = False
         if not self.current_token or (time.time() - self.last_token_refresh_time) >= self.token_refresh_interval:
-            self._ensure_not_waiting_manual_verification("初始化阶段")
             logger.info(f"【{self.cookie_id}】获取初始token...")
             token_refresh_attempted = True
 
@@ -8619,24 +8373,6 @@ class XianyuLive:
                 except Exception as e:
                     error_msg = self._safe_str(e)
                     error_type = type(e).__name__
-
-                    if isinstance(e, XianyuLive.ManualVerificationPendingError):
-                        wait_seconds = min(e.remaining_seconds, 60.0)
-                        remaining_minutes = int(e.remaining_seconds // 60)
-                        remaining_seconds = int(e.remaining_seconds % 60)
-                        self.connection_failures = 0
-                        logger.warning(
-                            f"【{self.cookie_id}】账号仍在人工验证等待期，暂停自动重连 "
-                            f"{wait_seconds:.0f} 秒后再检查，剩余冷却 "
-                            f"{remaining_minutes}分{remaining_seconds}秒"
-                        )
-                        try:
-                            self.current_token = None
-                            self._reset_background_tasks()
-                        except Exception:
-                            pass
-                        await self._interruptible_sleep(wait_seconds)
-                        continue
                     
                     # 检查是否是 ConnectionClosedError（正常的连接关闭）
                     is_connection_closed = (
@@ -8681,22 +8417,6 @@ class XianyuLive:
                     
                     # 检查是否超过最大失败次数
                     if self.connection_failures >= self.max_connection_failures:
-                        manual_verification_remaining = self._get_manual_verification_remaining_seconds()
-                        if manual_verification_remaining > 0:
-                            wait_seconds = min(manual_verification_remaining, 60.0)
-                            remaining_minutes = int(manual_verification_remaining // 60)
-                            remaining_seconds = int(manual_verification_remaining % 60)
-                            self.connection_failures = 0
-                            self._set_connection_state(
-                                ConnectionState.FAILED,
-                                f"等待人工验证，还需 {remaining_minutes}分{remaining_seconds}秒",
-                            )
-                            logger.warning(
-                                f"【{self.cookie_id}】连续失败后检测到人工验证仍未完成，"
-                                f"跳过密码登录刷新和实例重启，{wait_seconds:.0f} 秒后再检查"
-                            )
-                            await self._interruptible_sleep(wait_seconds)
-                            continue
                         self._set_connection_state(ConnectionState.FAILED, f"连续失败{self.max_connection_failures}次")
                         logger.warning(f"【{self.cookie_id}】连续失败{self.max_connection_failures}次，尝试通过密码登录刷新Cookie...")
                         

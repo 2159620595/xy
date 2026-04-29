@@ -500,9 +500,9 @@ const handleOpenQr = async () => {
   showQrModal.value = true
   try {
     const { data } = await baiduApi.getQr()
+    currentQr.value = data.imgurl
     currentSign = data.sign
-    currentQr.value = data.imgurl || ''
-    qrLoading.value = !currentQr.value
+    qrLoading.value = false
     pollingActive = true
     performPolling()
   } catch {
@@ -515,22 +515,10 @@ const performPolling = async () => {
   if (!pollingActive || !currentSign) return
   try {
     const { data } = await baiduApi.checkStatus(currentSign)
-    if (data.status === 'ready') {
-      if (data.sign) currentSign = data.sign
-      currentQr.value = data.imgurl || currentQr.value
-      qrLoading.value = !currentQr.value
-      setTimeout(performPolling, 1200)
-      return
-    }
     if (data.status === 'success') {
       message.success(`欢迎回来，${data.username}！`)
       showQrModal.value = false
       loadAccounts()
-      return
-    }
-    if (data.status === 'pending') {
-      qrLoading.value = !currentQr.value
-      setTimeout(performPolling, currentQr.value ? 2000 : 1200)
       return
     }
     if (data.status === 'scanned') isScanned.value = true
