@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import re
 import time
@@ -30,6 +31,8 @@ from db_manager import db_manager
 
 configure_logging(LOG_CONFIG)
 logger = get_logger(__name__)
+
+_PASSWORD_LOGIN_RESULT_MARKER = "__PASSWORD_LOGIN_RESULT__"
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -110,6 +113,126 @@ def _log_startup_retry_traceback(cookie_id: str, context: str) -> None:
     logger.debug(
         f"【{cookie_id}】{context}详细堆栈已省略；设置 VERBOSE_STARTUP_RETRY_LOGGING=1 可查看完整堆栈"
     )
+
+
+def _is_container_runtime() -> bool:
+    return bool(os.getenv("DOCKER_ENV")) or os.path.exists("/.dockerenv")
+
+
+def _resolve_password_login_show_browser(requested_show_browser: bool) -> bool:
+    if not requested_show_browser:
+        return False
+
+    # Linux 容器通常没有图形环境，强制切到无头模式避免 Playwright 启动即崩。
+    if _is_container_runtime() and sys.platform.startswith("linux"):
+        return False
+
+    if sys.platform.startswith("linux") and not os.getenv("DISPLAY"):
+        return False
+
+    return True
+
+
+async def _run_password_login_in_subprocess(
+    *,
+    cookie_id: str,
+    username: str,
+    password: str,
+    show_browser: bool,
+) -> dict | None:
+    script = r"""
+import json
+import os
+import sys
+import traceback
+
+RESULT_MARKER = "__PASSWORD_LOGIN_RESULT__"
+
+backend_dir = sys.argv[1]
+payload = json.loads(sys.argv[2])
+os.chdir(backend_dir)
+
+try:
+    from utils.xianyu_slider_stealth import XianyuSliderStealth
+
+    slider = XianyuSliderStealth(
+        user_id=payload["cookie_id"],
+        enable_learning=False,
+        headless=not payload["show_browser"],
+    )
+    result = slider.login_with_password_playwright(
+        account=payload["username"],
+        password=payload["password"],
+        show_browser=payload["show_browser"],
+        notification_callback=None,
+    )
+    print(
+        RESULT_MARKER
+        + json.dumps({"ok": True, "result": result}, ensure_ascii=False)
+    )
+except Exception as exc:
+    print(
+        RESULT_MARKER
+        + json.dumps(
+            {
+                "ok": False,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            },
+            ensure_ascii=False,
+        )
+    )
+    sys.exit(1)
+"""
+
+    payload = json.dumps(
+        {
+            "cookie_id": str(cookie_id),
+            "username": username,
+            "password": password,
+            "show_browser": bool(show_browser),
+        },
+        ensure_ascii=False,
+    )
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        script,
+        os.path.dirname(__file__),
+        payload,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate()
+
+    stdout_text = stdout.decode("utf-8", errors="replace")
+    stderr_text = stderr.decode("utf-8", errors="replace")
+    marker_line = next(
+        (
+            line[len(_PASSWORD_LOGIN_RESULT_MARKER) :]
+            for line in reversed(stdout_text.splitlines())
+            if line.startswith(_PASSWORD_LOGIN_RESULT_MARKER)
+        ),
+        None,
+    )
+    if marker_line:
+        result_payload = json.loads(marker_line)
+        if result_payload.get("ok"):
+            return result_payload.get("result")
+
+        raise RuntimeError(
+            result_payload.get("error")
+            or "子进程密码登录失败"
+        )
+
+    error_parts = []
+    if process.returncode:
+        error_parts.append(f"exit_code={process.returncode}")
+    if stderr_text.strip():
+        error_parts.append(stderr_text.strip()[:800])
+    if stdout_text.strip():
+        error_parts.append(stdout_text.strip()[-800:])
+    raise RuntimeError(" | ".join(error_parts) or "未收到子进程登录结果")
 
 class ConnectionState(Enum):
     """WebSocket连接状态枚举"""
@@ -2379,7 +2502,8 @@ class XianyuLive:
             
             username = account_info.get('username', '')
             password = account_info.get('password', '')
-            show_browser = account_info.get('show_browser', False)
+            requested_show_browser = bool(account_info.get('show_browser', False))
+            show_browser = _resolve_password_login_show_browser(requested_show_browser)
             
             # 检查是否配置了用户名和密码
             if not username or not password:
@@ -2392,30 +2516,21 @@ class XianyuLive:
             
             # 使用集成的 Playwright 登录方法（无需猴子补丁）
             from utils.xianyu_slider_stealth import XianyuSliderStealth
+            if requested_show_browser and not show_browser:
+                logger.warning(
+                    f"【{self.cookie_id}】当前运行环境不支持有头浏览器，自动切换为无头模式执行密码登录"
+                )
+
             browser_mode = "有头" if show_browser else "无头"
             logger.info(f"【{self.cookie_id}】开始使用{browser_mode}浏览器进行密码登录刷新Cookie...")
             logger.info(f"【{self.cookie_id}】使用账号: {username}")
-            
-            # 创建一个通知回调包装函数，支持接收截图路径和验证链接
-            async def notification_callback_wrapper(message: str, screenshot_path: str = None, verification_url: str = None):
-                """通知回调包装函数，支持接收截图路径和验证链接"""
-                await self.send_token_refresh_notification(
-                    error_message=message,
-                    notification_type="token_refresh",
-                    chat_id=None,
-                    attachment_path=screenshot_path,
-                    verification_url=verification_url
-                )
-            
-            # 在单独的线程中运行同步的登录方法
-            import asyncio
-            slider = XianyuSliderStealth(user_id=self.cookie_id, enable_learning=False, headless=not show_browser)
-            result = await asyncio.to_thread(
-                slider.login_with_password_playwright,
-                account=username,
+
+            # 在独立子进程中执行同步 Playwright 登录，隔离当前 asyncio 运行环境。
+            result = await _run_password_login_in_subprocess(
+                cookie_id=self.cookie_id,
+                username=username,
                 password=password,
                 show_browser=show_browser,
-                notification_callback=notification_callback_wrapper
             )
             
             if result:
@@ -2472,6 +2587,11 @@ class XianyuLive:
 
         except Exception as refresh_e:
             logger.error(f"【{self.cookie_id}】Cookie刷新或实例重启失败: {self._safe_str(refresh_e)}")
+            with contextlib.suppress(Exception):
+                await self.send_token_refresh_notification(
+                    f"自动密码登录刷新失败: {self._safe_str(refresh_e)}",
+                    "password_login_failed",
+                )
             import traceback
             logger.error(f"【{self.cookie_id}】详细堆栈:\n{traceback.format_exc()}")
             return False
