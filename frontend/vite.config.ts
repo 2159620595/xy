@@ -102,6 +102,56 @@ export default defineConfig({
     // Set FRONTEND_OUT_DIR=../backend/static and FRONTEND_BUILD_BASE=/static/
     // when you want an integrated backend build.
     outDir: path.resolve(__dirname, outputDir),
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes("node_modules")) {
+            return undefined;
+          }
+
+          if (id.includes("jsqr")) {
+            return "vendor-jsqr";
+          }
+
+          if (id.includes("echarts") || id.includes("zrender")) {
+            return "vendor-echarts";
+          }
+
+          if (
+            id.includes("naive-ui") ||
+            id.includes("vueuc") ||
+            id.includes("vooks") ||
+            id.includes("evtd") ||
+            id.includes("@css-render") ||
+            id.includes("@vicons")
+          ) {
+            return "vendor-naive";
+          }
+
+          if (id.includes("element-plus") || id.includes("@element-plus")) {
+            return "vendor-element";
+          }
+
+          if (id.includes("axios")) {
+            return "vendor-http";
+          }
+
+          if (id.includes("pinia")) {
+            return "vendor-store";
+          }
+
+          if (id.includes("vue-router")) {
+            return "vendor-router";
+          }
+
+          if (id.includes("/vue/") || id.includes("\\vue\\")) {
+            return "vendor-vue";
+          }
+
+          return "vendor-misc";
+        },
+      },
+    },
   },
   server: {
     proxy: buildProxyMap(),

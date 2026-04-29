@@ -8,6 +8,7 @@ import sys, uuid, asyncio, time, os, hashlib, json, base64, re, secrets, ipaddre
 
 from urllib.parse import unquote, urlencode, urlsplit
 
+from copy import deepcopy
 
 
 
@@ -25,14 +26,19 @@ from Crypto.Util.Padding import pad, unpad
 import redis.asyncio as aioredis
 from fastapi import FastAPI, Depends, HTTPException, Header, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy import func, or_, text
+from sqlalchemy import case, func, or_, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
 from app_logging import configure_logging, get_logger
+try:
+    from backend.perf_cache import build_cache_key, cached_call
+except ModuleNotFoundError:
+    from perf_cache import build_cache_key, cached_call
 
 from . import models
 from .database import (
@@ -97,6 +103,9 @@ class StatusResponse(BaseModel):
     status: str
     username: str | None = None
     msg: str | None = None
+    sign: str | None = None
+    imgurl: str | None = None
+    region: str | None = None
 
 class KeysResponse(BaseModel):
     status: str
@@ -732,8 +741,16 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+app.add_middleware(
+    GZipMiddleware,
+    minimum_size=max(256, int(os.environ.get("API_GZIP_MINIMUM_SIZE", "1024"))),
+)
 
 SIGNATURE_EXEMPT_PATHS = set()
+NETDISK_DASHBOARD_CACHE_TTL = max(
+    0,
+    int(os.environ.get("PERF_NETDISK_DASHBOARD_CACHE_TTL", "5")),
+)
 
 ADMIN_AUTH_PUBLIC_PATHS = {
     "/api/auth/login",
@@ -1374,33 +1391,31 @@ def get_dashboard_summary(
     tenant_id: str = Depends(get_tenant),
     db: Session = Depends(get_db),
 ):
-    online_count = db.query(func.count(models.DiskAccount.id)).filter(
-        models.DiskAccount.tenant_id == tenant_id,
-        models.DiskAccount.status == 1,
-    ).scalar() or 0
-    offline_count = db.query(func.count(models.DiskAccount.id)).filter(
-        models.DiskAccount.tenant_id == tenant_id,
-        models.DiskAccount.status != 1,
-    ).scalar() or 0
-    unused_keys = db.query(func.count(models.CdKey.id)).filter(
-        models.CdKey.tenant_id == tenant_id,
-        models.CdKey.status == 0,
-    ).scalar() or 0
-    used_keys = db.query(func.count(models.CdKey.id)).filter(
-        models.CdKey.tenant_id == tenant_id,
-        models.CdKey.status == 1,
-    ).scalar() or 0
-    voided_keys = db.query(func.count(models.CdKey.id)).filter(
-        models.CdKey.tenant_id == tenant_id,
-        models.CdKey.status == 2,
-    ).scalar() or 0
-    return {
-        "online_count": int(online_count),
-        "offline_count": int(offline_count),
-        "unused_keys": int(unused_keys),
-        "used_keys": int(used_keys),
-        "voided_keys": int(voided_keys),
-    }
+    cache_key = build_cache_key("netdisk", tenant_id, "dashboard_summary")
+
+    def load_summary() -> dict[str, int]:
+        account_summary = db.query(
+            func.coalesce(func.sum(case((models.DiskAccount.status == 1, 1), else_=0)), 0).label("online_count"),
+            func.coalesce(func.sum(case((models.DiskAccount.status != 1, 1), else_=0)), 0).label("offline_count"),
+        ).filter(
+            models.DiskAccount.tenant_id == tenant_id,
+        ).one()
+        cdkey_summary = db.query(
+            func.coalesce(func.sum(case((models.CdKey.status == 0, 1), else_=0)), 0).label("unused_keys"),
+            func.coalesce(func.sum(case((models.CdKey.status == 1, 1), else_=0)), 0).label("used_keys"),
+            func.coalesce(func.sum(case((models.CdKey.status == 2, 1), else_=0)), 0).label("voided_keys"),
+        ).filter(
+            models.CdKey.tenant_id == tenant_id,
+        ).one()
+        return {
+            "online_count": int(account_summary.online_count or 0),
+            "offline_count": int(account_summary.offline_count or 0),
+            "unused_keys": int(cdkey_summary.unused_keys or 0),
+            "used_keys": int(cdkey_summary.used_keys or 0),
+            "voided_keys": int(cdkey_summary.voided_keys or 0),
+        }
+
+    return cached_call(cache_key, NETDISK_DASHBOARD_CACHE_TTL, load_summary)
 
 
 @app.get("/api/auth/login-logs")
@@ -1438,12 +1453,14 @@ def get_admin_login_logs(
         logs_query = logs_query.filter(models.AdminLoginLog.risk_level == normalized_risk_level)
 
     rows = logs_query.order_by(models.AdminLoginLog.created_at.desc(), models.AdminLoginLog.id.desc()).limit(limit).all()
-    total_count = db.query(func.count(models.AdminLoginLog.id)).filter(*filters).scalar() or 0
-    success_count = db.query(func.count(models.AdminLoginLog.id)).filter(*filters, models.AdminLoginLog.status == "成功").scalar() or 0
-    failed_count = db.query(func.count(models.AdminLoginLog.id)).filter(*filters, models.AdminLoginLog.status == "失败").scalar() or 0
-    unique_ip_count = db.query(func.count(func.distinct(models.AdminLoginLog.ip_address))).filter(*filters).scalar() or 0
-    attention_count = db.query(func.count(models.AdminLoginLog.id)).filter(*filters, models.AdminLoginLog.risk_level == "关注").scalar() or 0
-    high_risk_count = db.query(func.count(models.AdminLoginLog.id)).filter(*filters, models.AdminLoginLog.risk_level == "高危").scalar() or 0
+    summary_row = db.query(
+        func.count(models.AdminLoginLog.id).label("total_count"),
+        func.coalesce(func.sum(case((models.AdminLoginLog.status == "成功", 1), else_=0)), 0).label("success_count"),
+        func.coalesce(func.sum(case((models.AdminLoginLog.status == "失败", 1), else_=0)), 0).label("failed_count"),
+        func.count(func.distinct(models.AdminLoginLog.ip_address)).label("unique_ip_count"),
+        func.coalesce(func.sum(case((models.AdminLoginLog.risk_level == "关注", 1), else_=0)), 0).label("attention_count"),
+        func.coalesce(func.sum(case((models.AdminLoginLog.risk_level == "高危", 1), else_=0)), 0).label("high_risk_count"),
+    ).filter(*filters).one()
 
     suspicious_rows = (
         db.query(
@@ -1473,10 +1490,14 @@ def get_admin_login_logs(
     )
     active_locks = []
     seen_lock_keys = set()
+    lock_state_cache: dict[tuple[str, str], dict[str, int | str] | None] = {}
     for row in active_lock_candidates:
         username_value = str(row.username or "").strip()
         ip_value = str(row.ip_address or "").strip()
-        lock_state = get_admin_login_lock_state(db, username=username_value, ip_address=ip_value)
+        cache_key = (username_value, ip_value)
+        if cache_key not in lock_state_cache:
+            lock_state_cache[cache_key] = get_admin_login_lock_state(db, username=username_value, ip_address=ip_value)
+        lock_state = lock_state_cache[cache_key]
         if not lock_state:
             continue
         lock_key = (str(lock_state.get("scope_label") or ""), int(lock_state.get("locked_until") or 0))
@@ -1514,12 +1535,12 @@ def get_admin_login_logs(
             for row in rows
         ],
         "summary": {
-            "total": total_count,
-            "success": success_count,
-            "failed": failed_count,
-            "unique_ip_count": unique_ip_count,
-            "attention_count": attention_count,
-            "high_risk_count": high_risk_count,
+            "total": int(summary_row.total_count or 0),
+            "success": int(summary_row.success_count or 0),
+            "failed": int(summary_row.failed_count or 0),
+            "unique_ip_count": int(summary_row.unique_ip_count or 0),
+            "attention_count": int(summary_row.attention_count or 0),
+            "high_risk_count": int(summary_row.high_risk_count or 0),
             "suspicious_ip_count": len(suspicious_rows),
             "window_hours": hours,
             "lock_threshold": ADMIN_LOGIN_LOCK_THRESHOLD,

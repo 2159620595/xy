@@ -184,7 +184,7 @@ buy 参数:
   --part <value>            当前分集/分段标识
   --count <n>               批量创建订单数量；大于 1 时需配合 --single-buy
   --batch-output <path>     批量下单结果输出文件，默认当前目录自动命名
-  --batch-interval-ms <ms>  批量下单间隔，默认 0
+  --batch-interval-ms <ms>  批量下单间隔，默认 1200
   --stop-on-error           批量下单遇错后立即停止
   --watch-timeout-ms <ms>   每次监听订单状态超时，默认 15000
   --unlock-timeout-ms <ms>  支付成功后轮询 VIP 解锁超时，默认 20000
@@ -200,8 +200,8 @@ batch 参数:
   --count <n>               批量数量；缺省时会在终端提示输入
   --autopay-output <path>   批量支付结果输出文件，默认当前目录自动命名
   --progress-jsonl          输出机器可读进度事件，供后端实时同步
-  --create-retry <n>        创建订单遇到限流时的最大重试次数，默认 3
-  --create-retry-interval-ms <ms> 创建订单限流重试间隔，默认 1200
+  --create-retry <n>        创建订单遇到限流时的最大重试次数，默认 6
+  --create-retry-interval-ms <ms> 创建订单限流重试基础间隔，默认 1800
   --confirm-buy             确认执行 batch，避免误下单
 
 autopay 参数:
@@ -703,6 +703,17 @@ function buildCreateVipOrderError(createResult, orderInfo = {}) {
   error.createResult = createResult;
   error.rateLimited = isCreateVipOrderRateLimited(createResult);
   return error;
+}
+
+function computeCreateVipOrderRetryDelayMs(attempt, baseRetryIntervalMs) {
+  const safeAttempt = Math.max(1, Number(attempt || 1));
+  const safeBaseIntervalMs = Math.max(500, Number(baseRetryIntervalMs || 1800));
+  const exponentialDelayMs = Math.min(
+    15000,
+    safeBaseIntervalMs * 2 ** Math.max(0, safeAttempt - 1),
+  );
+  const jitterMs = Math.floor(Math.random() * 600);
+  return exponentialDelayMs + jitterMs;
 }
 
 function appendUniqueText(items, ...values) {
@@ -2509,11 +2520,11 @@ async function buildBatchPurchasePlan(host, token, vipId, count, args) {
 
 async function runBatchBuyFlow(host, token, payload, args) {
   const count = Math.max(1, Number(args.count ?? 1));
-  const intervalMs = Math.max(0, Number(args["batch-interval-ms"] ?? 0));
-  const createRetry = Math.max(1, Number(args["create-retry"] ?? 3));
+  const intervalMs = Math.max(0, Number(args["batch-interval-ms"] ?? 1200));
+  const createRetry = Math.max(1, Number(args["create-retry"] ?? 6));
   const createRetryIntervalMs = Math.max(
     0,
-    Number(args["create-retry-interval-ms"] ?? 1200),
+    Number(args["create-retry-interval-ms"] ?? 1800),
   );
   const stopOnError = Boolean(args["stop-on-error"]);
   const outputFile = resolveBatchOutputPath(args["batch-output"], "vip-orders");
@@ -2534,9 +2545,9 @@ async function runBatchBuyFlow(host, token, payload, args) {
         {
           maxAttempts: createRetry,
           retryIntervalMs: createRetryIntervalMs,
-          onRetry: ({ attempt, maxAttempts, error }) => {
+          onRetry: ({ attempt, maxAttempts, retryIntervalMs, error }) => {
             console.error(
-              `批量下单 ${index}/${count} 命中限流，${createRetryIntervalMs}ms 后重试 (${attempt}/${maxAttempts}): ${error.message}`,
+              `批量下单 ${index}/${count} 命中限流，${retryIntervalMs}ms 后重试 (${attempt}/${maxAttempts}): ${error.message}`,
             );
           },
         },
@@ -2594,6 +2605,13 @@ async function runBatchBuyFlow(host, token, payload, args) {
       });
       if (stopOnError) {
         break;
+      }
+      if (isCreateVipOrderRateLimited(error) && index < count) {
+        const cooldownMs = Math.max(3000, createRetryIntervalMs * 2);
+        console.error(
+          `批量下单 ${index}/${count} 最终仍命中限流，额外冷却 ${cooldownMs}ms 后继续下一单...`,
+        );
+        await delay(cooldownMs);
       }
     }
 
@@ -2973,7 +2991,7 @@ async function createVipOrder(host, token, payload) {
 
 async function createVipOrderWithRetry(host, token, payload, options = {}) {
   const maxAttempts = Math.max(1, Number(options.maxAttempts ?? 3));
-  const retryIntervalMs = Math.max(0, Number(options.retryIntervalMs ?? 1200));
+  const retryIntervalMs = Math.max(0, Number(options.retryIntervalMs ?? 1800));
   const onRetry =
     typeof options.onRetry === "function" ? options.onRetry : null;
   let lastError = null;
@@ -2996,16 +3014,20 @@ async function createVipOrderWithRetry(host, token, payload, options = {}) {
       if (!isCreateVipOrderRateLimited(error) || attempt >= maxAttempts) {
         throw error;
       }
+      const computedRetryDelayMs = computeCreateVipOrderRetryDelayMs(
+        attempt,
+        retryIntervalMs,
+      );
       if (onRetry) {
         onRetry({
           attempt,
           maxAttempts,
-          retryIntervalMs,
+          retryIntervalMs: computedRetryDelayMs,
           error,
         });
       }
-      if (retryIntervalMs > 0) {
-        await delay(retryIntervalMs);
+      if (computedRetryDelayMs > 0) {
+        await delay(computedRetryDelayMs);
       }
     }
   }

@@ -318,6 +318,10 @@ class XianyuSliderStealth:
         
         # 保存最后一次使用的轨迹参数（用于分析优化）
         self.last_trajectory_params = {}
+
+        if self.enable_learning:
+            self.trajectory_params = self._optimize_trajectory_params()
+            logger.info(f"【{self.pure_user_id}】当前轨迹参数: {self.trajectory_params}")
     
     def _check_date_validity(self) -> bool:
         """检查日期有效性 - 已禁用
@@ -592,7 +596,7 @@ class XianyuSliderStealth:
                 return self.trajectory_params
             
             history = self._load_success_history()
-            if len(history) < 3:  # 至少需要3条成功记录才开始优化
+            if len(history) < 1:
                 logger.info(f"【{self.pure_user_id}】历史成功数据不足({len(history)}条)，使用默认参数")
                 return self.trajectory_params
             
@@ -635,37 +639,40 @@ class XianyuSliderStealth:
                 variance = sum((x - avg) ** 2 for x in values) / len(values)
                 return variance ** 0.5
             
-            # 优化参数 - 真实人类模式（优先真实度而非速度）
-            # 计算步数范围（确保最小值 < 最大值）
-            steps_min = max(110, int(safe_avg(total_steps_list) - safe_std(total_steps_list) * 0.8))
-            steps_max = min(130, int(safe_avg(total_steps_list) + safe_std(total_steps_list) * 0.8))
+            # 基于成功样本做温和收敛，避免把参数压到极端值
+            avg_steps = safe_avg(total_steps_list)
+            std_steps = safe_std(total_steps_list)
+            steps_min = max(18, int(avg_steps - max(2, std_steps * 1.2)))
+            steps_max = min(36, int(avg_steps + max(4, std_steps * 1.6)))
             if steps_min >= steps_max:
-                steps_min = 115
-                steps_max = 125
+                steps_min = max(18, int(avg_steps))
+                steps_max = min(36, steps_min + 4)
             
-            # 计算延迟范围（确保最小值 < 最大值）
-            delay_min = max(0.020, safe_avg(base_delay_list) - safe_std(base_delay_list) * 0.6)
-            delay_max = min(0.030, safe_avg(base_delay_list) + safe_std(base_delay_list) * 0.6)
+            avg_delay = safe_avg(base_delay_list)
+            std_delay = safe_std(base_delay_list)
+            delay_min = max(0.04, round(avg_delay - max(0.008, std_delay * 1.2), 4))
+            delay_max = min(0.12, round(avg_delay + max(0.015, std_delay * 1.6), 4))
             if delay_min >= delay_max:
-                delay_min = 0.022
-                delay_max = 0.027
+                delay_min = max(0.04, round(avg_delay, 4))
+                delay_max = min(0.12, round(delay_min + 0.02, 4))
             
-            # 计算慢速因子范围（确保最小值 < 最大值）
-            slow_min = max(5, int(safe_avg(slow_factor_list) - safe_std(slow_factor_list)))
-            slow_max = min(20, int(safe_avg(slow_factor_list) + safe_std(slow_factor_list)))
+            avg_slow = safe_avg(slow_factor_list)
+            std_slow = safe_std(slow_factor_list)
+            slow_min = max(2, int(avg_slow - max(1, std_slow)))
+            slow_max = min(8, int(avg_slow + max(2, std_slow * 1.5)))
             if slow_min >= slow_max:
-                slow_min = 8
-                slow_max = 15
+                slow_min = max(2, int(avg_slow))
+                slow_max = min(8, slow_min + 2)
             
             optimized_params = {
                 "total_steps_range": [steps_min, steps_max],
                 "base_delay_range": [delay_min, delay_max],
-                "jitter_x_range": [-3, 12],  # 保持固定范围
-                "jitter_y_range": [-2, 12],  # 保持固定范围
+                "jitter_x_range": [0, 3],
+                "jitter_y_range": [-2, 3],
                 "slow_factor_range": [slow_min, slow_max],
-                "acceleration_phase": max(0.08, min(0.12, safe_avg(acceleration_phase_list))),
-                "fast_phase": max(0.7, min(0.8, safe_avg(fast_phase_list))),
-                "slow_start_ratio_base": max(0.98, min(1.02, safe_avg(slow_start_ratio_list))),
+                "acceleration_phase": max(0.25, min(0.45, safe_avg(acceleration_phase_list))),
+                "fast_phase": max(0.35, min(0.55, safe_avg(fast_phase_list))),
+                "slow_start_ratio_base": max(1.01, min(1.05, safe_avg(slow_start_ratio_list))),
                 "completion_usage_rate": completion_usage_rate,
                 "avg_completion_steps": avg_completion_steps,
                 "trajectory_length_stats": trajectory_length_stats,
@@ -679,6 +686,84 @@ class XianyuSliderStealth:
         except Exception as e:
             logger.error(f"【{self.pure_user_id}】优化轨迹参数失败: {e}")
             return self.trajectory_params
+
+    def _build_attempt_trajectory_params(self, attempt: int) -> tuple[str, Dict[str, Any]]:
+        """根据重试次数构造更稳妥的轨迹参数。"""
+        params = {}
+        for key, value in self.trajectory_params.items():
+            params[key] = value.copy() if isinstance(value, list) else value
+
+        strategy = "manual_stealth"
+        if attempt == 2:
+            strategy = "cautious"
+            params["total_steps_range"] = [
+                min(42, params["total_steps_range"][0] + 4),
+                min(48, params["total_steps_range"][1] + 6),
+            ]
+            params["base_delay_range"] = [
+                min(0.16, round(params["base_delay_range"][0] * 1.25 + 0.01, 4)),
+                min(0.18, round(params["base_delay_range"][1] * 1.35 + 0.015, 4)),
+            ]
+            params["slow_factor_range"] = [
+                max(2, params["slow_factor_range"][0]),
+                min(10, params["slow_factor_range"][1] + 1),
+            ]
+        elif attempt >= 3:
+            strategy = "slow"
+            params["total_steps_range"] = [
+                min(46, params["total_steps_range"][0] + 8),
+                min(54, params["total_steps_range"][1] + 10),
+            ]
+            params["base_delay_range"] = [
+                min(0.18, round(params["base_delay_range"][0] * 1.5 + 0.015, 4)),
+                min(0.22, round(params["base_delay_range"][1] * 1.6 + 0.02, 4)),
+            ]
+            params["slow_factor_range"] = [
+                max(3, params["slow_factor_range"][0] + 1),
+                min(12, params["slow_factor_range"][1] + 2),
+            ]
+
+        if params["total_steps_range"][0] >= params["total_steps_range"][1]:
+            params["total_steps_range"][1] = params["total_steps_range"][0] + 2
+        if params["base_delay_range"][0] >= params["base_delay_range"][1]:
+            params["base_delay_range"][1] = round(params["base_delay_range"][0] + 0.02, 4)
+
+        return strategy, params
+
+    def _reset_slider_challenge(self) -> bool:
+        """在重试前点击验证码容器，显式重置 challenge。"""
+        selectors = [
+            ".nc-container",
+            "#baxia-dialog-content",
+            ".captcha-tips",
+            ".nc_wrapper",
+            "#nocaptcha",
+        ]
+        contexts = []
+        if hasattr(self, "_detected_slider_frame") and self._detected_slider_frame is not None:
+            contexts.append(self._detected_slider_frame)
+        contexts.append(self.page)
+
+        for context in contexts:
+            if not context:
+                continue
+            for selector in selectors:
+                try:
+                    element = context.query_selector(selector)
+                    if element and element.is_visible():
+                        element.click(force=True, timeout=2000)
+                        wait_seconds = random.uniform(0.8, 1.3)
+                        logger.info(
+                            f"【{self.pure_user_id}】重试前已点击验证码容器重置 challenge: "
+                            f"{selector}，等待{wait_seconds:.2f}秒"
+                        )
+                        time.sleep(wait_seconds)
+                        return True
+                except Exception:
+                    continue
+
+        logger.debug(f"【{self.pure_user_id}】未找到可点击的验证码重置容器")
+        return False
     
     def _get_cookies_after_success(self):
         """滑块验证成功后获取cookie"""
@@ -1975,17 +2060,25 @@ class XianyuSliderStealth:
             fast_mode: 快速查找模式（当已确认滑块存在时使用，减少等待时间）
         """
         failure_records = []
-        current_strategy = 'manual_stealth'
         
         for attempt in range(1, max_retries + 1):
             try:
+                current_strategy, attempt_params = self._build_attempt_trajectory_params(attempt)
+                self.trajectory_params = attempt_params
                 logger.info(f"【{self.pure_user_id}】开始处理滑块验证... (第{attempt}/{max_retries}次尝试)")
+                logger.info(
+                    f"【{self.pure_user_id}】当前滑块策略: {current_strategy}, "
+                    f"steps={attempt_params['total_steps_range']}, "
+                    f"delay={attempt_params['base_delay_range']}, "
+                    f"slow_factor={attempt_params['slow_factor_range']}"
+                )
                 
                 # 如果不是第一次尝试，短暂等待后重试
                 if attempt > 1:
                     retry_delay = random.uniform(1.0, 1.8)
                     logger.debug(f"【{self.pure_user_id}】等待{retry_delay:.2f}秒后重试...")
                     time.sleep(retry_delay)
+                    self._reset_slider_challenge()
                     
                     # 不刷新页面，直接在原来的frame中重试
                     # 保留frame引用，让重试时可以直接使用原来的frame查找滑块
@@ -2671,7 +2764,14 @@ class XianyuSliderStealth:
             logger.debug(traceback.format_exc())
             return None
     
-    def login_with_password_playwright(self, account: str, password: str, show_browser: bool = False, notification_callback: Optional[Callable] = None) -> dict:
+    def login_with_password_playwright(
+        self,
+        account: str,
+        password: str,
+        show_browser: bool = False,
+        notification_callback: Optional[Callable] = None,
+        return_verification_result: bool = False,
+    ) -> dict:
         """使用Playwright进行密码登录（新方法，替代DrissionPage）
         
         Args:
@@ -2704,6 +2804,10 @@ class XianyuSliderStealth:
             user_data_dir = os.path.join(os.getcwd(), 'browser_data', f'user_{self.pure_user_id}')
             os.makedirs(user_data_dir, exist_ok=True)
             logger.info(f"【{self.pure_user_id}】使用用户数据目录: {user_data_dir}")
+            debug_run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+            debug_dir = os.path.join('static', 'uploads', 'images', 'password_login_debug')
+            os.makedirs(debug_dir, exist_ok=True)
+            logger.info(f"【{self.pure_user_id}】密码登录调试目录: {debug_dir}")
             
             # 设置浏览器启动参数
             browser_args = [
@@ -2763,12 +2867,51 @@ class XianyuSliderStealth:
             browser = context.browser
             page = context.new_page()
             logger.info(f"【{self.pure_user_id}】浏览器已成功启动（{browser_mode}模式）")
+
+            def _sanitize_debug_stage(stage: str) -> str:
+                safe_stage = []
+                for ch in str(stage):
+                    if ch.isalnum() or ch in ('-', '_'):
+                        safe_stage.append(ch)
+                    else:
+                        safe_stage.append('_')
+                return ''.join(safe_stage).strip('_') or 'unknown'
+
+            def _capture_login_debug(stage: str, note: str = "") -> Optional[str]:
+                try:
+                    frame_urls = []
+                    try:
+                        frame_urls = [getattr(frame, 'url', '') for frame in page.frames[:5]]
+                    except Exception:
+                        pass
+
+                    logger.info(
+                        f"【{self.pure_user_id}】调试阶段={stage}; "
+                        f"url={page.url}; title={page.title()}; "
+                        f"frames={len(page.frames)}; note={note or '无'}"
+                    )
+                    if frame_urls:
+                        logger.info(f"【{self.pure_user_id}】调试Frame URL样本: {frame_urls}")
+
+                    screenshot_name = (
+                        f"password_login_{self.pure_user_id}_{debug_run_id}_"
+                        f"{_sanitize_debug_stage(stage)}.png"
+                    )
+                    screenshot_path = os.path.join(debug_dir, screenshot_name)
+                    page.screenshot(path=screenshot_path, full_page=True, timeout=15000)
+                    logger.info(f"【{self.pure_user_id}】调试截图已保存: {screenshot_path}")
+                    return screenshot_path.replace("\\", "/")
+                except Exception as debug_err:
+                    logger.warning(f"【{self.pure_user_id}】记录调试信息失败(stage={stage}): {debug_err}")
+                    return None
             
             try:
                 # 访问登录页面
                 login_url = "https://www.goofish.com/im"
                 logger.info(f"【{self.pure_user_id}】访问登录页面: {login_url}")
+                logger.info(f"【{self.pure_user_id}】开始页面导航，等待 networkidle...")
                 page.goto(login_url, wait_until='networkidle', timeout=60000)
+                logger.info(f"【{self.pure_user_id}】页面导航完成")
                 
                 # 等待页面加载
                 wait_time = 2 if not show_browser else 2
@@ -2780,6 +2923,7 @@ class XianyuSliderStealth:
                 logger.info(f"【{self.pure_user_id}】当前URL: {page.url}")
                 logger.info(f"【{self.pure_user_id}】页面标题: {page.title()}")
                 logger.info(f"【{self.pure_user_id}】=====================================")
+                _capture_login_debug("page_loaded", "登录页初始状态")
                 
                 # 【步骤1】查找登录frame（闲鱼登录通常在iframe中）
                 logger.info(f"【{self.pure_user_id}】查找登录frame...")
@@ -3092,6 +3236,7 @@ class XianyuSliderStealth:
                     time.sleep(random.uniform(0.5, 1.0))
                 else:
                     logger.error(f"【{self.pure_user_id}】✗ 未找到密码输入框")
+                    _capture_login_debug("password_input_missing", "未找到密码输入框")
                     return None
                 
                 # 勾选用户协议
@@ -3116,8 +3261,10 @@ class XianyuSliderStealth:
                     logger.info(f"【{self.pure_user_id}】✓ 找到登录按钮")
                     login_button.click()
                     logger.info(f"【{self.pure_user_id}】✓ 登录按钮已点击")
+                    _capture_login_debug("after_login_click", "已点击登录按钮")
                 else:
                     logger.error(f"【{self.pure_user_id}】✗ 未找到登录按钮")
+                    _capture_login_debug("login_button_missing", "未找到登录按钮")
                     return None
                 
                 # 【关键】点击登录后，等待一下再检测滑块
@@ -3274,6 +3421,7 @@ class XianyuSliderStealth:
                         if has_qr:
                             logger.warning(f"【{self.pure_user_id}】⚠️ 检测到二维码/人脸验证")
                             logger.info(f"【{self.pure_user_id}】请在浏览器中完成二维码/人脸验证")
+                            verification_debug_screenshot = _capture_login_debug("verification_detected", "检测到二维码或人脸验证")
                             
                             # 获取验证链接URL和截图路径
                             frame_url = None
@@ -3295,6 +3443,9 @@ class XianyuSliderStealth:
                                     logger.warning(f"【{self.pure_user_id}】获取frame信息失败: {e}")
                                     import traceback
                                     logger.debug(traceback.format_exc())
+
+                            if not screenshot_path and verification_debug_screenshot:
+                                screenshot_path = verification_debug_screenshot
                             
                             # 显示验证信息
                             if screenshot_path:
@@ -3312,6 +3463,16 @@ class XianyuSliderStealth:
                                 logger.warning(f"【{self.pure_user_id}】二维码/人脸验证已检测到，但无法获取验证信息")
                                 logger.warning(f"【{self.pure_user_id}】请在浏览器中查看验证页面")
                                 logger.warning(f"【{self.pure_user_id}】" + "=" * 60)
+
+                            if return_verification_result:
+                                logger.warning(f"【{self.pure_user_id}】按配置立即返回验证需求结果，不继续阻塞等待")
+                                return {
+                                    "__password_login_status": "verification_required",
+                                    "verification_type": "qr_or_face",
+                                    "verification_url": frame_url,
+                                    "verification_screenshot_path": screenshot_path,
+                                    "message": "账号密码登录需要扫码或人脸验证",
+                                }
                             
                             logger.info(f"【{self.pure_user_id}】请在浏览器中完成验证，程序将持续等待...")
                             
@@ -3389,6 +3550,11 @@ class XianyuSliderStealth:
                             while waited_time < max_wait_time:
                                 time.sleep(check_interval)
                                 waited_time += check_interval
+                                if waited_time == check_interval or waited_time % 30 == 0:
+                                    _capture_login_debug(
+                                        f"verification_wait_{waited_time}s",
+                                        f"等待二维码/人脸验证中 {waited_time}/{max_wait_time} 秒"
+                                    )
                                 
                                 # 先检测是否有滑块，如果有就处理
                                 try:
@@ -3509,6 +3675,7 @@ class XianyuSliderStealth:
                             if login_success:
                                 logger.info(f"【{self.pure_user_id}】二维码/人脸验证已完成")
                             else:
+                                _capture_login_debug("verification_timeout", f"等待验证超时 {max_wait_time} 秒")
                                 logger.error(f"【{self.pure_user_id}】❌ 等待验证超时（{max_wait_time}秒）")
                                 return None
                         else:
@@ -3518,6 +3685,7 @@ class XianyuSliderStealth:
                             time.sleep(1)
                             login_success = self._check_login_success_by_element(page)
                             if not login_success:
+                                _capture_login_debug("login_not_confirmed", "未检测到二维码/人脸验证且登录状态未确认")
                                 logger.error(f"【{self.pure_user_id}】❌ 登录状态未确认，无法获取Cookie")
                                 return None
                             else:
@@ -3525,6 +3693,7 @@ class XianyuSliderStealth:
                     
                     # 【重要】只有在 login_success = True 的情况下，才获取Cookie
                     if not login_success:
+                        _capture_login_debug("login_failed_before_cookie", "登录未成功，跳过Cookie获取")
                         logger.error(f"【{self.pure_user_id}】❌ 登录未成功，无法获取Cookie")
                         return None
                     
@@ -3552,12 +3721,15 @@ class XianyuSliderStealth:
                         logger.info("=" * 60)
                         
                         if cookies_dict:
+                            _capture_login_debug("cookie_obtained", f"成功获取Cookie字段数={len(cookies_dict)}")
                             logger.success("✅ 登录成功！Cookie有效")
                             return cookies_dict
                         else:
+                            _capture_login_debug("cookie_empty", "获取到Cookie列表但为空")
                             logger.error("❌ 未获取到Cookie")
                             return None
                     except Exception as e:
+                        _capture_login_debug("cookie_fetch_error", f"获取Cookie失败: {e}")
                         logger.error(f"【{self.pure_user_id}】获取Cookie失败: {e}")
                         return None
                 

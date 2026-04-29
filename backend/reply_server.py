@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Depends, Query, status, UploadFile, File, Form
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -540,6 +541,7 @@ KEYWORDS_FILE = Path(__file__).parent / "回复关键字.txt"
 DEFAULT_ADMIN_PASSWORD = ""  # 不再保留固定默认密码
 SESSION_TOKENS = {}  # 存储会话token: {token: {'user_id': int, 'username': str, 'timestamp': float}}
 TOKEN_EXPIRE_TIME = 24 * 60 * 60  # token过期时间：24小时
+USER_CACHE_REFRESH_INTERVAL = 60  # 登录态中的用户信息短时缓存，避免每个请求都查库
 LOCAL_ONLY_MODE = (os.getenv("LOCAL_ONLY_MODE") or "false").strip().lower() == "true"
 LOCAL_ONLY_ALLOW_CIDR = (os.getenv("LOCAL_ONLY_ALLOW_CIDR") or "127.0.0.1/32,::1/128,172.16.0.0/12,192.168.65.0/24,192.168.99.0/24").strip()
 _LOCAL_ONLY_NETWORKS = []
@@ -685,6 +687,51 @@ def generate_token() -> str:
     return secrets.token_urlsafe(32)
 
 
+def _build_session_user_payload(user: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        'id': user['id'],
+        'username': user['username'],
+        'email': user.get('email'),
+        'nickname': user.get('nickname'),
+        'is_admin': bool(user.get('is_admin')),
+        'is_active': user.get('is_active', True),
+        'created_at': user.get('created_at'),
+        'updated_at': user.get('updated_at'),
+    }
+
+
+def build_session_token_data(user: Dict[str, Any]) -> Dict[str, Any]:
+    now = time.time()
+    cached_user = _build_session_user_payload(user)
+    return {
+        'user_id': cached_user['id'],
+        'username': cached_user['username'],
+        'is_admin': cached_user['is_admin'],
+        'timestamp': now,
+        'user_cache': cached_user,
+        'user_cache_expires_at': now + USER_CACHE_REFRESH_INTERVAL,
+    }
+
+
+def get_session_user(token_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    current_time = time.time()
+    cached_user = token_data.get('user_cache')
+    cache_expires_at = float(token_data.get('user_cache_expires_at') or 0)
+    if isinstance(cached_user, dict) and cache_expires_at > current_time:
+        return cached_user
+
+    current_user = db_manager.get_user_by_id(token_data['user_id'])
+    if not current_user or not current_user.get('is_active', True):
+        return None
+
+    cached_user = _build_session_user_payload(current_user)
+    token_data['username'] = cached_user['username']
+    token_data['is_admin'] = cached_user['is_admin']
+    token_data['user_cache'] = cached_user
+    token_data['user_cache_expires_at'] = current_time + USER_CACHE_REFRESH_INTERVAL
+    return cached_user
+
+
 def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> Optional[Dict[str, Any]]:
     """验证token并返回用户信息"""
     if not credentials:
@@ -701,8 +748,8 @@ def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(s
         del SESSION_TOKENS[token]
         return None
 
-    current_user = db_manager.get_user_by_id(token_data['user_id'])
-    if not current_user or not current_user.get('is_active', True):
+    current_user = get_session_user(token_data)
+    if not current_user:
         del SESSION_TOKENS[token]
         return None
 
@@ -854,6 +901,11 @@ if cors_allowed_origins:
         allow_headers=["*"],
     )
 
+app.add_middleware(
+    GZipMiddleware,
+    minimum_size=max(256, int(os.environ.get("API_GZIP_MINIMUM_SIZE", "1024"))),
+)
+
 # 注册刮刮乐远程控制路由
 if CAPTCHA_ROUTER_AVAILABLE:
     app.include_router(captcha_router)
@@ -898,10 +950,17 @@ async def local_only_guard(request, call_next):
 
 @app.middleware("http")
 async def log_requests(request, call_next):
-    start_time = time.time()
-    response = await call_next(request)
-    process_time = time.time() - start_time
+    start_time = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        process_time = time.perf_counter() - start_time
+        logger.exception(
+            f"API {request.method} {request.url.path} - 500 ({process_time:.3f}s)"
+        )
+        raise
 
+    process_time = time.perf_counter() - start_time
     log_message = (
         f"API {request.method} {request.url.path} - "
         f"{response.status_code} ({process_time:.3f}s)"
@@ -909,6 +968,8 @@ async def log_requests(request, call_next):
     if response.status_code >= 500:
         logger.error(log_message)
     elif response.status_code >= 400:
+        logger.warning(log_message)
+    elif process_time >= 3.0:
         logger.warning(log_message)
     elif process_time >= 1.0:
         logger.info(log_message)
@@ -1069,12 +1130,7 @@ async def login(request: LoginRequest):
             if user:
                 # 生成token
                 token = generate_token()
-                SESSION_TOKENS[token] = {
-                    'user_id': user['id'],
-                    'username': user['username'],
-                    'is_admin': bool(user.get('is_admin')),
-                    'timestamp': time.time()
-                }
+                SESSION_TOKENS[token] = build_session_token_data(user)
 
                 if user.get('is_admin'):
                     logger.info(f"【{user['username']}#{user['id']}】登录成功（管理员）")
@@ -1104,12 +1160,7 @@ async def login(request: LoginRequest):
         if user and db_manager.verify_user_password(user['username'], request.password):
             # 生成token
             token = generate_token()
-            SESSION_TOKENS[token] = {
-                'user_id': user['id'],
-                'username': user['username'],
-                'is_admin': bool(user.get('is_admin')),
-                'timestamp': time.time()
-            }
+            SESSION_TOKENS[token] = build_session_token_data(user)
 
             logger.info(f"【{user['username']}#{user['id']}】邮箱登录成功")
 
@@ -1151,12 +1202,7 @@ async def login(request: LoginRequest):
 
         # 生成token
         token = generate_token()
-        SESSION_TOKENS[token] = {
-            'user_id': user['id'],
-            'username': user['username'],
-            'is_admin': bool(user.get('is_admin')),
-            'timestamp': time.time()
-        }
+        SESSION_TOKENS[token] = build_session_token_data(user)
 
         logger.info(f"【{user['username']}#{user['id']}】验证码登录成功")
 
@@ -1326,6 +1372,8 @@ async def verify_captcha(request: VerifyCaptchaRequest):
 
 # 极验验证状态存储: {challenge: {"status": int, "expires_at": float}}
 geetest_status_store: dict = {}
+geetest_register_cache: dict = {}
+GEETEST_REGISTER_CACHE_TTL_SECONDS = 60
 
 
 def cleanup_expired_geetest_status():
@@ -1352,6 +1400,32 @@ def get_geetest_status(challenge: str) -> int:
     if stored and stored["expires_at"] > time.time():
         return stored["status"]
     return 0
+
+
+def get_cached_geetest_register_response() -> Optional["GeetestRegisterResponse"]:
+    """复用短时间内的极验初始化结果，避免重复触发远端初始化。"""
+    cached = geetest_register_cache.get("register")
+    if not cached:
+        return None
+    if float(cached.get("expires_at") or 0) <= time.time():
+        geetest_register_cache.pop("register", None)
+        return None
+    return GeetestRegisterResponse(
+        success=bool(cached.get("success")),
+        code=int(cached.get("code") or 200),
+        message=str(cached.get("message") or ""),
+        data=cached.get("data"),
+    )
+
+
+def cache_geetest_register_response(response: "GeetestRegisterResponse") -> None:
+    geetest_register_cache["register"] = {
+        "success": bool(response.success),
+        "code": int(response.code),
+        "message": str(response.message or ""),
+        "data": response.data,
+        "expires_at": time.time() + GEETEST_REGISTER_CACHE_TTL_SECONDS,
+    }
 
 
 class GeetestRegisterResponse(BaseModel):
@@ -1384,6 +1458,11 @@ async def geetest_register():
     
     前端调用此接口获取gt、challenge等参数，用于初始化验证码组件
     """
+    cached_response = get_cached_geetest_register_response()
+    if cached_response is not None:
+        logger.debug("极验初始化命中短时缓存")
+        return cached_response
+
     try:
         from utils.geetest import GeetestLib
         
@@ -1398,12 +1477,14 @@ async def geetest_register():
         if challenge:
             set_geetest_status(challenge, 0)
         
-        return GeetestRegisterResponse(
+        response = GeetestRegisterResponse(
             success=True,
             code=200,
             message="获取成功" if result.status == 1 else "宕机模式",
             data=data
         )
+        cache_geetest_register_response(response)
+        return response
             
     except Exception as e:
         logger.error(f"极验初始化失败: {e}")
@@ -1419,12 +1500,14 @@ async def geetest_register():
             if challenge:
                 set_geetest_status(challenge, 0)
             
-            return GeetestRegisterResponse(
+            response = GeetestRegisterResponse(
                 success=True,
                 code=200,
                 message="本地初始化",
                 data=data
             )
+            cache_geetest_register_response(response)
+            return response
         except Exception as e2:
             logger.error(f"极验本地初始化也失败: {e2}")
             return GeetestRegisterResponse(
@@ -6686,7 +6769,7 @@ def get_system_logs(admin_user: Dict[str, Any] = Depends(require_admin),
         return {"logs": [], "message": f"获取系统日志失败: {str(e)}", "success": False}
 
 @app.get('/admin/log-files')
-def list_log_files(admin_user: Dict[str, Any] = Depends(require_admin)):
+def list_available_log_files(admin_user: Dict[str, Any] = Depends(require_admin)):
     """列出所有可用的系统日志文件"""
     from datetime import datetime
 
@@ -7035,7 +7118,7 @@ async def upload_database_backup(admin_user: Dict[str, Any] = Depends(require_ad
 
         # 关闭当前数据库连接
         if hasattr(db_manager, 'conn') and db_manager.conn:
-            db_manager.conn.close()
+            db_manager.close()
             log_with_user('info', "已关闭当前数据库连接", admin_user)
 
         # 替换数据库文件

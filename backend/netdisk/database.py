@@ -42,6 +42,8 @@ DB_POOL_SIZE = _read_positive_int("DB_POOL_SIZE", 10)
 DB_MAX_OVERFLOW = _read_positive_int("DB_MAX_OVERFLOW", 20)
 DB_POOL_TIMEOUT = _read_positive_int("DB_POOL_TIMEOUT", 5)
 DB_CONNECT_TIMEOUT = _read_positive_int("DB_CONNECT_TIMEOUT", 5)
+DB_POOL_RECYCLE = _read_positive_int("DB_POOL_RECYCLE", 1800)
+DB_POOL_USE_LIFO = str(os.environ.get("DB_POOL_USE_LIFO", "true")).strip().lower() not in {"0", "false", "no", "off"}
 
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL,
@@ -49,11 +51,18 @@ engine = create_engine(
     pool_size=DB_POOL_SIZE,
     max_overflow=DB_MAX_OVERFLOW,
     pool_timeout=DB_POOL_TIMEOUT,
+    pool_recycle=DB_POOL_RECYCLE,
+    pool_use_lifo=DB_POOL_USE_LIFO,
     connect_args={"connect_timeout": DB_CONNECT_TIMEOUT},
 )
 
 
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    expire_on_commit=False,
+    bind=engine,
+)
 
 Base = declarative_base()
 
