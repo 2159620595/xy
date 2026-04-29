@@ -64,6 +64,7 @@ config.local.*
 config.dev.*
 
 # IDE / OS
+.worktrees/
 .vscode/
 .idea/
 *.swp
