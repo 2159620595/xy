@@ -376,6 +376,17 @@ class XianyuLive:
     _password_login_cooldown = 60  # 密码登录冷却时间：60秒
     _last_password_verification_time = {}  # {cookie_id: timestamp}
     _password_verification_cooldown = 300  # 人工验证冷却时间：5分钟
+
+    class ManualVerificationPendingError(RuntimeError):
+        """当前账号处于人工验证等待期，暂不应继续自动重试。"""
+
+        def __init__(self, cookie_id: str, remaining_seconds: float, trigger_reason: str = ""):
+            self.cookie_id = cookie_id
+            self.remaining_seconds = max(0.0, float(remaining_seconds))
+            self.trigger_reason = trigger_reason
+            super().__init__(
+                f"账号 {cookie_id} 正在等待人工验证，剩余 {self.remaining_seconds:.1f} 秒"
+            )
     
     def _safe_str(self, e):
         """安全地将异常转换为字符串"""
@@ -408,6 +419,32 @@ class XianyuLive:
                 logger.success(state_msg)
             else:
                 logger.debug(state_msg)
+
+    def _get_manual_verification_remaining_seconds(self) -> float:
+        """返回当前账号距离人工验证冷却结束还剩多少秒。"""
+        last_verification_time = XianyuLive._last_password_verification_time.get(self.cookie_id, 0)
+        if last_verification_time <= 0:
+            return 0.0
+        elapsed = time.time() - last_verification_time
+        remaining = XianyuLive._password_verification_cooldown - elapsed
+        return max(0.0, remaining)
+
+    def _ensure_not_waiting_manual_verification(self, trigger_reason: str = "") -> None:
+        """如果当前仍在人工验证等待期，抛出专用异常阻断自动重试。"""
+        remaining = self._get_manual_verification_remaining_seconds()
+        if remaining <= 0:
+            return
+        remaining_minutes = int(remaining // 60)
+        remaining_seconds = int(remaining % 60)
+        self._set_connection_state(
+            ConnectionState.FAILED,
+            f"等待人工验证，还需 {remaining_minutes}分{remaining_seconds}秒",
+        )
+        raise XianyuLive.ManualVerificationPendingError(
+            self.cookie_id,
+            remaining,
+            trigger_reason=trigger_reason,
+        )
 
     async def _interruptible_sleep(self, duration: float):
         """可中断的sleep，将长时间sleep拆分成多个短时间sleep，以便及时响应取消信号
@@ -5759,6 +5796,7 @@ class XianyuLive:
         # 如果没有token或者token过期，获取新token
         token_refresh_attempted = False
         if not self.current_token or (time.time() - self.last_token_refresh_time) >= self.token_refresh_interval:
+            self._ensure_not_waiting_manual_verification("初始化阶段")
             logger.info(f"【{self.cookie_id}】获取初始token...")
             token_refresh_attempted = True
 
@@ -8581,6 +8619,24 @@ class XianyuLive:
                 except Exception as e:
                     error_msg = self._safe_str(e)
                     error_type = type(e).__name__
+
+                    if isinstance(e, XianyuLive.ManualVerificationPendingError):
+                        wait_seconds = min(e.remaining_seconds, 60.0)
+                        remaining_minutes = int(e.remaining_seconds // 60)
+                        remaining_seconds = int(e.remaining_seconds % 60)
+                        self.connection_failures = 0
+                        logger.warning(
+                            f"【{self.cookie_id}】账号仍在人工验证等待期，暂停自动重连 "
+                            f"{wait_seconds:.0f} 秒后再检查，剩余冷却 "
+                            f"{remaining_minutes}分{remaining_seconds}秒"
+                        )
+                        try:
+                            self.current_token = None
+                            self._reset_background_tasks()
+                        except Exception:
+                            pass
+                        await self._interruptible_sleep(wait_seconds)
+                        continue
                     
                     # 检查是否是 ConnectionClosedError（正常的连接关闭）
                     is_connection_closed = (
@@ -8625,6 +8681,22 @@ class XianyuLive:
                     
                     # 检查是否超过最大失败次数
                     if self.connection_failures >= self.max_connection_failures:
+                        manual_verification_remaining = self._get_manual_verification_remaining_seconds()
+                        if manual_verification_remaining > 0:
+                            wait_seconds = min(manual_verification_remaining, 60.0)
+                            remaining_minutes = int(manual_verification_remaining // 60)
+                            remaining_seconds = int(manual_verification_remaining % 60)
+                            self.connection_failures = 0
+                            self._set_connection_state(
+                                ConnectionState.FAILED,
+                                f"等待人工验证，还需 {remaining_minutes}分{remaining_seconds}秒",
+                            )
+                            logger.warning(
+                                f"【{self.cookie_id}】连续失败后检测到人工验证仍未完成，"
+                                f"跳过密码登录刷新和实例重启，{wait_seconds:.0f} 秒后再检查"
+                            )
+                            await self._interruptible_sleep(wait_seconds)
+                            continue
                         self._set_connection_state(ConnectionState.FAILED, f"连续失败{self.max_connection_failures}次")
                         logger.warning(f"【{self.cookie_id}】连续失败{self.max_connection_failures}次，尝试通过密码登录刷新Cookie...")
                         

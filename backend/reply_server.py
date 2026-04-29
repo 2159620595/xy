@@ -1326,6 +1326,8 @@ async def verify_captcha(request: VerifyCaptchaRequest):
 
 # 极验验证状态存储: {challenge: {"status": int, "expires_at": float}}
 geetest_status_store: dict = {}
+geetest_register_cache: dict = {}
+GEETEST_REGISTER_CACHE_TTL_SECONDS = 60
 
 
 def cleanup_expired_geetest_status():
@@ -1352,6 +1354,32 @@ def get_geetest_status(challenge: str) -> int:
     if stored and stored["expires_at"] > time.time():
         return stored["status"]
     return 0
+
+
+def get_cached_geetest_register_response() -> Optional["GeetestRegisterResponse"]:
+    """复用短时间内的极验初始化结果，避免重复触发远端初始化。"""
+    cached = geetest_register_cache.get("register")
+    if not cached:
+        return None
+    if float(cached.get("expires_at") or 0) <= time.time():
+        geetest_register_cache.pop("register", None)
+        return None
+    return GeetestRegisterResponse(
+        success=bool(cached.get("success")),
+        code=int(cached.get("code") or 200),
+        message=str(cached.get("message") or ""),
+        data=cached.get("data"),
+    )
+
+
+def cache_geetest_register_response(response: "GeetestRegisterResponse") -> None:
+    geetest_register_cache["register"] = {
+        "success": bool(response.success),
+        "code": int(response.code),
+        "message": str(response.message or ""),
+        "data": response.data,
+        "expires_at": time.time() + GEETEST_REGISTER_CACHE_TTL_SECONDS,
+    }
 
 
 class GeetestRegisterResponse(BaseModel):
@@ -1384,6 +1412,11 @@ async def geetest_register():
     
     前端调用此接口获取gt、challenge等参数，用于初始化验证码组件
     """
+    cached_response = get_cached_geetest_register_response()
+    if cached_response is not None:
+        logger.debug("极验初始化命中短时缓存")
+        return cached_response
+
     try:
         from utils.geetest import GeetestLib
         
@@ -1398,12 +1431,14 @@ async def geetest_register():
         if challenge:
             set_geetest_status(challenge, 0)
         
-        return GeetestRegisterResponse(
+        response = GeetestRegisterResponse(
             success=True,
             code=200,
             message="获取成功" if result.status == 1 else "宕机模式",
             data=data
         )
+        cache_geetest_register_response(response)
+        return response
             
     except Exception as e:
         logger.error(f"极验初始化失败: {e}")
@@ -1419,12 +1454,14 @@ async def geetest_register():
             if challenge:
                 set_geetest_status(challenge, 0)
             
-            return GeetestRegisterResponse(
+            response = GeetestRegisterResponse(
                 success=True,
                 code=200,
                 message="本地初始化",
                 data=data
             )
+            cache_geetest_register_response(response)
+            return response
         except Exception as e2:
             logger.error(f"极验本地初始化也失败: {e2}")
             return GeetestRegisterResponse(
@@ -6686,7 +6723,7 @@ def get_system_logs(admin_user: Dict[str, Any] = Depends(require_admin),
         return {"logs": [], "message": f"获取系统日志失败: {str(e)}", "success": False}
 
 @app.get('/admin/log-files')
-def list_log_files(admin_user: Dict[str, Any] = Depends(require_admin)):
+def list_available_log_files(admin_user: Dict[str, Any] = Depends(require_admin)):
     """列出所有可用的系统日志文件"""
     from datetime import datetime
 

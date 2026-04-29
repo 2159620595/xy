@@ -287,6 +287,60 @@
               style="display: none"
               @change="handleQrImageChange"
             />
+
+            <div class="paste-panel">
+              <div class="paste-panel__title">粘贴二维码</div>
+              <div class="paste-panel__desc">
+                支持直接粘贴二维码链接/文本，也支持从剪贴板粘贴二维码图片。
+              </div>
+              <textarea
+                v-model.trim="pastedQrText"
+                class="paste-panel__textarea"
+                placeholder="在这里粘贴二维码链接、tradeNo、orderNo，或直接 Ctrl+V / 长按粘贴二维码图片"
+                :disabled="
+                  scanSubmitting ||
+                  batchSubmitting ||
+                  isBatchRunning ||
+                  clipboardReading
+                "
+                @paste="handlePasteIntoTextarea"
+              />
+              <div class="actions-row">
+                <button
+                  class="action-button"
+                  :disabled="
+                    scanSubmitting ||
+                    batchSubmitting ||
+                    isBatchRunning ||
+                    clipboardReading ||
+                    !pastedQrText
+                  "
+                  @click="submitPastedQrText"
+                >
+                  {{
+                    scanSubmitting
+                      ? "识别中..."
+                      : "提交粘贴内容"
+                  }}
+                </button>
+                <button
+                  class="action-button"
+                  :disabled="
+                    scanSubmitting ||
+                    batchSubmitting ||
+                    isBatchRunning ||
+                    clipboardReading
+                  "
+                  @click="readClipboardPayload"
+                >
+                  {{
+                    clipboardReading
+                      ? "读取剪贴板中..."
+                      : "读取剪贴板"
+                  }}
+                </button>
+              </div>
+            </div>
           </article>
         </section>
       </template>
@@ -629,6 +683,7 @@ const scanSubmitting = ref(false);
 const batchSubmitting = ref(false);
 const confirmSubmitting = ref(false);
 const cameraBusy = ref(false);
+const clipboardReading = ref(false);
 
 const showCameraModal = ref(false);
 const showBatchOrderModal = ref(false);
@@ -652,8 +707,10 @@ const cameraTip = ref("请将摄像头对准聚点购买二维码");
 const videoRef = ref(null);
 const qrImageInputRef = ref(null);
 const showPayResult = ref(false);
+const pastedQrText = ref("");
 
-const POLL_INTERVAL_MS = 2500;
+const DEFAULT_POLL_INTERVAL_MS = 10000;
+const BATCH_RUNNING_POLL_INTERVAL_MS = 5000;
 
 let clockTimer = null;
 let toastTimer = null;
@@ -889,9 +946,13 @@ const shouldAutoSync = computed(() => {
     String(currentSession.value?.status || ""),
   );
 });
+const autoSyncIntervalMs = computed(() =>
+  isBatchRunning.value ? BATCH_RUNNING_POLL_INTERVAL_MS : DEFAULT_POLL_INTERVAL_MS,
+);
 
 onMounted(() => {
   document.addEventListener("visibilitychange", handleVisibilityChange);
+  document.addEventListener("paste", handleGlobalPaste);
   clockTimer = window.setInterval(() => {
     nowTimestamp.value = Math.floor(Date.now() / 1000);
   }, 1000);
@@ -922,6 +983,7 @@ watch(
 
 onUnmounted(() => {
   document.removeEventListener("visibilitychange", handleVisibilityChange);
+  document.removeEventListener("paste", handleGlobalPaste);
   stopLiveSync();
   if (clockTimer) {
     clearInterval(clockTimer);
@@ -964,7 +1026,7 @@ function restartLiveSync() {
     )
       return;
     syncCurrentState({ silent: true }).catch(() => {});
-  }, POLL_INTERVAL_MS);
+  }, autoSyncIntervalMs.value);
 }
 
 function createEmptyRedeemInfo() {
@@ -1477,6 +1539,16 @@ function openQrImagePicker() {
   qrImageInputRef.value?.click();
 }
 
+function isEditableTarget(target) {
+  if (!target || typeof target.closest !== "function") return false;
+  if (target.isContentEditable) return true;
+  return Boolean(
+    target.closest(
+      'input, textarea, select, [contenteditable="true"], [contenteditable=""]',
+    ),
+  );
+}
+
 function loadImageElementFromFile(file) {
   return new Promise((resolve, reject) => {
     const objectUrl = URL.createObjectURL(file);
@@ -1493,6 +1565,40 @@ function loadImageElementFromFile(file) {
   });
 }
 
+async function decodeQrFromImageSource(source) {
+  const image = await loadImageElementFromFile(source);
+  const canvas = document.createElement("canvas");
+  canvas.width = image.naturalWidth || image.width;
+  canvas.height = image.naturalHeight || image.height;
+  const context = canvas.getContext("2d");
+  if (!context) {
+    throw new Error("无法读取图片内容");
+  }
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+  const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+  const result = jsQR(imageData.data, canvas.width, canvas.height, {
+    inversionAttempts: "attemptBoth",
+  });
+  if (!result?.data) {
+    throw new Error("未识别到二维码，请换一张清晰的二维码图片");
+  }
+  return String(result.data || "").trim();
+}
+
+async function processQrText(text) {
+  const normalized = String(text || "").trim();
+  if (!normalized) {
+    throw new Error("未读取到可用的二维码内容");
+  }
+  pastedQrText.value = normalized;
+  await submitScan(normalized);
+}
+
+async function processQrImageBlob(blob) {
+  const qrText = await decodeQrFromImageSource(blob);
+  await processQrText(qrText);
+}
+
 async function handleQrImageChange(event) {
   const input = event?.target;
   const file = input?.files?.[0];
@@ -1506,27 +1612,158 @@ async function handleQrImageChange(event) {
 
   try {
     scanSubmitting.value = true;
-    const image = await loadImageElementFromFile(file);
-    const canvas = document.createElement("canvas");
-    canvas.width = image.naturalWidth || image.width;
-    canvas.height = image.naturalHeight || image.height;
-    const context = canvas.getContext("2d");
-    if (!context) {
-      throw new Error("无法读取图片内容");
-    }
-    context.drawImage(image, 0, 0, canvas.width, canvas.height);
-    const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
-    const result = jsQR(imageData.data, canvas.width, canvas.height, {
-      inversionAttempts: "attemptBoth",
-    });
-    if (!result?.data) {
-      throw new Error("未识别到二维码，请换一张清晰的购买二维码图片");
-    }
-    await submitScan(result.data);
+    await processQrImageBlob(file);
   } catch (error) {
     showToast(error?.message || "图片识别失败");
   } finally {
     scanSubmitting.value = false;
+  }
+}
+
+async function submitPastedQrText() {
+  if (!pastedQrText.value) {
+    showToast("请先粘贴二维码文本或链接");
+    return;
+  }
+  try {
+    await processQrText(pastedQrText.value);
+  } catch (error) {
+    showToast(error?.message || "粘贴内容识别失败");
+  }
+}
+
+async function handlePasteIntoTextarea(event) {
+  const clipboard = event?.clipboardData;
+  if (!clipboard) return;
+
+  const imageItem = Array.from(clipboard.items || []).find((item) =>
+    String(item.type || "").startsWith("image/"),
+  );
+  if (imageItem) {
+    event.preventDefault();
+    const file = imageItem.getAsFile();
+    if (!file) {
+      showToast("剪贴板图片读取失败");
+      return;
+    }
+    try {
+      scanSubmitting.value = true;
+      await processQrImageBlob(file);
+    } catch (error) {
+      showToast(error?.message || "剪贴板图片识别失败");
+    } finally {
+      scanSubmitting.value = false;
+    }
+    return;
+  }
+
+  const text = String(clipboard.getData("text/plain") || "").trim();
+  if (!text) return;
+  event.preventDefault();
+  pastedQrText.value = text;
+  try {
+    await processQrText(text);
+  } catch (error) {
+    showToast(error?.message || "粘贴内容识别失败");
+  }
+}
+
+async function handleGlobalPaste(event) {
+  if (
+    scanSubmitting.value ||
+    batchSubmitting.value ||
+    isBatchRunning.value ||
+    clipboardReading.value
+  ) {
+    return;
+  }
+
+  const target = event?.target;
+  if (isEditableTarget(target)) {
+    return;
+  }
+
+  const clipboard = event?.clipboardData;
+  if (!clipboard) return;
+
+  const imageItem = Array.from(clipboard.items || []).find((item) =>
+    String(item.type || "").startsWith("image/"),
+  );
+  if (imageItem) {
+    const file = imageItem.getAsFile();
+    if (!file) return;
+    event.preventDefault();
+    try {
+      scanSubmitting.value = true;
+      await processQrImageBlob(file);
+    } catch (error) {
+      showToast(error?.message || "剪贴板图片识别失败");
+    } finally {
+      scanSubmitting.value = false;
+    }
+    return;
+  }
+
+  const text = String(clipboard.getData("text/plain") || "").trim();
+  if (!text) return;
+  event.preventDefault();
+  pastedQrText.value = text;
+  try {
+    await processQrText(text);
+  } catch (error) {
+    showToast(error?.message || "粘贴内容识别失败");
+  }
+}
+
+async function readClipboardPayload() {
+  if (
+    scanSubmitting.value ||
+    batchSubmitting.value ||
+    isBatchRunning.value ||
+    clipboardReading.value
+  ) {
+    return;
+  }
+
+  if (window.isSecureContext === false) {
+    showToast("需要 HTTPS 或 localhost 才能读取系统剪贴板");
+    return;
+  }
+
+  clipboardReading.value = true;
+  try {
+    const clipboardApi = navigator?.clipboard;
+    if (!clipboardApi) {
+      throw new Error("当前浏览器不支持读取系统剪贴板");
+    }
+
+    if (typeof clipboardApi.read === "function") {
+      const items = await clipboardApi.read();
+      for (const item of items) {
+        const imageType = item.types.find((type) =>
+          String(type || "").startsWith("image/"),
+        );
+        if (imageType) {
+          const blob = await item.getType(imageType);
+          await processQrImageBlob(blob);
+          return;
+        }
+      }
+    }
+
+    if (typeof clipboardApi.readText === "function") {
+      const text = String((await clipboardApi.readText()) || "").trim();
+      if (text) {
+        await processQrText(text);
+        return;
+      }
+    }
+
+    throw new Error("剪贴板里没有可用的二维码文本或图片");
+  } catch (error) {
+    showToast(error?.message || "读取剪贴板失败");
+  } finally {
+    clipboardReading.value = false;
   }
 }
 
@@ -2413,6 +2650,55 @@ function showToast(message) {
   font-size: 12px;
   color: #7f8cab;
   line-height: 1.7;
+}
+
+.paste-panel {
+  margin-top: 14px;
+  padding: 14px;
+  border-radius: 16px;
+  background: #101726;
+  border: 1px solid #1f2940;
+}
+
+.paste-panel__title {
+  font-size: 13px;
+  font-weight: 800;
+  color: #fff;
+}
+
+.paste-panel__desc {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #7f8cab;
+  line-height: 1.7;
+}
+
+.paste-panel__textarea {
+  width: 100%;
+  min-height: 104px;
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px solid #2a3552;
+  background: #0d1422;
+  color: #fff;
+  font-size: 14px;
+  line-height: 1.6;
+  resize: vertical;
+  outline: none;
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.paste-panel__textarea:focus {
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.16);
+}
+
+.paste-panel__textarea:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
 }
 
 .batch-order-field {
