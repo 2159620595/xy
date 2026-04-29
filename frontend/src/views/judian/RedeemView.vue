@@ -1199,6 +1199,58 @@ function showError(code, message) {
   state.value = "error";
 }
 
+function extractErrorStatus(error, fallback = 500) {
+  const status = Number(error?.response?.status || 0);
+  return Number.isFinite(status) && status > 0 ? status : fallback;
+}
+
+function extractErrorMessage(error, fallback = "请求失败，请稍后重试") {
+  const response = error?.response || {};
+  const data = response?.data;
+  const status = extractErrorStatus(error, 0);
+  const statusText = String(response?.statusText || "").trim();
+
+  const normalizeText = (value) => {
+    if (typeof value !== "string") return "";
+    const text = value.trim();
+    if (!text) return "";
+    if (text.startsWith("<")) {
+      const titleMatch = text.match(/<title>([^<]+)<\/title>/i);
+      return String(titleMatch?.[1] || "").trim();
+    }
+    return text;
+  };
+
+  const detail = data?.detail;
+  if (Array.isArray(detail)) {
+    const messages = detail
+      .map((item) => {
+        if (typeof item === "string") return item.trim();
+        const message = String(item?.msg || item?.message || "").trim();
+        const location = Array.isArray(item?.loc)
+          ? item.loc.filter(Boolean).join(".")
+          : "";
+        if (location && message) return `${location}: ${message}`;
+        return message;
+      })
+      .filter(Boolean);
+    if (messages.length) return messages.join("; ");
+  }
+
+  const candidates = [
+    normalizeText(detail),
+    normalizeText(data?.message),
+    normalizeText(data?.error),
+    normalizeText(typeof data === "string" ? data : ""),
+    normalizeText(error?.message),
+  ].filter(Boolean);
+
+  if (candidates.length) return candidates[0];
+  if (status && statusText) return `${fallback}（HTTP ${status} ${statusText}）`;
+  if (status) return `${fallback}（HTTP ${status}）`;
+  return fallback;
+}
+
 async function loadPage() {
   const code = getCurrentCode();
   if (!code) {
@@ -1220,8 +1272,8 @@ async function loadPage() {
       router.replace({ query: nextQuery }).catch(() => {});
     }
   } catch (error) {
-    const status = error?.response?.status || 500;
-    const detail = error?.response?.data?.detail || "网络错误，请刷新后重试";
+    const status = extractErrorStatus(error, 500);
+    const detail = extractErrorMessage(error, "网络错误，请刷新后重试");
     showError(status, detail);
   } finally {
     pageRefreshing.value = false;
@@ -1245,8 +1297,8 @@ async function syncCurrentState(options = {}) {
     applyRedeemPayload(data);
     state.value = "ready";
   } catch (error) {
-    const status = error?.response?.status || 500;
-    const detail = error?.response?.data?.detail || "同步状态失败";
+    const status = extractErrorStatus(error, 500);
+    const detail = extractErrorMessage(error, "同步状态失败");
     if ([404, 409, 410].includes(status)) {
       showError(status, detail);
       return;
@@ -1283,7 +1335,7 @@ async function refreshSession() {
 
     showToast("已创建新的解锁会话");
   } catch (error) {
-    const detail = error?.response?.data?.detail || "新建会话失败";
+    const detail = extractErrorMessage(error, "新建会话失败");
     showToast(detail);
   } finally {
     pageRefreshing.value = false;
@@ -1408,9 +1460,10 @@ async function submitScan(qrText) {
       applyRedeemPayload(data);
     } catch {}
 
-    const detail =
-      error?.response?.data?.detail ||
-      "二维码识别失败，请确认扫到的是包含 tradeNo 的聚点购买二维码";
+    const detail = extractErrorMessage(
+      error,
+      "二维码识别失败，请确认扫到的是包含 tradeNo 的聚点购买二维码",
+    );
     showToast(detail);
   } finally {
     scanSubmitting.value = false;
@@ -1565,8 +1618,7 @@ async function refreshBatchPreview() {
     };
   } catch (error) {
     const responseStatus = Number(error?.response?.status || 0);
-    const responseDetail = String(error?.response?.data?.detail || "").trim();
-    const normalizedDetail = responseDetail.toLowerCase();
+    const rawDetail = String(error?.response?.data?.detail || "").trim();
     batchPreview.value = {
       ...createEmptyBatchPreview(),
       availableDiamond: Number(redeemInfo.value.account?.diamondQuantity || 0),
@@ -1580,9 +1632,9 @@ async function refreshBatchPreview() {
           : -1,
       canSubmit: false,
       error:
-        responseStatus === 404 || normalizedDetail === "not found"
+        responseStatus === 404 || rawDetail.toLowerCase() === "not found"
           ? "预估接口未生效，请重启后端服务后再试。"
-          : responseDetail || "额度校验失败，请稍后重试。",
+          : extractErrorMessage(error, "额度校验失败，请稍后重试。"),
     };
   } finally {
     batchPreviewLoading.value = false;
@@ -1645,8 +1697,7 @@ async function submitBatchOrder() {
       applyRedeemPayload(data);
     } catch {}
 
-    const detail =
-      error?.response?.data?.detail || "批量下单提交失败，请稍后重试";
+    const detail = extractErrorMessage(error, "批量下单提交失败，请稍后重试");
     showToast(detail);
   } finally {
     batchSubmitting.value = false;
@@ -1690,7 +1741,7 @@ async function confirmOrder() {
       applyRedeemPayload(data);
     } catch {}
 
-    const detail = error?.response?.data?.detail || "自动扣钻失败，请稍后重试";
+    const detail = extractErrorMessage(error, "自动扣钻失败，请稍后重试");
     showToast(detail);
   } finally {
     confirmSubmitting.value = false;

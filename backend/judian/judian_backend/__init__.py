@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import queue
 import random
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -41,6 +43,7 @@ except ModuleNotFoundError:
     from netdisk.database import SessionLocal, get_db
 
 app = FastAPI(title='Judian API')
+logger = logging.getLogger(__name__)
 security = HTTPBearer(auto_error=False)
 JWT_SECRET = os.environ.get('JUDIAN_JWT_SECRET') or f"{os.environ.get('API_SECRET_KEY', 'judian-secret')}-judian"
 DEFAULT_TRUSTED_UI_ORIGINS = str(os.environ.get('CORS_ALLOW_ORIGINS', '') or '').strip()
@@ -3689,60 +3692,149 @@ def public_unlock_scan(session_id: str, body: JudianPublicUnlockScanRequest, db:
 
 @app.post('/public/unlock/{session_id}/batch')
 def public_unlock_batch_purchase(session_id: str, body: JudianPublicBatchPurchaseRequest, db: Session = Depends(get_db)):
-    session_row, cdkey_row, account = get_public_unlock_session_or_404(db, session_id)
-    if body.count is not None and not (body.items or []):
-        count = normalize_public_batch_order_count(body)
-        remote_token, remote_login_email, remote_login_password, target_login_email, target_login_password = resolve_public_batch_script_auth(account, body)
-        package_type = pick_text(body.packageType).lower()
-        vip_id, unit_diamond, required_diamond = resolve_public_batch_required_diamond(
-            count,
-            vip_id=pick_text(body.vipId),
-            package_type=package_type,
+    stage = 'init'
+    is_script_mode = body.count is not None and not (body.items or [])
+    request_count = body.count
+    request_vip_id = pick_text(body.vipId)
+    request_package_type = pick_text(body.packageType)
+    request_account = pick_text(body.account)
+    try:
+        stage = 'load_session'
+        session_row, cdkey_row, account = get_public_unlock_session_or_404(db, session_id)
+        logger.info(
+            'public_unlock_batch_purchase start: session_id=%s mode=%s count=%s vipId=%s packageType=%s account=%s has_password=%s',
+            session_id,
+            'script' if is_script_mode else 'items',
+            request_count,
+            request_vip_id,
+            request_package_type,
+            request_account,
+            bool(pick_text(body.password)),
         )
-        ensure_public_cdkey_quota_sufficient(cdkey_row, required_diamond)
-        batch_task_row = create_public_batch_script_task(
+        if is_script_mode:
+            stage = 'normalize_count'
+            count = normalize_public_batch_order_count(body)
+            stage = 'resolve_script_auth'
+            remote_token, remote_login_email, remote_login_password, target_login_email, target_login_password = resolve_public_batch_script_auth(account, body)
+            stage = 'resolve_package_type'
+            package_type = pick_text(body.packageType).lower()
+            stage = 'resolve_required_diamond'
+            vip_id, unit_diamond, required_diamond = resolve_public_batch_required_diamond(
+                count,
+                vip_id=pick_text(body.vipId),
+                package_type=package_type,
+            )
+            logger.info(
+                'public_unlock_batch_purchase resolved pricing: session_id=%s stage=%s count=%s vipId=%s packageType=%s unit_diamond=%s required_diamond=%s',
+                session_id,
+                stage,
+                count,
+                vip_id,
+                package_type,
+                unit_diamond,
+                required_diamond,
+            )
+            stage = 'ensure_quota'
+            ensure_public_cdkey_quota_sufficient(cdkey_row, required_diamond)
+            stage = 'create_script_task'
+            batch_task_row = create_public_batch_script_task(
+                db,
+                session_row,
+                cdkey_row,
+                account,
+                count,
+                vip_id=vip_id,
+                package_type=package_type,
+                unit_diamond=unit_diamond,
+                required_diamond=required_diamond,
+            )
+            logger.info(
+                'public_unlock_batch_purchase task_created: session_id=%s stage=%s batch_id=%s mode=script count=%s vipId=%s packageType=%s',
+                session_id,
+                stage,
+                batch_task_row.batch_id,
+                count,
+                vip_id,
+                package_type,
+            )
+            stage = 'start_script_worker'
+            worker = threading.Thread(
+                target=run_public_batch_script_job,
+                args=(
+                    session_row.session_id,
+                    batch_task_row.batch_id,
+                    remote_token,
+                    remote_login_email,
+                    remote_login_password,
+                    target_login_email,
+                    target_login_password,
+                ),
+                daemon=True,
+            )
+            worker.start()
+        else:
+            stage = 'normalize_items'
+            items = normalize_public_batch_purchase_items(body)
+            logger.info(
+                'public_unlock_batch_purchase normalized_items: session_id=%s stage=%s item_count=%s',
+                session_id,
+                stage,
+                len(items),
+            )
+            stage = 'create_items_task'
+            batch_task_row = create_public_batch_purchase_task(db, session_row, cdkey_row, account, items)
+            logger.info(
+                'public_unlock_batch_purchase task_created: session_id=%s stage=%s batch_id=%s mode=items item_count=%s',
+                session_id,
+                stage,
+                batch_task_row.batch_id,
+                len(items),
+            )
+            stage = 'start_items_worker'
+            worker = threading.Thread(
+                target=run_public_batch_purchase_job,
+                args=(session_row.session_id, batch_task_row.batch_id),
+                daemon=True,
+            )
+            worker.start()
+        stage = 'build_response'
+        order_row = db.query(models.JudianOrder).filter_by(order_id=session_row.order_id).first() if session_row.order_id else None
+        return build_public_unlock_response(
             db,
-            session_row,
             cdkey_row,
             account,
-            count,
-            vip_id=vip_id,
-            package_type=package_type,
-            unit_diamond=unit_diamond,
-            required_diamond=required_diamond,
+            session_row,
+            order_row,
+            batch_task_row=batch_task_row,
         )
-        worker = threading.Thread(
-            target=run_public_batch_script_job,
-            args=(
-                session_row.session_id,
-                batch_task_row.batch_id,
-                remote_token,
-                remote_login_email,
-                remote_login_password,
-                target_login_email,
-                target_login_password,
-            ),
-            daemon=True,
+    except HTTPException as exc:
+        logger.warning(
+            'public_unlock_batch_purchase rejected: session_id=%s mode=%s stage=%s status=%s detail=%s count=%s vipId=%s packageType=%s account=%s',
+            session_id,
+            'script' if is_script_mode else 'items',
+            stage,
+            exc.status_code,
+            exc.detail,
+            request_count,
+            request_vip_id,
+            request_package_type,
+            request_account,
         )
-        worker.start()
-    else:
-        items = normalize_public_batch_purchase_items(body)
-        batch_task_row = create_public_batch_purchase_task(db, session_row, cdkey_row, account, items)
-        worker = threading.Thread(
-            target=run_public_batch_purchase_job,
-            args=(session_row.session_id, batch_task_row.batch_id),
-            daemon=True,
+        raise
+    except Exception as exc:
+        logger.error(
+            'public_unlock_batch_purchase failed: session_id=%s mode=%s stage=%s count=%s vipId=%s packageType=%s account=%s error=%s\n%s',
+            session_id,
+            'script' if is_script_mode else 'items',
+            stage,
+            request_count,
+            request_vip_id,
+            request_package_type,
+            request_account,
+            exc,
+            traceback.format_exc(),
         )
-        worker.start()
-    order_row = db.query(models.JudianOrder).filter_by(order_id=session_row.order_id).first() if session_row.order_id else None
-    return build_public_unlock_response(
-        db,
-        cdkey_row,
-        account,
-        session_row,
-        order_row,
-        batch_task_row=batch_task_row,
-    )
+        raise HTTPException(status_code=500, detail=f'批量下单创建失败: {exc}') from exc
 
 
 @app.post('/public/unlock/{session_id}/confirm')

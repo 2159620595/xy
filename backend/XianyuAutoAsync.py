@@ -165,6 +165,7 @@ try:
         password=payload["password"],
         show_browser=payload["show_browser"],
         notification_callback=None,
+        return_verification_result=True,
     )
     print(
         RESULT_MARKER
@@ -373,6 +374,8 @@ class XianyuLive:
     # 类级别的密码登录时间记录，用于防止重复登录
     _last_password_login_time = {}  # {cookie_id: timestamp}
     _password_login_cooldown = 60  # 密码登录冷却时间：60秒
+    _last_password_verification_time = {}  # {cookie_id: timestamp}
+    _password_verification_cooldown = 300  # 人工验证冷却时间：5分钟
     
     def _safe_str(self, e):
         """安全地将异常转换为字符串"""
@@ -2466,6 +2469,28 @@ class XianyuLive:
         """
         logger.warning(f"【{self.cookie_id}】检测到{trigger_reason}，准备刷新Cookie并重启实例...")
 
+        # 如果上一次命中人工验证，短时间内不要重复拉起无头登录页面
+        current_time = time.time()
+        last_verification_time = XianyuLive._last_password_verification_time.get(self.cookie_id, 0)
+        time_since_last_verification = current_time - last_verification_time
+        if last_verification_time > 0 and time_since_last_verification < XianyuLive._password_verification_cooldown:
+            remaining_time = XianyuLive._password_verification_cooldown - time_since_last_verification
+            logger.warning(
+                f"【{self.cookie_id}】距离上次检测到人工验证仅 {time_since_last_verification:.1f} 秒，"
+                f"人工验证冷却中（还需等待 {remaining_time:.1f} 秒），跳过重复密码登录"
+            )
+            log_captcha_event(
+                self.cookie_id,
+                "人工验证冷却中，跳过重复密码登录",
+                None,
+                (
+                    f"触发原因: {trigger_reason}; "
+                    f"距上次人工验证: {time_since_last_verification:.1f}秒; "
+                    f"剩余冷却: {remaining_time:.1f}秒"
+                ),
+            )
+            return False
+
         # 检查是否在密码登录冷却期内，避免重复登录
         current_time = time.time()
         last_password_login = XianyuLive._last_password_login_time.get(self.cookie_id, 0)
@@ -2534,6 +2559,52 @@ class XianyuLive:
             )
             
             if result:
+                if result.get("__password_login_status") == "verification_required":
+                    verification_url = result.get("verification_url")
+                    screenshot_path = result.get("verification_screenshot_path")
+                    XianyuLive._last_password_verification_time[self.cookie_id] = time.time()
+                    logger.warning(
+                        f"【{self.cookie_id}】已记录人工验证时间，冷却期 "
+                        f"{XianyuLive._password_verification_cooldown} 秒"
+                    )
+                    attachment_path = None
+                    if screenshot_path:
+                        attachment_path = screenshot_path
+                        if not os.path.isabs(attachment_path):
+                            attachment_path = os.path.join(
+                                os.path.dirname(__file__),
+                                attachment_path.replace("/", os.sep),
+                            )
+                        if not os.path.exists(attachment_path):
+                            attachment_path = None
+
+                    message = (
+                        f"检测到{trigger_reason}，账号密码登录需要扫码或人脸验证，"
+                        f"已暂停自动刷新等待人工处理"
+                    )
+                    logger.warning(
+                        f"【{self.cookie_id}】密码登录需要人工验证: "
+                        f"url={verification_url or '无'}; screenshot={screenshot_path or '无'}"
+                    )
+                    log_captcha_event(
+                        self.cookie_id,
+                        "密码登录需要人工验证",
+                        None,
+                        (
+                            f"触发原因: {trigger_reason}; "
+                            f"验证链接: {verification_url or '无'}; "
+                            f"截图: {screenshot_path or '无'}; "
+                            f"冷却时间: {XianyuLive._password_verification_cooldown}秒"
+                        ),
+                    )
+                    await self.send_token_refresh_notification(
+                        message,
+                        "password_login_verification_required",
+                        attachment_path=attachment_path,
+                        verification_url=verification_url,
+                    )
+                    return False
+
                 logger.info(f"【{self.cookie_id}】密码登录成功，获取到Cookie")
                 logger.debug(f"【{self.cookie_id}】Cookie内容: {result}")
                 
@@ -4546,8 +4617,15 @@ class XianyuLive:
             attachment_path: 附件路径（可选，用于发送截图）
         """
         try:
+            bypass_expiry_filter_types = {
+                "password_login_verification_required",
+            }
+
             # 检查是否是正常的令牌过期，这种情况不需要发送通知
-            if self._is_normal_token_expiry(error_message):
+            if (
+                notification_type not in bypass_expiry_filter_types
+                and self._is_normal_token_expiry(error_message)
+            ):
                 logger.warning(f"检测到正常的令牌过期，跳过通知: {error_message}")
                 return
 
@@ -4591,7 +4669,17 @@ class XianyuLive:
 
             # 构造通知消息
             # 判断异常信息中是否包含"滑块验证成功"
-            if "滑块验证成功" in error_message:
+            if notification_type == "password_login_verification_required":
+                notification_msg = (
+                    f"{error_message}\n\n"
+                    f"账号: {self.cookie_id}\n"
+                    f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                )
+                if verification_url:
+                    notification_msg += f"\n验证链接: {verification_url}\n"
+                if attachment_path:
+                    notification_msg += "\n已附上验证截图，请尽快人工处理。\n"
+            elif "滑块验证成功" in error_message:
                 notification_msg = f"{error_message}\n\n" \
                                   f"账号: {self.cookie_id}\n" \
                                   f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
