@@ -540,6 +540,7 @@ KEYWORDS_FILE = Path(__file__).parent / "回复关键字.txt"
 DEFAULT_ADMIN_PASSWORD = ""  # 不再保留固定默认密码
 SESSION_TOKENS = {}  # 存储会话token: {token: {'user_id': int, 'username': str, 'timestamp': float}}
 TOKEN_EXPIRE_TIME = 24 * 60 * 60  # token过期时间：24小时
+USER_CACHE_REFRESH_INTERVAL = 60  # 登录态中的用户信息短时缓存，避免每个请求都查库
 LOCAL_ONLY_MODE = (os.getenv("LOCAL_ONLY_MODE") or "false").strip().lower() == "true"
 LOCAL_ONLY_ALLOW_CIDR = (os.getenv("LOCAL_ONLY_ALLOW_CIDR") or "127.0.0.1/32,::1/128,172.16.0.0/12,192.168.65.0/24,192.168.99.0/24").strip()
 _LOCAL_ONLY_NETWORKS = []
@@ -685,6 +686,51 @@ def generate_token() -> str:
     return secrets.token_urlsafe(32)
 
 
+def _build_session_user_payload(user: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        'id': user['id'],
+        'username': user['username'],
+        'email': user.get('email'),
+        'nickname': user.get('nickname'),
+        'is_admin': bool(user.get('is_admin')),
+        'is_active': user.get('is_active', True),
+        'created_at': user.get('created_at'),
+        'updated_at': user.get('updated_at'),
+    }
+
+
+def build_session_token_data(user: Dict[str, Any]) -> Dict[str, Any]:
+    now = time.time()
+    cached_user = _build_session_user_payload(user)
+    return {
+        'user_id': cached_user['id'],
+        'username': cached_user['username'],
+        'is_admin': cached_user['is_admin'],
+        'timestamp': now,
+        'user_cache': cached_user,
+        'user_cache_expires_at': now + USER_CACHE_REFRESH_INTERVAL,
+    }
+
+
+def get_session_user(token_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    current_time = time.time()
+    cached_user = token_data.get('user_cache')
+    cache_expires_at = float(token_data.get('user_cache_expires_at') or 0)
+    if isinstance(cached_user, dict) and cache_expires_at > current_time:
+        return cached_user
+
+    current_user = db_manager.get_user_by_id(token_data['user_id'])
+    if not current_user or not current_user.get('is_active', True):
+        return None
+
+    cached_user = _build_session_user_payload(current_user)
+    token_data['username'] = cached_user['username']
+    token_data['is_admin'] = cached_user['is_admin']
+    token_data['user_cache'] = cached_user
+    token_data['user_cache_expires_at'] = current_time + USER_CACHE_REFRESH_INTERVAL
+    return cached_user
+
+
 def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> Optional[Dict[str, Any]]:
     """验证token并返回用户信息"""
     if not credentials:
@@ -701,8 +747,8 @@ def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(s
         del SESSION_TOKENS[token]
         return None
 
-    current_user = db_manager.get_user_by_id(token_data['user_id'])
-    if not current_user or not current_user.get('is_active', True):
+    current_user = get_session_user(token_data)
+    if not current_user:
         del SESSION_TOKENS[token]
         return None
 
@@ -1069,12 +1115,7 @@ async def login(request: LoginRequest):
             if user:
                 # 生成token
                 token = generate_token()
-                SESSION_TOKENS[token] = {
-                    'user_id': user['id'],
-                    'username': user['username'],
-                    'is_admin': bool(user.get('is_admin')),
-                    'timestamp': time.time()
-                }
+                SESSION_TOKENS[token] = build_session_token_data(user)
 
                 if user.get('is_admin'):
                     logger.info(f"【{user['username']}#{user['id']}】登录成功（管理员）")
@@ -1104,12 +1145,7 @@ async def login(request: LoginRequest):
         if user and db_manager.verify_user_password(user['username'], request.password):
             # 生成token
             token = generate_token()
-            SESSION_TOKENS[token] = {
-                'user_id': user['id'],
-                'username': user['username'],
-                'is_admin': bool(user.get('is_admin')),
-                'timestamp': time.time()
-            }
+            SESSION_TOKENS[token] = build_session_token_data(user)
 
             logger.info(f"【{user['username']}#{user['id']}】邮箱登录成功")
 
@@ -1151,12 +1187,7 @@ async def login(request: LoginRequest):
 
         # 生成token
         token = generate_token()
-        SESSION_TOKENS[token] = {
-            'user_id': user['id'],
-            'username': user['username'],
-            'is_admin': bool(user.get('is_admin')),
-            'timestamp': time.time()
-        }
+        SESSION_TOKENS[token] = build_session_token_data(user)
 
         logger.info(f"【{user['username']}#{user['id']}】验证码登录成功")
 

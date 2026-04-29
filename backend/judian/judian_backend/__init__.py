@@ -33,6 +33,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
+from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 try:
@@ -2351,9 +2352,86 @@ def execute_public_unlock_payment(
     }
 
 
+_PUBLIC_UNLOCK_AUTOPAY_RUNNING: set[str] = set()
+_PUBLIC_UNLOCK_AUTOPAY_LOCK = threading.Lock()
 
 
-def build_public_unlock_url(code: str, session_id: str) -> str:
+def _set_public_unlock_autopay_pending(
+    db: Session,
+    session_row: models.JudianScanSession,
+    order_row: models.JudianOrder | None,
+    *,
+    message: str,
+) -> None:
+    session_row.status = 'confirmed' if session_row.order_id else (session_row.status or 'pending')
+    session_row.message = message
+    session_row.updated_at = now_text()
+    session_row.payload = {
+        **dict_like(session_row.payload),
+        'autoPay': True,
+        'autoPayQueued': True,
+        'autoPayQueuedAt': int(time.time()),
+    }
+    if order_row is not None and str(order_row.order_status or '') != 'completed':
+        order_row.order_status = 'confirmed'
+        order_row.updated_at = now_text()
+    db.commit()
+    db.refresh(session_row)
+    if order_row is not None:
+        db.refresh(order_row)
+
+
+def run_public_unlock_payment_job(session_id: str) -> None:
+    db = SessionLocal()
+    try:
+        session_row, cdkey_row, account = get_public_unlock_session_or_404(db, session_id)
+        order_row = db.query(models.JudianOrder).filter_by(order_id=session_row.order_id).first() if session_row.order_id else None
+        if order_row is None:
+            logger.warning('public_unlock_payment_job skipped: session_id=%s order_missing', session_id)
+            return
+        execute_public_unlock_payment(db, session_row, cdkey_row, account, order_row)
+        logger.info('public_unlock_payment_job completed: session_id=%s order_id=%s', session_id, session_row.order_id)
+    except HTTPException as exc:
+        logger.warning(
+            'public_unlock_payment_job rejected: session_id=%s status=%s detail=%s',
+            session_id,
+            exc.status_code,
+            exc.detail,
+        )
+    except Exception as exc:
+        logger.error(
+            'public_unlock_payment_job failed: session_id=%s error=%s\n%s',
+            session_id,
+            exc,
+            traceback.format_exc(),
+        )
+    finally:
+        try:
+            db.close()
+        finally:
+            with _PUBLIC_UNLOCK_AUTOPAY_LOCK:
+                _PUBLIC_UNLOCK_AUTOPAY_RUNNING.discard(str(session_id or '').strip())
+
+
+def start_public_unlock_payment_job(session_id: str) -> bool:
+    normalized_session_id = str(session_id or '').strip()
+    if not normalized_session_id:
+        return False
+    with _PUBLIC_UNLOCK_AUTOPAY_LOCK:
+        if normalized_session_id in _PUBLIC_UNLOCK_AUTOPAY_RUNNING:
+            return False
+        _PUBLIC_UNLOCK_AUTOPAY_RUNNING.add(normalized_session_id)
+    worker = threading.Thread(
+        target=run_public_unlock_payment_job,
+        args=(normalized_session_id,),
+        daemon=True,
+    )
+    worker.start()
+    return True
+
+
+
+
 
 
     safe_code = str(code or '').strip()
@@ -3680,14 +3758,23 @@ def public_unlock_scan(session_id: str, body: JudianPublicUnlockScanRequest, db:
         trade_no=body.tradeNo or '',
         order_no=body.orderNo or '',
     )
-    return execute_public_unlock_payment(
+    _set_public_unlock_autopay_pending(
         db,
         session_row,
-        cdkey_row,
-        account,
         order_row,
-        remote_session=remote_session,
+        message='订单已同步，正在后台自动扣钻，请稍候查看结果',
     )
+    started = start_public_unlock_payment_job(session_row.session_id)
+    if not started:
+        logger.info('public_unlock_scan reuse_running_autopay: session_id=%s order_id=%s', session_row.session_id, session_row.order_id)
+    db.refresh(cdkey_row)
+    db.refresh(account)
+    return {
+        'success': True,
+        'pending': True,
+        'message': session_row.message,
+        **build_public_unlock_response(db, cdkey_row, account, session_row, order_row),
+    }
 
 
 @app.post('/public/unlock/{session_id}/batch')
@@ -3842,42 +3929,52 @@ def public_unlock_confirm(session_id: str, db: Session = Depends(get_db)):
     session_row, cdkey_row, account = get_public_unlock_session_or_404(db, session_id)
     if not session_row.order_id:
         raise HTTPException(status_code=400, detail='当前会话还没有识别到订单，请先扫码')
-
-    def load_order(runtime_session: requests.Session):
-        order_payload = remote_get_order_info(runtime_session, session_row.order_id)
-        return ensure_public_order_payload_or_raise(order_payload)
-
-    try:
-        account, remote_session, order_payload = run_public_remote_action_with_relogin(db, account, load_order)
-    except JudianRemoteError as exc:
-        raise_public_remote_error(str(exc), default_status_code=502)
-
-    order_row = upsert_public_order(db, session_row, cdkey_row, order_payload, trade_no=session_row.order_id, account=account)
-    order_row.order_status = 'confirmed'
-    session_row.status = 'confirmed'
-    session_row.message = '订单校验完成，正在使用已保存 token 自动扣钻'
+    order_row = db.query(models.JudianOrder).filter_by(order_id=session_row.order_id).first()
+    if order_row is None:
+        raise HTTPException(status_code=400, detail='当前订单尚未同步，请重新扫码后再试')
     session_row.confirmed_at = int(time.time())
-    session_row.updated_at = now_text()
-
-    db.commit()
-    db.refresh(session_row)
-    db.refresh(order_row)
-    db.refresh(account)
-    return execute_public_unlock_payment(
+    _set_public_unlock_autopay_pending(
         db,
         session_row,
-        cdkey_row,
-        account,
         order_row,
-        remote_session=remote_session,
+        message='已重新触发后台自动扣钻，请稍候查看结果',
     )
+    started = start_public_unlock_payment_job(session_row.session_id)
+    if not started:
+        logger.info('public_unlock_confirm reuse_running_autopay: session_id=%s order_id=%s', session_row.session_id, session_row.order_id)
+    db.refresh(cdkey_row)
+    db.refresh(account)
+    return {
+        'success': True,
+        'pending': True,
+        'message': session_row.message,
+        **build_public_unlock_response(db, cdkey_row, account, session_row, order_row),
+    }
 
 
 @app.post('/public/unlock/{session_id}/complete')
 def public_unlock_complete(session_id: str, db: Session = Depends(get_db)):
     session_row, cdkey_row, account = get_public_unlock_session_or_404(db, session_id)
     order_row = db.query(models.JudianOrder).filter_by(order_id=session_row.order_id).first() if session_row.order_id else None
-    return execute_public_unlock_payment(db, session_row, cdkey_row, account, order_row)
+    if order_row is None:
+        raise HTTPException(status_code=400, detail='当前订单尚未同步，请重新扫码后再试')
+    _set_public_unlock_autopay_pending(
+        db,
+        session_row,
+        order_row,
+        message='正在后台继续处理自动扣钻，请稍候查看结果',
+    )
+    started = start_public_unlock_payment_job(session_row.session_id)
+    if not started:
+        logger.info('public_unlock_complete reuse_running_autopay: session_id=%s order_id=%s', session_row.session_id, session_row.order_id)
+    db.refresh(cdkey_row)
+    db.refresh(account)
+    return {
+        'success': True,
+        'pending': True,
+        'message': session_row.message,
+        **build_public_unlock_response(db, cdkey_row, account, session_row, order_row),
+    }
 
 
 
@@ -3895,21 +3992,82 @@ def verify(user: dict[str, Any] = Depends(get_current_user)):
 
 @app.get('/dashboard/summary')
 def dashboard_summary(user: dict[str, Any] = Depends(get_current_user), db: Session = Depends(get_db)):
-    account_rows = owner_scoped_account_query(db, user).order_by(models.JudianAccount.updated_at.desc(), models.JudianAccount.id.desc()).all()
-    cdkey_rows = owner_scoped_cdkey_query(db, user).order_by(models.JudianCdKey.updated_at.desc(), models.JudianCdKey.id.desc()).all()
+    account_query = owner_scoped_account_query(db, user)
+    cdkey_query = owner_scoped_cdkey_query(db, user)
 
-    serialized_accounts = [serialize_account(row) for row in account_rows]
-    serialized_cdkeys = [serialize_cdkey(row) for row in cdkey_rows]
-    active_count = sum(1 for item in serialized_accounts if item['status'] == 'active' and item['sessionToken'])
-    enabled_count = sum(1 for item in serialized_accounts if item['enabled'])
-    total_diamonds = sum(int(item['diamondQuantity'] or 0) for item in serialized_accounts)
-    available_cdkeys = sum(1 for item in serialized_cdkeys if item['status'] in {'unused', 'active'})
-    invalid_cdkeys = sum(1 for item in serialized_cdkeys if item['status'] in {'expired', 'void'})
+    account_summary = account_query.with_entities(
+        func.count(models.JudianAccount.id).label('accounts'),
+        func.coalesce(
+            func.sum(
+                case(
+                    (
+                        (models.JudianAccount.status == 'active')
+                        & (func.coalesce(models.JudianAccount.session_token, '') != ''),
+                        1,
+                    ),
+                    else_=0,
+                )
+            ),
+            0,
+        ).label('active_sessions'),
+        func.coalesce(
+            func.sum(case((models.JudianAccount.enabled.is_(True), 1), else_=0)),
+            0,
+        ).label('enabled_accounts'),
+        func.coalesce(func.sum(func.coalesce(models.JudianAccount.diamond_quantity, 0)), 0).label('total_diamonds'),
+        func.max(models.JudianAccount.updated_at).label('latest_account_updated_at'),
+        func.max(models.JudianAccount.last_login_at).label('latest_account_login_at'),
+    ).one()
+    cdkey_summary = cdkey_query.with_entities(
+        func.count(models.JudianCdKey.id).label('cdkeys'),
+        func.coalesce(
+            func.sum(case((models.JudianCdKey.status.in_(['unused', 'active']), 1), else_=0)),
+            0,
+        ).label('available_cdkeys'),
+        func.coalesce(
+            func.sum(case((models.JudianCdKey.status.in_(['expired', 'void']), 1), else_=0)),
+            0,
+        ).label('invalid_cdkeys'),
+        func.coalesce(func.sum(case((models.JudianCdKey.status == 'unused', 1), else_=0)), 0).label('unused_count'),
+        func.coalesce(func.sum(case((models.JudianCdKey.status == 'active', 1), else_=0)), 0).label('active_count'),
+        func.coalesce(func.sum(case((models.JudianCdKey.status == 'expired', 1), else_=0)), 0).label('expired_count'),
+        func.coalesce(func.sum(case((models.JudianCdKey.status == 'void', 1), else_=0)), 0).label('void_count'),
+        func.max(models.JudianCdKey.updated_at).label('latest_cdkey_updated_at'),
+        func.max(models.JudianCdKey.created_at).label('latest_cdkey_created_at'),
+    ).one()
+
+    top_account_rows = account_query.order_by(
+        models.JudianAccount.diamond_quantity.desc(),
+        models.JudianAccount.updated_at.desc(),
+        models.JudianAccount.id.desc(),
+    ).limit(8).all()
+    activity_account_rows = account_query.order_by(
+        models.JudianAccount.updated_at.desc(),
+        models.JudianAccount.id.desc(),
+    ).limit(40).all()
+    activity_cdkey_rows = cdkey_query.order_by(
+        models.JudianCdKey.updated_at.desc(),
+        models.JudianCdKey.id.desc(),
+    ).limit(40).all()
+
+    active_count = int(account_summary.active_sessions or 0)
+    enabled_count = int(account_summary.enabled_accounts or 0)
+    total_diamonds = int(account_summary.total_diamonds or 0)
+    available_cdkeys = int(cdkey_summary.available_cdkeys or 0)
+    invalid_cdkeys = int(cdkey_summary.invalid_cdkeys or 0)
     key_status_summary = [
         {
             'status': status,
             'label': label,
-            'count': sum(1 for item in serialized_cdkeys if item['status'] == status),
+            'count': int(
+                {
+                    'unused': cdkey_summary.unused_count,
+                    'active': cdkey_summary.active_count,
+                    'expired': cdkey_summary.expired_count,
+                    'void': cdkey_summary.void_count,
+                }[status]
+                or 0
+            ),
             'description': description,
         }
         for status, label, description in [
@@ -3919,20 +4077,24 @@ def dashboard_summary(user: dict[str, Any] = Depends(get_current_user), db: Sess
             ('void', '已作废', '手动作废后不再继续使用的卡密'),
         ]
     ]
-    top_accounts = sorted(serialized_accounts, key=lambda item: int(item['diamondQuantity'] or 0), reverse=True)[:8]
-    activities = build_dashboard_activities(account_rows, cdkey_rows)
+    top_accounts = [serialize_account(row) for row in top_account_rows]
+    activities = build_dashboard_activities(activity_account_rows, activity_cdkey_rows)
     last_updated_at = max(
         [str(item.get('createdAt') or '') for item in activities]
-        + [str(item['updatedAt'] or item['lastLoginAt'] or '') for item in serialized_accounts]
-        + [str(item['updatedAt'] or item['createdAt'] or '') for item in serialized_cdkeys]
+        + [
+            str(account_summary.latest_account_updated_at or ''),
+            str(account_summary.latest_account_login_at or ''),
+            str(cdkey_summary.latest_cdkey_updated_at or ''),
+            str(cdkey_summary.latest_cdkey_created_at or ''),
+        ]
         + [''],
     )
     return {
-        'accounts': len(serialized_accounts),
+        'accounts': int(account_summary.accounts or 0),
         'activeSessions': active_count,
         'enabledAccounts': enabled_count,
         'totalDiamonds': total_diamonds,
-        'cdkeys': len(serialized_cdkeys),
+        'cdkeys': int(cdkey_summary.cdkeys or 0),
         'availableCdkeys': available_cdkeys,
         'invalidCdkeys': invalid_cdkeys,
         'topAccounts': top_accounts,
