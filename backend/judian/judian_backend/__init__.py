@@ -1674,6 +1674,8 @@ def serialize_public_batch_task(row: models.JudianBatchPurchaseTask | None) -> d
         'currentTradeNo': row.current_trade_no or '',
         'createdAt': row.created_at or '',
         'updatedAt': row.updated_at or '',
+        'cancelRequested': bool(payload.get('cancelRequested')),
+        'cancelRequestedAt': pick_text(payload.get('cancelRequestedAt')),
         'items': items,
         'payload': payload,
     }
@@ -2882,6 +2884,71 @@ def make_public_batch_failed_items(count: int, message: str) -> list[dict[str, A
     ]
 
 
+def is_public_batch_task_cancel_requested(row: models.JudianBatchPurchaseTask | None) -> bool:
+    if row is None:
+        return False
+    payload = dict_like(row.payload)
+    return bool(payload.get('cancelRequested'))
+
+
+def mark_public_batch_task_cancel_requested(
+    db: Session,
+    session_row: models.JudianScanSession,
+    row: models.JudianBatchPurchaseTask,
+) -> models.JudianBatchPurchaseTask:
+    now = now_text()
+    row.payload = {
+        **dict_like(row.payload),
+        'cancelRequested': True,
+        'cancelRequestedAt': now,
+    }
+    row.message = '已请求取消批量任务，等待当前步骤结束'
+    row.updated_at = now
+    session_row.message = row.message
+    session_row.updated_at = now
+    db.commit()
+    db.refresh(row)
+    db.refresh(session_row)
+    return row
+
+
+def cancel_public_batch_task(
+    db: Session,
+    session_row: models.JudianScanSession,
+    row: models.JudianBatchPurchaseTask,
+    *,
+    message: str = '批量任务已取消',
+) -> models.JudianBatchPurchaseTask:
+    existing_items = dict_like(row.result_payload).get('items')
+    items_result = [dict_like(item) for item in existing_items] if isinstance(existing_items, list) else []
+    total_consumed_diamond = sum(max(0, pick_int(item.get('consumedDiamond'))) for item in items_result)
+    row = finalize_public_batch_task(
+        db,
+        row,
+        status='canceled',
+        message=message,
+        items_result=items_result,
+        current_index=pick_int(row.current_index),
+        current_trade_no=str(row.current_trade_no or ''),
+        total_consumed_diamond=total_consumed_diamond,
+    )
+    row.payload = {
+        **dict_like(row.payload),
+        'cancelRequested': True,
+        'cancelRequestedAt': pick_text(dict_like(row.payload).get('cancelRequestedAt'), now_text()),
+    }
+    session_row.message = row.message
+    session_row.updated_at = now_text()
+    session_row.result_payload = {
+        **dict_like(session_row.result_payload),
+        'latestBatchId': row.batch_id,
+    }
+    db.commit()
+    db.refresh(row)
+    db.refresh(session_row)
+    return row
+
+
 def get_batch_script_root() -> str:
     return os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'scripts'))
 
@@ -3321,6 +3388,21 @@ def run_public_batch_purchase(
     results: list[dict[str, Any]] = []
 
     for index, item in enumerate(items, start=1):
+        db.refresh(batch_task_row)
+        if is_public_batch_task_cancel_requested(batch_task_row):
+            batch_task_row = cancel_public_batch_task(
+                db,
+                session_row,
+                batch_task_row,
+                message=f'批量任务已取消，已处理 {len(results)}/{len(items)} 单',
+            )
+            return build_public_unlock_response(
+                db,
+                cdkey_row,
+                account,
+                session_row,
+                batch_task_row=batch_task_row,
+            ), batch_task_row
         batch_task_row.current_index = index
         batch_task_row.current_trade_no = str(item.get('tradeNo') or item.get('orderNo') or '')
         batch_task_row.message = f'正在处理第 {index}/{len(items)} 单'
@@ -3594,6 +3676,9 @@ def run_public_batch_script_job(
         batch_task_row.updated_at = now_text()
         db.commit()
         db.refresh(batch_task_row)
+        if is_public_batch_task_cancel_requested(batch_task_row):
+            cancel_public_batch_task(db, session_row, batch_task_row, message='批量任务已取消，脚本未启动')
+            return
 
         process = subprocess.Popen(
             command,
@@ -3626,6 +3711,7 @@ def run_public_batch_script_job(
         reader_thread.start()
         deadline = time.time() + timeout_seconds
         timed_out = False
+        canceled = False
         while True:
             wait_timeout = max(0.1, min(0.5, deadline - time.time()))
             try:
@@ -3641,6 +3727,12 @@ def run_public_batch_script_job(
                     )
                 continue
             except queue.Empty:
+                db.refresh(batch_task_row)
+                if is_public_batch_task_cancel_requested(batch_task_row):
+                    canceled = True
+                    if process.poll() is None:
+                        process.kill()
+                    break
                 if process.poll() is not None:
                     break
                 if time.time() >= deadline:
@@ -3659,6 +3751,14 @@ def run_public_batch_script_job(
                     session_row,
                     event_payload,
                 )
+        if canceled:
+            cancel_public_batch_task(
+                db,
+                session_row,
+                batch_task_row,
+                message=f'批量任务已取消，已处理 {int(batch_task_row.processed_count or 0)}/{count} 单',
+            )
+            return
         if timed_out:
             raise RuntimeError(f'批量下单脚本执行超时，超过 {timeout_seconds} 秒')
         stdout_text = ''.join(stdout_lines)
@@ -3984,6 +4084,43 @@ def public_unlock_batch_purchase(session_id: str, body: JudianPublicBatchPurchas
             traceback.format_exc(),
         )
         raise HTTPException(status_code=500, detail=f'批量下单创建失败: {exc}') from exc
+
+
+@app.post('/public/unlock/{session_id}/batch/cancel')
+def public_unlock_batch_cancel(session_id: str, db: Session = Depends(get_db)):
+    session_row, cdkey_row, account = get_public_unlock_session_or_404(db, session_id)
+    batch_task_row = get_latest_public_batch_task(db, session_row)
+    if batch_task_row is None:
+        raise HTTPException(status_code=404, detail='当前会话暂无批量购买任务')
+
+    status = str(batch_task_row.status or '').strip().lower()
+    if status in {'completed', 'failed', 'canceled'}:
+        return {
+            'success': True,
+            'pending': False,
+            'message': batch_task_row.message or '当前批量任务已结束',
+            **build_public_unlock_response(
+                db,
+                cdkey_row,
+                account,
+                session_row,
+                batch_task_row=batch_task_row,
+            ),
+        }
+
+    batch_task_row = mark_public_batch_task_cancel_requested(db, session_row, batch_task_row)
+    return {
+        'success': True,
+        'pending': True,
+        'message': batch_task_row.message,
+        **build_public_unlock_response(
+            db,
+            cdkey_row,
+            account,
+            session_row,
+            batch_task_row=batch_task_row,
+        ),
+    }
 
 
 @app.post('/public/unlock/{session_id}/confirm')

@@ -130,8 +130,18 @@
                     {{ batchStatusText }}
                   </div>
                 </div>
-                <div class="batch-progress-card__meta">
-                  {{ batchProgressText }}
+                <div class="batch-progress-card__header-actions">
+                  <div class="batch-progress-card__meta">
+                    {{ batchProgressText }}
+                  </div>
+                  <button
+                    v-if="canCancelBatchTask"
+                    class="action-button action-button--danger batch-progress-card__action"
+                    :disabled="batchCancelling"
+                    @click="cancelBatchTask"
+                  >
+                    {{ batchCancelling ? "正在取消..." : "取消任务" }}
+                  </button>
                 </div>
               </div>
               <div class="batch-progress-card__desc">
@@ -242,15 +252,19 @@
             <div class="actions-row actions-row--stack">
               <button
                 class="action-button action-button--primary action-button--secondary"
-                :disabled="scanSubmitting || batchSubmitting || isBatchRunning"
-                @click="openBatchOrderModal"
+                :disabled="scanSubmitting || batchSubmitting || batchCancelling"
+                @click="handleBatchPrimaryAction"
               >
                 {{
                   batchSubmitting
                     ? "批量下单提交中..."
-                    : isBatchRunning
-                      ? "批量任务执行中..."
-                      : "批量下单"
+                    : batchCancelling
+                      ? "正在取消批量任务..."
+                      : canCancelBatchTask
+                        ? "取消批量任务"
+                        : isBatchRunning
+                          ? "批量任务执行中..."
+                          : "批量下单"
                 }}
               </button>
               <button
@@ -317,11 +331,7 @@
                   "
                   @click="submitPastedQrText"
                 >
-                  {{
-                    scanSubmitting
-                      ? "识别中..."
-                      : "提交粘贴内容"
-                  }}
+                  {{ scanSubmitting ? "识别中..." : "提交粘贴内容" }}
                 </button>
                 <button
                   class="action-button"
@@ -333,11 +343,7 @@
                   "
                   @click="readClipboardPayload"
                 >
-                  {{
-                    clipboardReading
-                      ? "读取剪贴板中..."
-                      : "读取剪贴板"
-                  }}
+                  {{ clipboardReading ? "读取剪贴板中..." : "读取剪贴板" }}
                 </button>
               </div>
             </div>
@@ -680,6 +686,7 @@ const pageRefreshing = ref(false);
 const syncingState = ref(false);
 const scanSubmitting = ref(false);
 const batchSubmitting = ref(false);
+const batchCancelling = ref(false);
 const confirmSubmitting = ref(false);
 const cameraBusy = ref(false);
 const clipboardReading = ref(false);
@@ -738,6 +745,11 @@ const resultMessage = computed(
 const isBatchRunning = computed(
   () => String(currentBatchTask.value?.status || "") === "running",
 );
+const canCancelBatchTask = computed(() => {
+  const status = String(currentBatchTask.value?.status || "");
+  if (!["pending", "running"].includes(status)) return false;
+  return currentBatchTask.value?.cancelRequested !== true;
+});
 const isUnlockCompleted = computed(() => {
   const sessionStatus = String(currentSession.value?.status || "");
   const orderStatus = String(currentOrder.value?.status || "");
@@ -864,6 +876,8 @@ const canConfirmUnlock = computed(
 );
 const batchStatusText = computed(() => {
   const status = String(currentBatchTask.value?.status || "");
+  if (currentBatchTask.value?.cancelRequested) return "批量任务取消中";
+  if (status === "canceled") return "批量任务已取消";
   if (status === "completed") return "批量下单已完成";
   if (status === "failed") return "批量下单失败";
   if (status === "running") return "批量下单进行中";
@@ -871,6 +885,8 @@ const batchStatusText = computed(() => {
 });
 const batchStatusClass = computed(() => {
   const status = String(currentBatchTask.value?.status || "");
+  if (currentBatchTask.value?.cancelRequested) return "warning";
+  if (status === "canceled") return "warning";
   if (status === "completed") return "success";
   if (status === "failed") return "failed";
   return "running";
@@ -942,13 +958,16 @@ const batchPreviewHintText = computed(() => {
 });
 const shouldAutoSync = computed(() => {
   if (state.value !== "ready" || !currentSessionId.value) return false;
+  if (currentBatchTask.value?.cancelRequested) return true;
   if (isBatchRunning.value) return true;
   return ["pending", "scanned", "confirmed"].includes(
     String(currentSession.value?.status || ""),
   );
 });
 const autoSyncIntervalMs = computed(() =>
-  isBatchRunning.value ? BATCH_RUNNING_POLL_INTERVAL_MS : DEFAULT_POLL_INTERVAL_MS,
+  isBatchRunning.value
+    ? BATCH_RUNNING_POLL_INTERVAL_MS
+    : DEFAULT_POLL_INTERVAL_MS,
 );
 
 onMounted(() => {
@@ -1148,6 +1167,8 @@ function normalizeBatchTask(batchTask) {
     currentTradeNo: String(batchTask.currentTradeNo || ""),
     createdAt: String(batchTask.createdAt || ""),
     updatedAt: String(batchTask.updatedAt || ""),
+    cancelRequested: batchTask.cancelRequested === true,
+    cancelRequestedAt: String(batchTask.cancelRequestedAt || ""),
     requiredDiamond: Number(payload.requiredDiamond || 0),
     beforeDiamond: Number(payload.beforeDiamond ?? -1),
     afterDiamond: Number(payload.afterDiamond ?? -1),
@@ -1309,7 +1330,8 @@ function extractErrorMessage(error, fallback = "请求失败，请稍后重试")
   ].filter(Boolean);
 
   if (candidates.length) return candidates[0];
-  if (status && statusText) return `${fallback}（HTTP ${status} ${statusText}）`;
+  if (status && statusText)
+    return `${fallback}（HTTP ${status} ${statusText}）`;
   if (status) return `${fallback}（HTTP ${status}）`;
   return fallback;
 }
@@ -1793,7 +1815,8 @@ async function readClipboardPayload() {
 }
 
 function openBatchOrderModal() {
-  if (batchSubmitting.value || isBatchRunning.value) return;
+  if (batchSubmitting.value || batchCancelling.value || isBatchRunning.value)
+    return;
   batchOrderCount.value = Math.min(
     365,
     Math.max(1, Number(batchOrderCount.value || 1) || 1),
@@ -1808,10 +1831,19 @@ function openBatchOrderModal() {
 }
 
 function closeBatchOrderModal() {
-  if (batchSubmitting.value || isBatchRunning.value) return;
+  if (batchSubmitting.value || batchCancelling.value || isBatchRunning.value)
+    return;
   batchOrderPassword.value = "";
   batchPreviewLoading.value = false;
   showBatchOrderModal.value = false;
+}
+
+function handleBatchPrimaryAction() {
+  if (canCancelBatchTask.value) {
+    cancelBatchTask();
+    return;
+  }
+  openBatchOrderModal();
 }
 
 function applyBatchCountPreset(option) {
@@ -1963,6 +1995,30 @@ async function submitBatchOrder() {
     showToast(detail);
   } finally {
     batchSubmitting.value = false;
+  }
+}
+
+async function cancelBatchTask() {
+  const sessionId = String(currentSession.value?.sessionId || "");
+  if (!sessionId) {
+    showToast("当前解锁会话不存在，请刷新页面后重试");
+    return;
+  }
+  if (!canCancelBatchTask.value || batchCancelling.value) return;
+
+  batchCancelling.value = true;
+  try {
+    const { data } = await judianApi.publicUnlockBatchCancel(sessionId);
+    applyRedeemPayload(data);
+    showToast(data?.message || "已请求取消批量任务");
+  } catch (error) {
+    try {
+      const { data } = await judianApi.publicUnlockDetail(sessionId);
+      applyRedeemPayload(data);
+    } catch {}
+    showToast(extractErrorMessage(error, "取消批量任务失败，请稍后重试"));
+  } finally {
+    batchCancelling.value = false;
   }
 }
 
@@ -2525,6 +2581,17 @@ function showToast(message) {
   border-color: #0d8777;
 }
 
+.action-button--danger {
+  background: linear-gradient(135deg, #b91c1c, #dc2626);
+  border-color: #dc2626;
+  box-shadow: 0 10px 24px rgba(220, 38, 38, 0.22);
+}
+
+.action-button--danger:hover:not(:disabled) {
+  background: linear-gradient(135deg, #991b1b, #b91c1c);
+  border-color: #b91c1c;
+}
+
 .batch-progress-card {
   margin-bottom: 14px;
   padding: 14px;
@@ -2539,6 +2606,10 @@ function showToast(message) {
 
 .batch-progress-card--success {
   border-color: rgba(34, 197, 94, 0.35);
+}
+
+.batch-progress-card--warning {
+  border-color: rgba(251, 191, 36, 0.4);
 }
 
 .batch-progress-card--failed {
@@ -2565,6 +2636,18 @@ function showToast(message) {
   font-size: 13px;
   font-weight: 700;
   color: #93c5fd;
+}
+
+.batch-progress-card__header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.batch-progress-card__action {
+  min-width: 88px;
+  padding: 8px 12px;
+  font-size: 12px;
 }
 
 .batch-progress-card__desc,
