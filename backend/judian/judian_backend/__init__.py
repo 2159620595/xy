@@ -2471,6 +2471,7 @@ def build_public_unlock_url(code: str, session_id: str) -> str:
 
 def get_or_create_public_unlock_session(
     db: Session,
+    row: models.JudianCdKey,
     account: models.JudianAccount,
     session_id: str = '',
     *,
