@@ -33,6 +33,11 @@ const judianClient = axios.create({
   timeout: JUDIAN_API_TIMEOUT_MS,
 });
 
+export const judianPublicClient = axios.create({
+  baseURL: JUDIAN_API_BASE,
+  timeout: JUDIAN_API_TIMEOUT_MS,
+});
+
 judianClient.interceptors.request.use(async (config) => {
   if (!getJudianToken() && getMainUser()) {
     try {
@@ -133,18 +138,18 @@ export const judianApi = {
     judianClient.put(`/cdkeys/${rowId}`, data),
   cleanInactiveCdKeys: () => judianClient.delete("/cdkeys/inactive"),
   publicRedeemInfo: (code: string, sessionId?: string, forceRefresh = false) =>
-    axios.get(buildJudianApiUrl("/cdkey/redeem"), {
+    judianPublicClient.get("/cdkey/redeem", {
       params: { code, session: sessionId || "", refresh: forceRefresh ? 1 : 0 },
     }),
   publicUnlockDetail: (sessionId: string) =>
-    axios.get(buildJudianApiUrl(`/public/unlock/${sessionId}`)),
+    judianPublicClient.get(`/public/unlock/${sessionId}`),
   publicUnlockBatchDetail: (sessionId: string) =>
-    axios.get(buildJudianApiUrl(`/public/unlock/${sessionId}/batch`)),
+    judianPublicClient.get(`/public/unlock/${sessionId}/batch`),
   publicUnlockBatchPreview: (
     sessionId: string,
     params: { count: number; vipId?: string; packageType?: string },
   ) =>
-    axios.get(buildJudianApiUrl(`/public/unlock/${sessionId}/batch/preview`), {
+    judianPublicClient.get(`/public/unlock/${sessionId}/batch/preview`, {
       params: {
         count: params.count,
         vip_id: params.vipId || "",
@@ -152,17 +157,17 @@ export const judianApi = {
       },
     }),
   publicUnlockScan: (sessionId: string, data: Record<string, unknown>) =>
-    axios.post(buildJudianApiUrl(`/public/unlock/${sessionId}/scan`), data),
+    judianPublicClient.post(`/public/unlock/${sessionId}/scan`, data),
   publicUnlockBatchPurchase: (
     sessionId: string,
     data: Record<string, unknown>,
-  ) => axios.post(buildJudianApiUrl(`/public/unlock/${sessionId}/batch`), data),
+  ) => judianPublicClient.post(`/public/unlock/${sessionId}/batch`, data),
   publicUnlockBatchCancel: (sessionId: string) =>
-    axios.post(buildJudianApiUrl(`/public/unlock/${sessionId}/batch/cancel`)),
+    judianPublicClient.post(`/public/unlock/${sessionId}/batch/cancel`),
   publicUnlockConfirm: (sessionId: string) =>
-    axios.post(buildJudianApiUrl(`/public/unlock/${sessionId}/confirm`)),
+    judianPublicClient.post(`/public/unlock/${sessionId}/confirm`),
   publicUnlockComplete: (sessionId: string) =>
-    axios.post(buildJudianApiUrl(`/public/unlock/${sessionId}/complete`)),
+    judianPublicClient.post(`/public/unlock/${sessionId}/complete`),
 };
 
 export default judianClient;

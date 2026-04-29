@@ -1,3 +1,4 @@
+import { DEFAULT_REQUEST_TIMEOUT_MS, createTimeoutController } from "@/utils/http-timeout";
 import { JUDIAN_API_BASE_URL, NETDISK_API_BASE_URL } from "@/utils/request";
 
 const TOKEN_KEY = "judian_auth_token";
@@ -101,6 +102,7 @@ export function clearJudianSession() {
 
 export async function verifyStoredJudianSession(token: string) {
   if (!token) return false;
+  const { signal, cancel } = createTimeoutController(DEFAULT_REQUEST_TIMEOUT_MS);
   try {
     const response = await fetch(JUDIAN_VERIFY_URL, {
       method: "GET",
@@ -108,12 +110,15 @@ export async function verifyStoredJudianSession(token: string) {
       headers: {
         Authorization: `Bearer ${token}`,
       },
+      signal,
     });
     if (!response.ok) return false;
     const data = await response.json();
     return Boolean(data?.authenticated);
   } catch {
     return false;
+  } finally {
+    cancel();
   }
 }
 
@@ -138,6 +143,7 @@ export async function ensureJudianSession(force = false) {
     const mainUser = getMainUser();
     if (!mainUser?.username) return false;
 
+    const { signal, cancel } = createTimeoutController(DEFAULT_REQUEST_TIMEOUT_MS);
     try {
       const response = await fetch(JUDIAN_SESSION_BOOTSTRAP_URL, {
         method: "POST",
@@ -148,6 +154,7 @@ export async function ensureJudianSession(force = false) {
           username: mainUser.username,
           role: mainUser.role || "admin",
         }),
+        signal,
       });
 
       const data = await response.json().catch(() => null);
@@ -163,6 +170,8 @@ export async function ensureJudianSession(force = false) {
       return true;
     } catch {
       return false;
+    } finally {
+      cancel();
     }
   })();
 
