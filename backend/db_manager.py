@@ -101,6 +101,38 @@ class PostgresCompatConnection:
         return getattr(self._conn, item)
 
 
+class ManagedConnection:
+    """为 DBManager 提供可感知关闭和断线自愈的连接代理。"""
+
+    def __init__(self, manager: "DBManager"):
+        self._manager = manager
+
+    def cursor(self, *args, **kwargs):
+        return self._manager._call_connection_method("cursor", *args, **kwargs)
+
+    def commit(self):
+        return self._manager._call_connection_method("commit")
+
+    def rollback(self):
+        return self._manager._rollback_connection()
+
+    def close(self):
+        return self._manager._close_managed_connection()
+
+    def __enter__(self):
+        self._manager.ensure_connection().__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._manager.ensure_connection().__exit__(exc_type, exc, tb)
+
+    def __bool__(self):
+        return self._manager._connection is not None
+
+    def __getattr__(self, item):
+        return getattr(self._manager.ensure_connection(), item)
+
+
 class DBManager:
     """数据库管理，支持 SQLite 和 PostgreSQL。"""
     
@@ -143,8 +175,9 @@ class DBManager:
         else:
             logger.info("用户认证数据源: SQLite(DB_PATH)")
         logger.info(f"主业务数据源: {'PostgreSQL' if self.is_postgres else 'SQLite'}")
-        self.conn = None
         self.lock = threading.RLock()  # 使用可重入锁保护数据库操作
+        self._connection = None
+        self.conn = ManagedConnection(self)
 
         # SQL日志配置 - 默认关闭，避免启动和高频查询刷屏。
         # 需要排查数据库问题时，可通过环境变量 SQL_LOG_ENABLED=true 临时打开。
@@ -207,6 +240,108 @@ class DBManager:
 
         raw_conn = psycopg2.connect(self.pg_data_url, connect_timeout=10)
         return PostgresCompatConnection(raw_conn, self)
+
+    def _create_connection(self):
+        return self._create_postgres_connection() if self.is_postgres else self._create_sqlite_connection()
+
+    def _is_disconnect_error(self, error: Exception) -> bool:
+        message = str(error).lower()
+        disconnect_markers = (
+            "connection already closed",
+            "closed database",
+            "cannot operate on a closed database",
+            "server closed the connection unexpectedly",
+            "terminating connection",
+            "connection not open",
+            "cursor already closed",
+            "ssl connection has been closed unexpectedly",
+        )
+        return any(marker in message for marker in disconnect_markers)
+
+    def _close_raw_connection_quietly(self, conn, reason: str = ""):
+        if conn is None:
+            return
+        try:
+            conn.close()
+        except Exception as close_error:
+            logger.debug(f"关闭数据库连接失败，忽略: {close_error}")
+        if reason:
+            logger.warning(reason)
+
+    def _reset_connection_locked(self, reason: str = ""):
+        stale_conn = self._connection
+        self._connection = None
+        self._close_raw_connection_quietly(stale_conn, reason)
+
+    def _is_connection_alive(self, conn) -> bool:
+        if conn is None:
+            return False
+        try:
+            closed = getattr(conn, "closed", 0)
+            if closed:
+                return False
+        except Exception:
+            pass
+
+        try:
+            probe_cursor = conn.cursor()
+            try:
+                probe_cursor.execute("SELECT 1")
+            finally:
+                try:
+                    probe_cursor.close()
+                except Exception:
+                    pass
+            return True
+        except Exception as probe_error:
+            logger.debug(f"数据库连接探活失败: {probe_error}")
+            return False
+
+    def ensure_connection(self, force_reconnect: bool = False):
+        with self.lock:
+            if force_reconnect:
+                self._reset_connection_locked("检测到数据库连接失效，准备重建连接")
+
+            if self._connection is None:
+                self._connection = self._create_connection()
+                return self._connection
+
+            if not self._is_connection_alive(self._connection):
+                self._reset_connection_locked("数据库连接已关闭或不可用，已自动重连")
+                self._connection = self._create_connection()
+
+            return self._connection
+
+    def _call_connection_method(self, method_name: str, *args, **kwargs):
+        conn = self.ensure_connection()
+        method = getattr(conn, method_name)
+        try:
+            return method(*args, **kwargs)
+        except Exception as error:
+            if not self._is_disconnect_error(error):
+                raise
+            logger.warning(f"数据库连接调用失败，尝试自动重连: {error}")
+            conn = self.ensure_connection(force_reconnect=True)
+            return getattr(conn, method_name)(*args, **kwargs)
+
+    def _rollback_connection(self):
+        with self.lock:
+            conn = self._connection
+            if conn is None:
+                return None
+            try:
+                return conn.rollback()
+            except Exception as error:
+                if self._is_disconnect_error(error):
+                    logger.warning(f"数据库连接在回滚时已失效，丢弃旧连接: {error}")
+                    self._reset_connection_locked()
+                    return None
+                raise
+
+    def _close_managed_connection(self):
+        with self.lock:
+            self._reset_connection_locked()
+            return None
 
     def _is_valid_identifier(self, value: str) -> bool:
         return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value or ""))
@@ -429,14 +564,14 @@ class DBManager:
     def _init_postgres_db(self):
         """初始化 PostgreSQL 连接和运行时 schema。"""
         try:
-            self.conn = self._create_postgres_connection()
+            self.ensure_connection(force_reconnect=True)
             cursor = self.conn.cursor()
             self._ensure_pg_runtime_schema(cursor)
             self.conn.commit()
             logger.info("PostgreSQL数据库初始化完成")
         except Exception as e:
             logger.error(f"PostgreSQL数据库初始化失败: {e}")
-            if self.conn:
+            if self._connection:
                 try:
                     self.conn.rollback()
                 except Exception:
@@ -556,7 +691,7 @@ class DBManager:
             self._init_postgres_db()
             return
         try:
-            self.conn = self._create_sqlite_connection()
+            self.ensure_connection(force_reconnect=True)
             cursor = self.conn.cursor()
             
             # 创建用户表
@@ -1906,15 +2041,11 @@ class DBManager:
 
     def close(self):
         """关闭数据库连接"""
-        if self.conn:
-            self.conn.close()
-            self.conn = None
+        self.conn.close()
     
     def get_connection(self):
         """获取数据库连接，如果已关闭则重新连接"""
-        if self.conn is None:
-            self.conn = self._create_postgres_connection() if self.is_postgres else self._create_sqlite_connection()
-        return self.conn
+        return self.ensure_connection()
 
     def _log_sql(self, sql: str, params: tuple = None, operation: str = "EXECUTE"):
         """记录SQL执行日志"""

@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Callable
 
-from urllib.parse import parse_qs, urlparse, urlsplit
+from urllib.parse import parse_qs, quote, urlparse, urlsplit
 
 
 
@@ -30,6 +30,7 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding as rsa_padding
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import PlainTextResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
@@ -39,15 +40,23 @@ from sqlalchemy.orm import Session
 try:
     from backend.netdisk import models
     from backend.netdisk.database import SessionLocal, get_db
+    from backend.perf_cache import build_cache_key, cached_call, invalidate_cache_prefix
 except ModuleNotFoundError:
     from netdisk import models
     from netdisk.database import SessionLocal, get_db
+    from perf_cache import build_cache_key, cached_call, invalidate_cache_prefix
 
 app = FastAPI(title='Judian API')
+app.add_middleware(
+    GZipMiddleware,
+    minimum_size=max(256, int(os.environ.get('API_GZIP_MINIMUM_SIZE', '1024'))),
+)
 logger = logging.getLogger(__name__)
 security = HTTPBearer(auto_error=False)
 JWT_SECRET = os.environ.get('JUDIAN_JWT_SECRET') or f"{os.environ.get('API_SECRET_KEY', 'judian-secret')}-judian"
 DEFAULT_TRUSTED_UI_ORIGINS = str(os.environ.get('CORS_ALLOW_ORIGINS', '') or '').strip()
+JUDIAN_DASHBOARD_CACHE_TTL = max(0, int(os.environ.get('PERF_JUDIAN_DASHBOARD_CACHE_TTL', '5')))
+JUDIAN_LIST_CACHE_TTL = max(0, int(os.environ.get('PERF_JUDIAN_LIST_CACHE_TTL', '3')))
 JUDIAN_DEFAULT_TRUSTED_UI_ORIGINS = [
     'http://localhost:5173',
     'http://127.0.0.1:5173',
@@ -403,6 +412,18 @@ def get_current_user(
         'sub': username,
         'is_admin': True,
     }
+
+
+def build_judian_user_cache_key(user: dict[str, Any], *parts: Any) -> str:
+    username = str(user.get('username') or '').strip() or 'admin'
+    return build_cache_key('judian', username, *parts)
+
+
+def invalidate_judian_owner_cache(owner_username: str) -> None:
+    normalized_owner = str(owner_username or '').strip()
+    if not normalized_owner:
+        return
+    invalidate_cache_prefix(f"{build_cache_key('judian', normalized_owner)}::")
 
 
 def resolve_claim_api_token(request: Request) -> str:
@@ -2430,21 +2451,26 @@ def start_public_unlock_payment_job(session_id: str) -> bool:
     return True
 
 
-
-
-
-
-    safe_code = str(code or '').strip()
-    safe_session = str(session_id or '').strip()
+def build_public_unlock_url(code: str, session_id: str) -> str:
+    safe_code = quote(str(code or '').strip(), safe='')
+    safe_session = quote(str(session_id or '').strip(), safe='')
+    query_parts: list[str] = []
     if safe_code:
-        return f'/judian/redeem?code={safe_code}&session={safe_session}'
-    return f'/judian/unlock?session={safe_session}'
+        query_parts.append(f'code={safe_code}')
+    if safe_session:
+        query_parts.append(f'session={safe_session}')
+    query = '&'.join(query_parts)
+    if query:
+        return f'/judian/redeem?{query}'
+    return '/judian/redeem'
+
+
+
 
 
 
 def get_or_create_public_unlock_session(
     db: Session,
-    row: models.JudianCdKey,
     account: models.JudianAccount,
     session_id: str = '',
     *,
@@ -3992,134 +4018,149 @@ def verify(user: dict[str, Any] = Depends(get_current_user)):
 
 @app.get('/dashboard/summary')
 def dashboard_summary(user: dict[str, Any] = Depends(get_current_user), db: Session = Depends(get_db)):
-    account_query = owner_scoped_account_query(db, user)
-    cdkey_query = owner_scoped_cdkey_query(db, user)
+    cache_key = build_judian_user_cache_key(user, 'dashboard_summary')
 
-    account_summary = account_query.with_entities(
-        func.count(models.JudianAccount.id).label('accounts'),
-        func.coalesce(
-            func.sum(
-                case(
-                    (
-                        (models.JudianAccount.status == 'active')
-                        & (func.coalesce(models.JudianAccount.session_token, '') != ''),
-                        1,
-                    ),
-                    else_=0,
-                )
-            ),
-            0,
-        ).label('active_sessions'),
-        func.coalesce(
-            func.sum(case((models.JudianAccount.enabled.is_(True), 1), else_=0)),
-            0,
-        ).label('enabled_accounts'),
-        func.coalesce(func.sum(func.coalesce(models.JudianAccount.diamond_quantity, 0)), 0).label('total_diamonds'),
-        func.max(models.JudianAccount.updated_at).label('latest_account_updated_at'),
-        func.max(models.JudianAccount.last_login_at).label('latest_account_login_at'),
-    ).one()
-    cdkey_summary = cdkey_query.with_entities(
-        func.count(models.JudianCdKey.id).label('cdkeys'),
-        func.coalesce(
-            func.sum(case((models.JudianCdKey.status.in_(['unused', 'active']), 1), else_=0)),
-            0,
-        ).label('available_cdkeys'),
-        func.coalesce(
-            func.sum(case((models.JudianCdKey.status.in_(['expired', 'void']), 1), else_=0)),
-            0,
-        ).label('invalid_cdkeys'),
-        func.coalesce(func.sum(case((models.JudianCdKey.status == 'unused', 1), else_=0)), 0).label('unused_count'),
-        func.coalesce(func.sum(case((models.JudianCdKey.status == 'active', 1), else_=0)), 0).label('active_count'),
-        func.coalesce(func.sum(case((models.JudianCdKey.status == 'expired', 1), else_=0)), 0).label('expired_count'),
-        func.coalesce(func.sum(case((models.JudianCdKey.status == 'void', 1), else_=0)), 0).label('void_count'),
-        func.max(models.JudianCdKey.updated_at).label('latest_cdkey_updated_at'),
-        func.max(models.JudianCdKey.created_at).label('latest_cdkey_created_at'),
-    ).one()
+    def load_dashboard_summary() -> dict[str, Any]:
+        account_query = owner_scoped_account_query(db, user)
+        cdkey_query = owner_scoped_cdkey_query(db, user)
 
-    top_account_rows = account_query.order_by(
-        models.JudianAccount.diamond_quantity.desc(),
-        models.JudianAccount.updated_at.desc(),
-        models.JudianAccount.id.desc(),
-    ).limit(8).all()
-    activity_account_rows = account_query.order_by(
-        models.JudianAccount.updated_at.desc(),
-        models.JudianAccount.id.desc(),
-    ).limit(40).all()
-    activity_cdkey_rows = cdkey_query.order_by(
-        models.JudianCdKey.updated_at.desc(),
-        models.JudianCdKey.id.desc(),
-    ).limit(40).all()
+        account_summary = account_query.with_entities(
+            func.count(models.JudianAccount.id).label('accounts'),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            (models.JudianAccount.status == 'active')
+                            & (func.coalesce(models.JudianAccount.session_token, '') != ''),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label('active_sessions'),
+            func.coalesce(
+                func.sum(case((models.JudianAccount.enabled.is_(True), 1), else_=0)),
+                0,
+            ).label('enabled_accounts'),
+            func.coalesce(func.sum(func.coalesce(models.JudianAccount.diamond_quantity, 0)), 0).label('total_diamonds'),
+            func.max(models.JudianAccount.updated_at).label('latest_account_updated_at'),
+            func.max(models.JudianAccount.last_login_at).label('latest_account_login_at'),
+        ).one()
+        cdkey_summary = cdkey_query.with_entities(
+            func.count(models.JudianCdKey.id).label('cdkeys'),
+            func.coalesce(
+                func.sum(case((models.JudianCdKey.status.in_(['unused', 'active']), 1), else_=0)),
+                0,
+            ).label('available_cdkeys'),
+            func.coalesce(
+                func.sum(case((models.JudianCdKey.status.in_(['expired', 'void']), 1), else_=0)),
+                0,
+            ).label('invalid_cdkeys'),
+            func.coalesce(func.sum(case((models.JudianCdKey.status == 'unused', 1), else_=0)), 0).label('unused_count'),
+            func.coalesce(func.sum(case((models.JudianCdKey.status == 'active', 1), else_=0)), 0).label('active_count'),
+            func.coalesce(func.sum(case((models.JudianCdKey.status == 'expired', 1), else_=0)), 0).label('expired_count'),
+            func.coalesce(func.sum(case((models.JudianCdKey.status == 'void', 1), else_=0)), 0).label('void_count'),
+            func.max(models.JudianCdKey.updated_at).label('latest_cdkey_updated_at'),
+            func.max(models.JudianCdKey.created_at).label('latest_cdkey_created_at'),
+        ).one()
 
-    active_count = int(account_summary.active_sessions or 0)
-    enabled_count = int(account_summary.enabled_accounts or 0)
-    total_diamonds = int(account_summary.total_diamonds or 0)
-    available_cdkeys = int(cdkey_summary.available_cdkeys or 0)
-    invalid_cdkeys = int(cdkey_summary.invalid_cdkeys or 0)
-    key_status_summary = [
-        {
-            'status': status,
-            'label': label,
-            'count': int(
-                {
-                    'unused': cdkey_summary.unused_count,
-                    'active': cdkey_summary.active_count,
-                    'expired': cdkey_summary.expired_count,
-                    'void': cdkey_summary.void_count,
-                }[status]
-                or 0
-            ),
-            'description': description,
+        top_account_rows = account_query.order_by(
+            models.JudianAccount.diamond_quantity.desc(),
+            models.JudianAccount.updated_at.desc(),
+            models.JudianAccount.id.desc(),
+        ).limit(8).all()
+        activity_account_rows = account_query.order_by(
+            models.JudianAccount.updated_at.desc(),
+            models.JudianAccount.id.desc(),
+        ).limit(40).all()
+        activity_cdkey_rows = cdkey_query.order_by(
+            models.JudianCdKey.updated_at.desc(),
+            models.JudianCdKey.id.desc(),
+        ).limit(40).all()
+
+        active_count = int(account_summary.active_sessions or 0)
+        enabled_count = int(account_summary.enabled_accounts or 0)
+        total_diamonds = int(account_summary.total_diamonds or 0)
+        available_cdkeys = int(cdkey_summary.available_cdkeys or 0)
+        invalid_cdkeys = int(cdkey_summary.invalid_cdkeys or 0)
+        key_status_summary = [
+            {
+                'status': status,
+                'label': label,
+                'count': int(
+                    {
+                        'unused': cdkey_summary.unused_count,
+                        'active': cdkey_summary.active_count,
+                        'expired': cdkey_summary.expired_count,
+                        'void': cdkey_summary.void_count,
+                    }[status]
+                    or 0
+                ),
+                'description': description,
+            }
+            for status, label, description in [
+                ('unused', '待领取', '尚未领取、可继续发放的真实卡密'),
+                ('active', '已领取', '已经进入使用链路的真实卡密'),
+                ('expired', '已过期', '已过期、建议清理的真实卡密'),
+                ('void', '已作废', '手动作废后不再继续使用的卡密'),
+            ]
+        ]
+        top_accounts = [serialize_account(row) for row in top_account_rows]
+        activities = build_dashboard_activities(activity_account_rows, activity_cdkey_rows)
+        last_updated_at = max(
+            [str(item.get('createdAt') or '') for item in activities]
+            + [
+                str(account_summary.latest_account_updated_at or ''),
+                str(account_summary.latest_account_login_at or ''),
+                str(cdkey_summary.latest_cdkey_updated_at or ''),
+                str(cdkey_summary.latest_cdkey_created_at or ''),
+            ]
+            + [''],
+        )
+        return {
+            'accounts': int(account_summary.accounts or 0),
+            'activeSessions': active_count,
+            'enabledAccounts': enabled_count,
+            'totalDiamonds': total_diamonds,
+            'cdkeys': int(cdkey_summary.cdkeys or 0),
+            'availableCdkeys': available_cdkeys,
+            'invalidCdkeys': invalid_cdkeys,
+            'topAccounts': top_accounts,
+            'keyStatusSummary': key_status_summary,
+            'activities': activities,
+            'lastUpdatedAt': last_updated_at,
         }
-        for status, label, description in [
-            ('unused', '待领取', '尚未领取、可继续发放的真实卡密'),
-            ('active', '已领取', '已经进入使用链路的真实卡密'),
-            ('expired', '已过期', '已过期、建议清理的真实卡密'),
-            ('void', '已作废', '手动作废后不再继续使用的卡密'),
-        ]
-    ]
-    top_accounts = [serialize_account(row) for row in top_account_rows]
-    activities = build_dashboard_activities(activity_account_rows, activity_cdkey_rows)
-    last_updated_at = max(
-        [str(item.get('createdAt') or '') for item in activities]
-        + [
-            str(account_summary.latest_account_updated_at or ''),
-            str(account_summary.latest_account_login_at or ''),
-            str(cdkey_summary.latest_cdkey_updated_at or ''),
-            str(cdkey_summary.latest_cdkey_created_at or ''),
-        ]
-        + [''],
-    )
-    return {
-        'accounts': int(account_summary.accounts or 0),
-        'activeSessions': active_count,
-        'enabledAccounts': enabled_count,
-        'totalDiamonds': total_diamonds,
-        'cdkeys': int(cdkey_summary.cdkeys or 0),
-        'availableCdkeys': available_cdkeys,
-        'invalidCdkeys': invalid_cdkeys,
-        'topAccounts': top_accounts,
-        'keyStatusSummary': key_status_summary,
-        'activities': activities,
-        'lastUpdatedAt': last_updated_at,
-    }
+
+    return cached_call(cache_key, JUDIAN_DASHBOARD_CACHE_TTL, load_dashboard_summary)
 
 
 @app.get('/accounts')
 def list_accounts(user: dict[str, Any] = Depends(get_current_user), db: Session = Depends(get_db)):
-    rows = owner_scoped_account_query(db, user).order_by(models.JudianAccount.updated_at.desc(), models.JudianAccount.id.desc()).all()
-    return {
-        'items': [serialize_account(row) for row in rows],
-        'total': len(rows),
-    }
+    cache_key = build_judian_user_cache_key(user, 'accounts')
+
+    def load_accounts() -> dict[str, Any]:
+        rows = owner_scoped_account_query(db, user).order_by(models.JudianAccount.updated_at.desc(), models.JudianAccount.id.desc()).all()
+        return {
+            'items': [serialize_account(row) for row in rows],
+            'total': len(rows),
+        }
+
+    return cached_call(cache_key, JUDIAN_LIST_CACHE_TTL, load_accounts)
 
 
 @app.get('/cards')
 def list_cards(user: dict[str, Any] = Depends(get_current_user), db: Session = Depends(get_db)):
-    rows = owner_scoped_card_query(db, user).order_by(models.JudianCard.updated_at.desc(), models.JudianCard.id.desc()).all()
-    return {
-        'items': [serialize_card(row) for row in rows],
-        'total': len(rows),
-    }
+    cache_key = build_judian_user_cache_key(user, 'cards')
+
+    def load_cards() -> dict[str, Any]:
+        rows = owner_scoped_card_query(db, user).order_by(models.JudianCard.updated_at.desc(), models.JudianCard.id.desc()).all()
+        return {
+            'items': [serialize_card(row) for row in rows],
+            'total': len(rows),
+        }
+
+    return cached_call(cache_key, JUDIAN_LIST_CACHE_TTL, load_cards)
 
 
 def save_card_from_request(
@@ -4183,6 +4224,7 @@ def create_card(body: JudianCardCreateRequest, user: dict[str, Any] = Depends(ge
     row = save_card_from_request(db, user, body)
     db.commit()
     db.refresh(row)
+    invalidate_judian_owner_cache(row.owner_username)
     return {
         'message': '卡券创建成功',
         'id': row.id,
@@ -4198,6 +4240,7 @@ def update_card(card_id: int, body: JudianCardCreateRequest, user: dict[str, Any
     save_card_from_request(db, user, body, row)
     db.commit()
     db.refresh(row)
+    invalidate_judian_owner_cache(row.owner_username)
     return {
         'message': '卡券更新成功',
         'item': serialize_card(row),
@@ -4208,8 +4251,10 @@ def update_card(card_id: int, body: JudianCardCreateRequest, user: dict[str, Any
 @app.delete('/cards/{card_id}')
 def delete_card(card_id: int, user: dict[str, Any] = Depends(get_current_user), db: Session = Depends(get_db)):
     row = get_card_or_404(db, user, card_id)
+    owner_username = str(row.owner_username or '').strip()
     db.delete(row)
     db.commit()
+    invalidate_judian_owner_cache(owner_username)
     return {
         'message': '卡券删除成功',
         'success': True,
@@ -4218,12 +4263,16 @@ def delete_card(card_id: int, user: dict[str, Any] = Depends(get_current_user), 
 
 @app.get('/cdkeys')
 def list_cdkeys(user: dict[str, Any] = Depends(get_current_user), db: Session = Depends(get_db)):
+    cache_key = build_judian_user_cache_key(user, 'cdkeys')
 
-    rows = owner_scoped_cdkey_query(db, user).order_by(models.JudianCdKey.created_at.desc(), models.JudianCdKey.id.desc()).all()
-    return {
-        'items': [serialize_cdkey(row) for row in rows],
-        'total': len(rows),
-    }
+    def load_cdkeys() -> dict[str, Any]:
+        rows = owner_scoped_cdkey_query(db, user).order_by(models.JudianCdKey.created_at.desc(), models.JudianCdKey.id.desc()).all()
+        return {
+            'items': [serialize_cdkey(row) for row in rows],
+            'total': len(rows),
+        }
+
+    return cached_call(cache_key, JUDIAN_LIST_CACHE_TTL, load_cdkeys)
 
 
 @app.get('/cdkeys/claim')
@@ -4379,6 +4428,7 @@ def import_cdkeys(
     db.commit()
     for row in items:
         db.refresh(row)
+    invalidate_judian_owner_cache(owner_username)
 
     return {
         'message': f'导入完成：新增 {created}，跳过 {skipped}',
@@ -4454,6 +4504,7 @@ def import_cdkeys_from_netdisk(
     db.commit()
     for row in items:
         db.refresh(row)
+    invalidate_judian_owner_cache(owner_username)
 
     return {
         'message': f'导入完成：新增 {created}，跳过 {skipped}',
@@ -4508,6 +4559,7 @@ def import_card_codes_from_judian(
 
     db.commit()
     db.refresh(card)
+    invalidate_judian_owner_cache(card.owner_username)
     return {
         'message': f'已从聚点卡密导入到发货模板内容：新增 {appended} 个卡密',
         'appended': appended,
@@ -4554,6 +4606,7 @@ def import_card_codes_from_netdisk(
 
     db.commit()
     db.refresh(card)
+    invalidate_judian_owner_cache(card.owner_username)
     return {
         'message': f'已导入到发货模板内容：新增 {appended} 个卡密',
         'appended': appended,
@@ -4609,6 +4662,7 @@ def generate_cdkeys(
     db.commit()
     for row in rows:
         db.refresh(row)
+    invalidate_judian_owner_cache(owner_username)
     return {
         'message': f'已生成 {len(rows)} 张聚点卡密',
         'items': [serialize_cdkey(row) for row in rows],
@@ -4634,6 +4688,7 @@ def update_cdkey(
     row.updated_at = now_text()
     db.commit()
     db.refresh(row)
+    invalidate_judian_owner_cache(row.owner_username)
     return {
         'message': '聚点卡密更新成功',
         'item': serialize_cdkey(row),
@@ -4644,9 +4699,11 @@ def update_cdkey(
 def clean_inactive_cdkeys(user: dict[str, Any] = Depends(get_current_user), db: Session = Depends(get_db)):
     rows = owner_scoped_cdkey_query(db, user).filter(models.JudianCdKey.status.in_(['expired', 'void'])).all()
     removed = len(rows)
+    owner_username = str(user.get('username') or '').strip()
     for row in rows:
         db.delete(row)
     db.commit()
+    invalidate_judian_owner_cache(owner_username)
     return {
         'message': f'已清理 {removed} 张失效卡密',
         'removed': removed,
@@ -4691,6 +4748,7 @@ def login_account(
     except JudianRemoteError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    invalidate_judian_owner_cache(saved.owner_username)
     return {
         'message': '聚点账号登录成功',
         'item': serialize_account(saved),
@@ -4723,6 +4781,7 @@ def relogin_account(
     except JudianRemoteError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    invalidate_judian_owner_cache(saved.owner_username)
     return {
         'message': '聚点账号已重新登录',
         'item': serialize_account(saved),
@@ -4758,6 +4817,7 @@ def update_account(
     row.updated_at = now_text()
     db.commit()
     db.refresh(row)
+    invalidate_judian_owner_cache(row.owner_username)
     return {
         'message': '聚点账号更新成功',
         'item': serialize_account(row),
@@ -4771,8 +4831,10 @@ def delete_account(
     db: Session = Depends(get_db),
 ):
     row = get_account_or_404(db, user, row_id)
+    owner_username = str(row.owner_username or '').strip()
     db.delete(row)
     db.commit()
+    invalidate_judian_owner_cache(owner_username)
     return {
         'message': '聚点账号已删除',
         'success': True,

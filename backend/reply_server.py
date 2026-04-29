@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Depends, Query, status, UploadFile, File, Form
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -900,6 +901,11 @@ if cors_allowed_origins:
         allow_headers=["*"],
     )
 
+app.add_middleware(
+    GZipMiddleware,
+    minimum_size=max(256, int(os.environ.get("API_GZIP_MINIMUM_SIZE", "1024"))),
+)
+
 # 注册刮刮乐远程控制路由
 if CAPTCHA_ROUTER_AVAILABLE:
     app.include_router(captcha_router)
@@ -944,10 +950,17 @@ async def local_only_guard(request, call_next):
 
 @app.middleware("http")
 async def log_requests(request, call_next):
-    start_time = time.time()
-    response = await call_next(request)
-    process_time = time.time() - start_time
+    start_time = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        process_time = time.perf_counter() - start_time
+        logger.exception(
+            f"API {request.method} {request.url.path} - 500 ({process_time:.3f}s)"
+        )
+        raise
 
+    process_time = time.perf_counter() - start_time
     log_message = (
         f"API {request.method} {request.url.path} - "
         f"{response.status_code} ({process_time:.3f}s)"
@@ -955,6 +968,8 @@ async def log_requests(request, call_next):
     if response.status_code >= 500:
         logger.error(log_message)
     elif response.status_code >= 400:
+        logger.warning(log_message)
+    elif process_time >= 3.0:
         logger.warning(log_message)
     elif process_time >= 1.0:
         logger.info(log_message)
@@ -7103,7 +7118,7 @@ async def upload_database_backup(admin_user: Dict[str, Any] = Depends(require_ad
 
         # 关闭当前数据库连接
         if hasattr(db_manager, 'conn') and db_manager.conn:
-            db_manager.conn.close()
+            db_manager.close()
             log_with_user('info', "已关闭当前数据库连接", admin_user)
 
         # 替换数据库文件

@@ -26,6 +26,7 @@ from Crypto.Util.Padding import pad, unpad
 import redis.asyncio as aioredis
 from fastapi import FastAPI, Depends, HTTPException, Header, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import case, func, or_, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -34,6 +35,10 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
 from app_logging import configure_logging, get_logger
+try:
+    from backend.perf_cache import build_cache_key, cached_call
+except ModuleNotFoundError:
+    from perf_cache import build_cache_key, cached_call
 
 from . import models
 from .database import (
@@ -736,8 +741,16 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+app.add_middleware(
+    GZipMiddleware,
+    minimum_size=max(256, int(os.environ.get("API_GZIP_MINIMUM_SIZE", "1024"))),
+)
 
 SIGNATURE_EXEMPT_PATHS = set()
+NETDISK_DASHBOARD_CACHE_TTL = max(
+    0,
+    int(os.environ.get("PERF_NETDISK_DASHBOARD_CACHE_TTL", "5")),
+)
 
 ADMIN_AUTH_PUBLIC_PATHS = {
     "/api/auth/login",
@@ -1378,26 +1391,31 @@ def get_dashboard_summary(
     tenant_id: str = Depends(get_tenant),
     db: Session = Depends(get_db),
 ):
-    account_summary = db.query(
-        func.coalesce(func.sum(case((models.DiskAccount.status == 1, 1), else_=0)), 0).label("online_count"),
-        func.coalesce(func.sum(case((models.DiskAccount.status != 1, 1), else_=0)), 0).label("offline_count"),
-    ).filter(
-        models.DiskAccount.tenant_id == tenant_id,
-    ).one()
-    cdkey_summary = db.query(
-        func.coalesce(func.sum(case((models.CdKey.status == 0, 1), else_=0)), 0).label("unused_keys"),
-        func.coalesce(func.sum(case((models.CdKey.status == 1, 1), else_=0)), 0).label("used_keys"),
-        func.coalesce(func.sum(case((models.CdKey.status == 2, 1), else_=0)), 0).label("voided_keys"),
-    ).filter(
-        models.CdKey.tenant_id == tenant_id,
-    ).one()
-    return {
-        "online_count": int(account_summary.online_count or 0),
-        "offline_count": int(account_summary.offline_count or 0),
-        "unused_keys": int(cdkey_summary.unused_keys or 0),
-        "used_keys": int(cdkey_summary.used_keys or 0),
-        "voided_keys": int(cdkey_summary.voided_keys or 0),
-    }
+    cache_key = build_cache_key("netdisk", tenant_id, "dashboard_summary")
+
+    def load_summary() -> dict[str, int]:
+        account_summary = db.query(
+            func.coalesce(func.sum(case((models.DiskAccount.status == 1, 1), else_=0)), 0).label("online_count"),
+            func.coalesce(func.sum(case((models.DiskAccount.status != 1, 1), else_=0)), 0).label("offline_count"),
+        ).filter(
+            models.DiskAccount.tenant_id == tenant_id,
+        ).one()
+        cdkey_summary = db.query(
+            func.coalesce(func.sum(case((models.CdKey.status == 0, 1), else_=0)), 0).label("unused_keys"),
+            func.coalesce(func.sum(case((models.CdKey.status == 1, 1), else_=0)), 0).label("used_keys"),
+            func.coalesce(func.sum(case((models.CdKey.status == 2, 1), else_=0)), 0).label("voided_keys"),
+        ).filter(
+            models.CdKey.tenant_id == tenant_id,
+        ).one()
+        return {
+            "online_count": int(account_summary.online_count or 0),
+            "offline_count": int(account_summary.offline_count or 0),
+            "unused_keys": int(cdkey_summary.unused_keys or 0),
+            "used_keys": int(cdkey_summary.used_keys or 0),
+            "voided_keys": int(cdkey_summary.voided_keys or 0),
+        }
+
+    return cached_call(cache_key, NETDISK_DASHBOARD_CACHE_TTL, load_summary)
 
 
 @app.get("/api/auth/login-logs")

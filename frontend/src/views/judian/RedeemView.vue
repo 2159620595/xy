@@ -662,7 +662,6 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import jsQR from "jsqr";
 
 import { judianApi } from "@/api/judian";
 
@@ -718,6 +717,8 @@ let cameraStream = null;
 let cameraAnimation = null;
 let liveSyncTimer = null;
 let lastPayResultKey = "";
+let qrDecoder = null;
+let qrDecoderPromise = null;
 
 const currentSession = computed(() => redeemInfo.value.session || null);
 const currentSessionId = computed(() =>
@@ -1412,7 +1413,7 @@ async function openCamera() {
   }
 
   cameraBusy.value = true;
-  cameraTip.value = "正在加载摄像头...";
+  cameraTip.value = "正在加载扫码组件...";
   showCameraModal.value = true;
 
   const getMedia = async (constraints) => {
@@ -1431,6 +1432,7 @@ async function openCamera() {
   };
 
   try {
+    const decoderPromise = ensureQrDecoder();
     try {
       cameraStream = await getMedia({
         video: { facingMode: { ideal: "environment" } },
@@ -1438,6 +1440,7 @@ async function openCamera() {
     } catch {
       cameraStream = await getMedia({ video: true });
     }
+    await decoderPromise;
 
     const video = videoRef.value;
     if (!video) throw new Error("未找到视频节点");
@@ -1480,6 +1483,10 @@ function closeCamera() {
 function scanVideoFrame() {
   const video = videoRef.value;
   if (!showCameraModal.value || !video) return;
+  if (!qrDecoder) {
+    cameraAnimation = window.requestAnimationFrame(scanVideoFrame);
+    return;
+  }
 
   if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
     const canvas = document.createElement("canvas");
@@ -1489,7 +1496,7 @@ function scanVideoFrame() {
     if (context) {
       context.drawImage(video, 0, 0, canvas.width, canvas.height);
       const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
-      const result = jsQR(imageData.data, canvas.width, canvas.height, {
+      const result = qrDecoder(imageData.data, canvas.width, canvas.height, {
         inversionAttempts: "dontInvert",
       });
       if (result?.data) {
@@ -1565,7 +1572,25 @@ function loadImageElementFromFile(file) {
   });
 }
 
+async function ensureQrDecoder() {
+  if (qrDecoder) {
+    return qrDecoder;
+  }
+  if (!qrDecoderPromise) {
+    qrDecoderPromise = import("jsqr")
+      .then((module) => {
+        qrDecoder = module.default;
+        return qrDecoder;
+      })
+      .finally(() => {
+        qrDecoderPromise = null;
+      });
+  }
+  return qrDecoderPromise;
+}
+
 async function decodeQrFromImageSource(source) {
+  const decode = await ensureQrDecoder();
   const image = await loadImageElementFromFile(source);
   const canvas = document.createElement("canvas");
   canvas.width = image.naturalWidth || image.width;
@@ -1576,7 +1601,7 @@ async function decodeQrFromImageSource(source) {
   }
   context.drawImage(image, 0, 0, canvas.width, canvas.height);
   const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
-  const result = jsQR(imageData.data, canvas.width, canvas.height, {
+  const result = decode(imageData.data, canvas.width, canvas.height, {
     inversionAttempts: "attemptBoth",
   });
   if (!result?.data) {
