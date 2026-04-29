@@ -73,7 +73,7 @@ jobs:
           key: ${{ secrets.SERVER_SSH_KEY }}
           port: ${{ secrets.SERVER_PORT }}
           timeout: 5m
-          source: "docker-compose.yml,.dockerignore"
+          source: "docker-compose.yml,.dockerignore,backend/global_config.yml"
           target: ${{ env.APP_DIR }}
 
       - name: Deploy on server
