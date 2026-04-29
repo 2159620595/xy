@@ -79,6 +79,7 @@ ORDER_PAY_URL = 'http://111.230.160.82/v2/order/info/payApiOrder'
 BATCH_VIP_PRICE_LIST_URL = 'http://bkbf.xn--vhqr42drhf5k7b.com/pc/vip_price/list'
 REMOTE_TIMEOUT_SECONDS = 20
 REMOTE_SUPPLEMENTAL_TIMEOUT_SECONDS = 8
+PUBLIC_VIP_PLANS_CACHE_TTL_SECONDS = max(30, int(os.environ.get('PUBLIC_VIP_PLANS_CACHE_TTL_SECONDS', '180')))
 ANDROID_MODELS = ['22041211AC', 'SM-G9910', 'KB2000', 'V2049A', 'M2102K1C']
 PUBLIC_WEB_APP_ID = '4150439554430627'
 PUBLIC_WEB_APP_VERSION = '1.1.9'
@@ -90,6 +91,8 @@ PUBLIC_WEB_AUTH_IV = b'WonrnVkxeIxDcFbv'
 
 ACCOUNT_ID_PATTERN = re.compile(r'(\d+)$')
 _JUDIAN_SCHEMA_READY = False
+_PUBLIC_VIP_PLANS_CACHE: list[dict[str, Any]] = []
+_PUBLIC_VIP_PLANS_CACHE_AT = 0.0
 
 
 class JudianRemoteError(RuntimeError):
@@ -775,6 +778,25 @@ def remote_get_fund(session: requests.Session, *, timeout: int | float = REMOTE_
 
 
 def remote_get_public_vip_plans(*, timeout: int | float = REMOTE_SUPPLEMENTAL_TIMEOUT_SECONDS) -> list[dict[str, Any]]:
+    def normalize_plans(value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            raise JudianRemoteError('聚点套餐列表响应结构异常')
+        return [item for item in value if isinstance(item, dict)]
+
+    def update_cache(plans: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        global _PUBLIC_VIP_PLANS_CACHE, _PUBLIC_VIP_PLANS_CACHE_AT
+        _PUBLIC_VIP_PLANS_CACHE = list(plans)
+        _PUBLIC_VIP_PLANS_CACHE_AT = time.time()
+        return list(_PUBLIC_VIP_PLANS_CACHE)
+
+    def get_cached_plans(*, allow_stale: bool = False) -> list[dict[str, Any]]:
+        if not _PUBLIC_VIP_PLANS_CACHE:
+            return []
+        age_seconds = max(0.0, time.time() - _PUBLIC_VIP_PLANS_CACHE_AT)
+        if allow_stale or age_seconds <= PUBLIC_VIP_PLANS_CACHE_TTL_SECONDS:
+            return list(_PUBLIC_VIP_PLANS_CACHE)
+        return []
+
     script_root = get_batch_script_root()
     script_path = os.path.join(script_root, 'test-vip.js')
     if os.path.isfile(script_path):
@@ -793,15 +815,18 @@ def remote_get_public_vip_plans(*, timeout: int | float = REMOTE_SUPPLEMENTAL_TI
             if completed.returncode == 0:
                 plans = result_payload.get('data')
                 if isinstance(plans, list):
-                    return [item for item in plans if isinstance(item, dict)]
+                    return update_cache(normalize_plans(plans))
                 message = pick_text(
                     result_payload.get('msg'),
                     result_payload.get('message'),
                     str(completed.stderr or '').strip(),
                 )
                 raise JudianRemoteError(message or '批量下单脚本未返回可用套餐列表')
-        except Exception:
-            pass
+        except Exception as exc:
+            cached_plans = get_cached_plans()
+            if cached_plans:
+                logger.warning('remote_get_public_vip_plans use cached plans after script failure: %s', exc)
+                return cached_plans
 
     session = requests.Session()
     session.headers.update(build_public_web_headers())
@@ -812,6 +837,10 @@ def remote_get_public_vip_plans(*, timeout: int | float = REMOTE_SUPPLEMENTAL_TI
         )
         response.raise_for_status()
     except requests.RequestException as exc:
+        cached_plans = get_cached_plans(allow_stale=True)
+        if cached_plans:
+            logger.warning('remote_get_public_vip_plans use cached plans after http failure: %s', exc)
+            return cached_plans
         raise JudianRemoteError(f'聚点套餐列表获取失败：{exc}') from exc
 
     try:
@@ -824,15 +853,21 @@ def remote_get_public_vip_plans(*, timeout: int | float = REMOTE_SUPPLEMENTAL_TI
         code = str(payload.get('code') or '').strip()
         if code and code not in {'200', '20000'}:
             message = pick_text(payload.get('msg'), payload.get('message'))
+            cached_plans = get_cached_plans(allow_stale=True)
+            if cached_plans:
+                logger.warning(
+                    'remote_get_public_vip_plans use cached plans after remote code=%s message=%s',
+                    code,
+                    message,
+                )
+                return cached_plans
             raise JudianRemoteError(message or f'聚点套餐列表请求失败，code={code}')
 
     if isinstance(payload, dict):
         plans = payload.get('data')
     else:
         plans = payload
-    if not isinstance(plans, list):
-        raise JudianRemoteError('聚点套餐列表响应结构异常')
-    return [item for item in plans if isinstance(item, dict)]
+    return update_cache(normalize_plans(plans))
 
 
 def extract_public_vip_plan_diamond_cost(plan: dict[str, Any]) -> int:
