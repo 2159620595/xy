@@ -1,32 +1,41 @@
 <template>
-  <n-space vertical size="large" style="padding: 24px">
-    <n-card :bordered="false" class="judian-hero-card">
+  <section class="judian-page-layout">
+    <el-card shadow="never" class="judian-hero-card">
       <div class="judian-hero-card__content">
         <div class="judian-hero-card__main">
           <div class="judian-hero-card__eyebrow">聚点联盟</div>
           <div class="judian-hero-card__title-row">
             <h2>{{ title }}</h2>
-            <n-tag type="primary" size="small" round :bordered="false">前端演示版</n-tag>
+            <el-tag round type="primary">Element Plus 版</el-tag>
           </div>
           <p>{{ description }}</p>
-          <div v-if="lastUpdatedText" class="judian-hero-card__meta">最后更新：{{ lastUpdatedText }}</div>
+          <div v-if="lastUpdatedText" class="judian-hero-card__meta">
+            最后更新：{{ lastUpdatedText }}
+          </div>
         </div>
         <div v-if="$slots.actions" class="judian-hero-card__actions">
           <slot name="actions" />
         </div>
       </div>
-    </n-card>
+    </el-card>
 
     <div v-if="stats.length" class="judian-stats-grid">
-      <n-card v-for="item in stats" :key="item.label" size="small" class="judian-stat-card">
+      <el-card
+        v-for="item in stats"
+        :key="item.label"
+        shadow="never"
+        class="judian-stat-card"
+      >
         <div class="judian-stat-card__label">{{ item.label }}</div>
         <div class="judian-stat-card__value">{{ item.value }}</div>
         <div class="judian-stat-card__help">{{ item.help }}</div>
-      </n-card>
+      </el-card>
     </div>
 
-    <slot />
-  </n-space>
+    <div class="judian-page-layout__content">
+      <slot />
+    </div>
+  </section>
 </template>
 
 <script setup>
@@ -51,9 +60,21 @@ defineProps({
 </script>
 
 <style scoped>
+.judian-page-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  padding: 24px;
+}
+
 .judian-hero-card {
   background: linear-gradient(135deg, #f8fbff 0%, #f3f6fb 55%, #eef4ff 100%);
   border: 1px solid #e5edf9;
+}
+
+.judian-hero-card :deep(.el-card__body),
+.judian-stat-card :deep(.el-card__body) {
+  padding: 20px;
 }
 
 .judian-hero-card__content {
@@ -117,6 +138,12 @@ defineProps({
 
 .judian-stat-card {
   border: 1px solid #eef2f7;
+}
+
+.judian-page-layout__content {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
 }
 
 .judian-stat-card__label {

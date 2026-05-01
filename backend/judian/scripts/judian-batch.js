@@ -142,10 +142,10 @@ function printHelp() {
   console.log(
     `
 用法:
-  node test-vip.js           启动全自动一条龙服务 (登录 -> 默认套餐 -> 输数量 -> 自动支付)
-  node test-vip.js <action> --host <https://example.com> [options]
-  node test-vip.js --account <name> --password <pwd> [--pretty]
-  node test-vip.js <account> <password> [--pretty]
+  node judian-batch.js           启动全自动一条龙服务 (登录 -> 默认套餐 -> 输数量 -> 自动支付)
+  node judian-batch.js <action> --host <https://example.com> [options]
+  node judian-batch.js --account <name> --password <pwd> [--pretty]
+  node judian-batch.js <account> <password> [--pretty]
 
 动作:
   onepath                   全自动一条龙服务 (默认动作，自动选默认套餐)
@@ -240,21 +240,21 @@ raw 参数:
   --json <json>
 
 示例:
-  node test-vip.js
-  node test-vip.js menu
-  node test-vip.js smoke --pretty
-  node test-vip.js smoke --account demo@qq.com --password 123456 --pretty
-  node test-vip.js --account demo@qq.com --password 123456 --pretty
-  node test-vip.js demo@qq.com 123456 --pretty
-  node test-vip.js list --host https://your-host --pretty
-  node test-vip.js record --host https://your-host --token YOUR_TOKEN --page 1 --limit 10 --pretty
-  node test-vip.js buy --host https://your-host --token YOUR_TOKEN --vip-id 12 --v-id 1001 --player line1 --part 1 --confirm-buy --unlock-timeout-ms 20000 --pretty
-  node test-vip.js buy --host https://your-host --token YOUR_TOKEN --vip-id 12 --v-id 1001 --player line1 --part 1 --confirm-buy --single-buy --count 30 --batch-output vip-orders.json --pretty
-  node test-vip.js batch --host https://your-host --token YOUR_TOKEN --vip-id 12 --confirm-buy --pretty
-  node test-vip.js autopay --account demo@qq.com --password 123456 --scan-url http://64.120.95.181:2026/pc/order/scan/xxxx?jdTokenNo=xxxx --pretty
-  node test-vip.js autopay --account demo@qq.com --password 123456 --batch-file vip-orders.json --batch-output vip-autopay.json --pretty
-  node test-vip.js status --host https://your-host --token YOUR_TOKEN --order-no 20260424223908647882111760 --pretty
-  node test-vip.js login --host https://your-host --type password --account demo --password 123456 --pretty
+  node judian-batch.js
+  node judian-batch.js menu
+  node judian-batch.js smoke --pretty
+  node judian-batch.js smoke --account demo@qq.com --password 123456 --pretty
+  node judian-batch.js --account demo@qq.com --password 123456 --pretty
+  node judian-batch.js demo@qq.com 123456 --pretty
+  node judian-batch.js list --host https://your-host --pretty
+  node judian-batch.js record --host https://your-host --token YOUR_TOKEN --page 1 --limit 10 --pretty
+  node judian-batch.js buy --host https://your-host --token YOUR_TOKEN --vip-id 12 --v-id 1001 --player line1 --part 1 --confirm-buy --unlock-timeout-ms 20000 --pretty
+  node judian-batch.js buy --host https://your-host --token YOUR_TOKEN --vip-id 12 --v-id 1001 --player line1 --part 1 --confirm-buy --single-buy --count 30 --batch-output vip-orders.json --pretty
+  node judian-batch.js batch --host https://your-host --token YOUR_TOKEN --vip-id 12 --confirm-buy --pretty
+  node judian-batch.js autopay --account demo@qq.com --password 123456 --scan-url http://64.120.95.181:2026/pc/order/scan/xxxx?jdTokenNo=xxxx --pretty
+  node judian-batch.js autopay --account demo@qq.com --password 123456 --batch-file vip-orders.json --batch-output vip-autopay.json --pretty
+  node judian-batch.js status --host https://your-host --token YOUR_TOKEN --order-no 20260424223908647882111760 --pretty
+  node judian-batch.js login --host https://your-host --type password --account demo --password 123456 --pretty
 `,
   );
 }
@@ -4149,6 +4149,6 @@ async function run() {
 }
 
 run().catch((error) => {
-  console.error("[test-vip] 失败:", error.message);
+  console.error("[judian-batch] 失败:", error.message);
   process.exitCode = 1;
 });

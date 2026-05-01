@@ -1,95 +1,174 @@
 <template>
-  <n-space vertical size="large" style="padding: 24px">
-    <!-- 生成卡密 -->
-    <n-card title="批量生成卡密">
-      <n-form :model="form" label-placement="left" label-width="80px">
-        <n-grid :cols="5" :x-gap="16">
-          <n-form-item-gi label="绑定账户">
-            <n-select
-              v-model:value="form.accountId"
-              :options="accountOptions"
-              placeholder="选择网盘账号"
-              style="min-width: 180px"
-            />
-          </n-form-item-gi>
-          <n-form-item-gi label="授权天数">
-            <n-input-number v-model:value="form.days" :min="1" :max="3650" />
-          </n-form-item-gi>
-          <n-form-item-gi label="生成数量">
-            <n-input-number v-model:value="form.count" :min="1" :max="100" />
-          </n-form-item-gi>
-          <n-form-item-gi label="授权次数">
-            <n-input-number v-model:value="form.maxUses" :min="0" placeholder="0=不限" />
-          </n-form-item-gi>
-          <n-form-item-gi>
-            <n-button
+  <section class="netdisk-cdkeys">
+    <el-card shadow="never">
+      <template #header>批量生成卡密</template>
+      <el-form label-position="top" class="netdisk-cdkeys__form">
+        <el-row :gutter="16">
+          <el-col :xs="24" :md="8" :lg="6">
+            <el-form-item label="绑定账户">
+              <el-select v-model="form.accountId" placeholder="选择网盘账号">
+                <el-option
+                  v-for="item in accountOptions"
+                  :key="item.value"
+                  :label="item.label"
+                  :value="item.value"
+                  :disabled="item.disabled"
+                />
+              </el-select>
+            </el-form-item>
+          </el-col>
+          <el-col :xs="12" :md="4">
+            <el-form-item label="授权天数">
+              <el-input-number v-model="form.days" :min="1" :max="3650" />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="12" :md="4">
+            <el-form-item label="生成数量">
+              <el-input-number v-model="form.count" :min="1" :max="100" />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="12" :md="4">
+            <el-form-item label="授权次数">
+              <el-input-number v-model="form.maxUses" :min="0" />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="12" :md="4" class="netdisk-cdkeys__submit-col">
+            <el-button
               type="primary"
               :loading="generating"
               :disabled="!form.accountId"
               @click="handleGenerate"
             >
               立即生成
-            </n-button>
-          </n-form-item-gi>
-        </n-grid>
-      </n-form>
+            </el-button>
+          </el-col>
+        </el-row>
+      </el-form>
 
-      <!-- 兑换地址说明 -->
-      <n-alert type="info" style="margin-top: 12px" :show-icon="false">
-        <span style="font-size: 13px">
-          兑换接口地址：
-          <n-tag size="small" style="font-family: monospace; margin: 0 4px">
-            GET {{ currentOrigin }}/netdisk/redeem?code=卡密串码
-          </n-tag>
-          返回对应账号的 Cookie 及授权天数
-        </span>
-      </n-alert>
-    </n-card>
+      <el-alert type="info" :closable="false" style="margin-top: 12px">
+        <template #default>
+          <span style="font-size: 13px">
+            兑换接口地址：
+            <el-tag size="small" style="font-family: monospace; margin: 0 4px">
+              GET {{ currentOrigin }}/netdisk/redeem?code=卡密串码
+            </el-tag>
+            返回对应账号的 Cookie 及授权天数
+          </span>
+        </template>
+      </el-alert>
+    </el-card>
 
-    <!-- 卡密列表 -->
-    <n-card title="卡密库存管理">
-      <template #header-extra>
-        <n-space>
-          <n-select
-            v-model:value="filterAccount"
-            :options="filterAccountOptions"
-            placeholder="筛选网盘账号"
-            style="width: 180px"
-            clearable
-          />
-          <n-select
-            v-model:value="filterStatus"
-            :options="statusOptions"
-            placeholder="筛选状态"
-            style="width: 120px"
-            clearable
-          />
-          <n-button @click="loadKeys" secondary>刷新列表</n-button>
-          <n-popconfirm @positive-click="handleCleanExpired">
-            <template #trigger>
-              <n-button type="warning" secondary>清理过期/作废卡密</n-button>
-            </template>
-            确认要清理并彻底删除所有已经过期或作废的卡密吗？操作不可逆。
-          </n-popconfirm>
-        </n-space>
+    <el-card shadow="never">
+      <template #header>
+        <div class="netdisk-cdkeys__header">
+          <span>卡密库存管理</span>
+          <el-space wrap>
+            <el-select
+              v-model="filterAccount"
+              placeholder="筛选网盘账号"
+              clearable
+              style="width: 180px"
+            >
+              <el-option
+                v-for="item in filterAccountOptions"
+                :key="item.value"
+                :label="item.label"
+                :value="item.value"
+              />
+            </el-select>
+            <el-select
+              v-model="filterStatus"
+              placeholder="筛选状态"
+              clearable
+              style="width: 120px"
+            >
+              <el-option
+                v-for="item in statusOptions"
+                :key="item.value"
+                :label="item.label"
+                :value="item.value"
+              />
+            </el-select>
+            <el-button @click="loadKeys">刷新列表</el-button>
+            <el-button type="warning" plain @click="confirmCleanExpired">
+              清理过期/作废卡密
+            </el-button>
+          </el-space>
+        </div>
       </template>
 
-      <n-data-table
-        :columns="columns"
-        :data="filteredAndSortedTableData"
-        :loading="loading"
-        :pagination="{ pageSize: 15 }"
-      />
-    </n-card>
-  </n-space>
+      <el-table :data="filteredAndSortedTableData" stripe v-loading="loading">
+        <el-table-column label="卡密串码" min-width="180">
+          <template #default="{ row }">
+            <span class="netdisk-cdkeys__code">{{ row.key_code }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="绑定账号" min-width="160">
+          <template #default="{ row }">
+            {{ resolveAccountName(row.account_id) }}
+          </template>
+        </el-table-column>
+        <el-table-column label="授权天数" width="120">
+          <template #default="{ row }">{{ row.duration }} 天</template>
+        </el-table-column>
+        <el-table-column label="授权次数" width="140">
+          <template #default="{ row }">
+            {{ row.use_count || 0 }} / {{ row.max_uses > 0 ? row.max_uses : '不限' }}
+          </template>
+        </el-table-column>
+        <el-table-column label="状态" width="100">
+          <template #default="{ row }">
+            <el-tag :type="resolveStatusType(row.status)">
+              {{ statusMap[row.status]?.label || '未知' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" min-width="240" fixed="right">
+          <template #default="{ row }">
+            <el-space wrap>
+              <el-button size="small" text type="primary" @click="copyCode(row.key_code)">
+                复制
+              </el-button>
+              <el-button
+                size="small"
+                text
+                type="primary"
+                :disabled="row.status === 2"
+                @click="copyRedeemUrl(row.key_code)"
+              >
+                兑换链接
+              </el-button>
+              <el-button
+                size="small"
+                text
+                type="success"
+                :disabled="row.status === 2"
+                @click="openRedeemUrl(row.key_code)"
+              >
+                打开页面
+              </el-button>
+              <el-button
+                size="small"
+                text
+                type="danger"
+                :disabled="row.status === 2"
+                @click="confirmVoid(row)"
+              >
+                作废
+              </el-button>
+            </el-space>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-card>
+  </section>
 </template>
 
 <script setup>
-import { ref, h, computed, onMounted } from 'vue'
-import { NTag, NButton, NSpace, NPopconfirm, useMessage } from 'naive-ui'
+import { ref, computed, onMounted } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { baiduApi } from '@/api/baidu'
 
-const message = useMessage()
 const loading = ref(false)
 const generating = ref(false)
 const tableData = ref([])
@@ -155,115 +234,8 @@ const filteredAndSortedTableData = computed(() => {
 const statusMap = {
   0: { label: '未使用', type: 'success' },
   1: { label: '已授权', type: 'warning' },
-  2: { label: '已作废', type: 'error' },
+  2: { label: '已作废', type: 'danger' },
 }
-
-// ── 表格列 ──────────────────────────────────────────────────
-const columns = [
-  {
-    title: '卡密串码',
-    key: 'key_code',
-    align: 'center',
-    render: (r) => h('span', { style: 'font-family:monospace' }, r.key_code),
-  },
-  {
-    title: '绑定账号',
-    key: 'account_id',
-    align: 'center',
-    render: (r) => {
-      const acc = accounts.value.find((a) => a.id === r.account_id)
-      return acc ? acc.username : '—'
-    },
-  },
-  { title: '授权天数', key: 'duration', align: 'center', render: (r) => `${r.duration} 天` },
-  {
-    title: '授权次数',
-    key: 'usage',
-    align: 'center',
-    render: (r) => {
-      const max = r.max_uses > 0 ? r.max_uses : '不限'
-      const cur = r.use_count || 0
-      return `${cur} / ${max}`
-    }
-  },
-  {
-    title: '状态',
-    key: 'status',
-    align: 'center',
-    render: (r) => {
-      const s = statusMap[r.status] || { label: '未知', type: 'default' }
-      return h(NTag, { type: s.type, bordered: false, size: 'small' }, { default: () => s.label })
-    },
-  },
-  {
-    title: '操作',
-    key: 'actions',
-    align: 'center',
-    render: (r) =>
-      h(
-        NSpace,
-        { justify: 'center' },
-        {
-          default: () => [
-            // 复制卡密
-            h(
-              NButton,
-              {
-                size: 'small',
-                quaternary: true,
-                type: 'info',
-                onClick: () => copyCode(r.key_code),
-              },
-              { default: () => '复制' },
-            ),
-            // 复制兑换链接
-            h(
-              NButton,
-              {
-                size: 'small',
-                quaternary: true,
-                type: 'primary',
-                disabled: r.status === 2,
-                onClick: () => copyRedeemUrl(r.key_code),
-              },
-              { default: () => '兑换链接' },
-            ),
-            // 跳转按钮
-            h(
-              NButton,
-              {
-                size: 'small',
-                quaternary: true,
-                type: 'success',
-                disabled: r.status === 2,
-                onClick: () => window.open(resolveRedeemUrl(r.key_code), '_blank'),
-              },
-              { default: () => '打开页面' },
-            ),
-            // 作废（带确认）
-            h(
-              NPopconfirm,
-              { onPositiveClick: () => handleVoid(r) },
-              {
-                trigger: () =>
-                  h(
-                    NButton,
-                    {
-                      size: 'small',
-                      quaternary: true,
-                      type: 'error',
-                      disabled: r.status === 2,
-                    },
-                    { default: () => '作废' },
-                  ),
-                default: () => '确认作废该卡密？操作不可撤销',
-              },
-            ),
-          ],
-        },
-      ),
-  },
-]
 
 // ── 方法 ───────────────────────────────────────────────────
 const loadAccounts = async () => {
@@ -271,20 +243,28 @@ const loadAccounts = async () => {
   accounts.value = res.data || []
 }
 
+const resolveAccountName = (accountId) => {
+  const acc = accounts.value.find((item) => item.id === accountId)
+  return acc ? acc.username : '—'
+}
+
+const resolveStatusType = (status) =>
+  statusMap[status]?.type === 'danger' ? 'danger' : statusMap[status]?.type || 'info'
+
 const loadKeys = async () => {
   loading.value = true
   try {
     const res = await baiduApi.getCdKeys()
     tableData.value = res.data || []
   } catch {
-    message.error('获取卡密列表失败')
+    ElMessage.error('获取卡密列表失败')
   } finally {
     loading.value = false
   }
 }
 
 const handleGenerate = async () => {
-  if (!form.value.accountId) return message.warning('请先选择绑定账户')
+  if (!form.value.accountId) return ElMessage.warning('请先选择绑定账户')
   generating.value = true
   try {
     await baiduApi.generateCdKeys(
@@ -293,10 +273,10 @@ const handleGenerate = async () => {
       form.value.days,
       form.value.maxUses,
     )
-    message.success(`成功生成 ${form.value.count} 张卡密`)
+    ElMessage.success(`成功生成 ${form.value.count} 张卡密`)
     loadKeys()
   } catch {
-    message.error('生成失败，请重试')
+    ElMessage.error('生成失败，请重试')
   } finally {
     generating.value = false
   }
@@ -305,10 +285,21 @@ const handleGenerate = async () => {
 const handleVoid = async (row) => {
   try {
     await baiduApi.deleteCdKey(row.id)
-    message.success('卡密已作废')
+    ElMessage.success('卡密已作废')
     loadKeys()
   } catch {
-    message.error('操作失败')
+    ElMessage.error('操作失败')
+  }
+}
+
+const confirmVoid = async (row) => {
+  try {
+    await ElMessageBox.confirm('确认作废该卡密？操作不可撤销。', '作废确认', {
+      type: 'warning',
+    })
+    await handleVoid(row)
+  } catch {
+    // User cancelled.
   }
 }
 
@@ -319,9 +310,9 @@ const copyCode = async (code) => {
     } else {
       fallbackCopy(code)
     }
-    message.success('卡密已复制')
+    ElMessage.success('卡密已复制')
   } catch (err) {
-    message.error('复制失败，请手动复制')
+    ElMessage.error('复制失败，请手动复制')
   }
 }
 
@@ -333,10 +324,14 @@ const copyRedeemUrl = async (code) => {
     } else {
       fallbackCopy(url)
     }
-    message.success('兑换链接已复制')
+    ElMessage.success('兑换链接已复制')
   } catch (err) {
-    message.error('复制失败，请手动复制')
+    ElMessage.error('复制失败，请手动复制')
   }
+}
+
+const openRedeemUrl = (code) => {
+  window.open(resolveRedeemUrl(code), '_blank', 'noopener')
 }
 
 const fallbackCopy = (text) => {
@@ -359,10 +354,23 @@ const fallbackCopy = (text) => {
 const handleCleanExpired = async () => {
   try {
     const res = await baiduApi.cleanExpiredKeys()
-    message.success(res.data.msg || '清理成功')
+    ElMessage.success(res.data.msg || '清理成功')
     loadKeys()
   } catch (e) {
-    message.error('清理失败')
+    ElMessage.error('清理失败')
+  }
+}
+
+const confirmCleanExpired = async () => {
+  try {
+    await ElMessageBox.confirm(
+      '确认要清理并彻底删除所有已经过期或作废的卡密吗？操作不可逆。',
+      '清理确认',
+      { type: 'warning' },
+    )
+    await handleCleanExpired()
+  } catch {
+    // User cancelled.
   }
 }
 
@@ -371,3 +379,40 @@ onMounted(() => {
   loadKeys()
 })
 </script>
+
+<style scoped>
+.netdisk-cdkeys {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  padding: 24px;
+}
+
+.netdisk-cdkeys__form :deep(.el-input-number),
+.netdisk-cdkeys__form :deep(.el-select) {
+  width: 100%;
+}
+
+.netdisk-cdkeys__submit-col {
+  display: flex;
+  align-items: flex-end;
+}
+
+.netdisk-cdkeys__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.netdisk-cdkeys__code {
+  font-family: monospace;
+}
+
+@media (max-width: 960px) {
+  .netdisk-cdkeys__header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}
+</style>

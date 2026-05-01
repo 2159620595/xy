@@ -1,5 +1,6 @@
 import { buildApiUrl, del, get, post } from '@/utils/request'
 import type { AdminStats, ApiResponse, User } from '@/types'
+import { getMainToken } from '@/utils/session'
 
 interface BackendUser {
   id: number
@@ -248,7 +249,7 @@ export const getLogFiles = async (): Promise<{
 }
 
 export const exportLogs = async (): Promise<{ blob: Blob; filename: string }> => {
-  const token = localStorage.getItem('auth_token')
+  const token = getMainToken()
   if (!token) {
     throw new Error('未登录')
   }

@@ -1,46 +1,44 @@
 <template>
-  <n-space vertical size="large">
-    <n-grid :x-gap="12" :y-gap="12" :cols="4" item-responsive>
-      <n-gi v-for="item in statistics" :key="item.title">
-        <n-card size="small" :bordered="false">
-          <n-statistic :label="item.title">
-            <template #prefix>
-              <n-icon :component="item.icon" :color="item.color" />
-            </template>
-            <span class="text-2xl font-bold">
-              <n-number-animation :from="0" :to="item.value" :duration="800" />
-            </span>
-          </n-statistic>
-          <div class="mt-2 text-xs">
-            <n-text depth="3">{{ item.sub }}</n-text>
-          </div>
-        </n-card>
-      </n-gi>
-    </n-grid>
+  <section class="netdisk-dashboard">
+    <div class="netdisk-dashboard__metrics">
+      <el-card
+        v-for="item in statistics"
+        :key="item.title"
+        shadow="never"
+        class="netdisk-dashboard__metric-card"
+      >
+        <div class="netdisk-dashboard__metric-top">
+          <el-icon :style="{ color: item.color }">
+            <component :is="item.icon" />
+          </el-icon>
+          <span class="netdisk-dashboard__metric-label">{{ item.title }}</span>
+        </div>
+        <div class="netdisk-dashboard__metric-value">{{ item.value }}</div>
+        <div class="netdisk-dashboard__metric-help">{{ item.sub }}</div>
+      </el-card>
+    </div>
 
-    <n-grid :x-gap="12" :cols="2">
-      <n-gi>
-        <n-card title="账号状态分布" :bordered="false">
-          <div ref="pieRef" style="height: 260px" />
-        </n-card>
-      </n-gi>
-      <n-gi>
-        <n-card title="卡密状态分布" :bordered="false">
-          <div ref="barRef" style="height: 260px" />
-        </n-card>
-      </n-gi>
-    </n-grid>
-  </n-space>
+    <div class="netdisk-dashboard__charts">
+      <el-card shadow="never">
+        <template #header>账号状态分布</template>
+        <div ref="pieRef" style="height: 260px" />
+      </el-card>
+      <el-card shadow="never">
+        <template #header>卡密状态分布</template>
+        <div ref="barRef" style="height: 260px" />
+      </el-card>
+    </div>
+  </section>
 </template>
 
 <script setup>
 import { ref, onMounted, nextTick } from 'vue'
 import {
-  CloudServerOutlined,
-  KeyOutlined,
-  SafetyCertificateOutlined,
-  AlertOutlined,
-} from '@vicons/antd'
+  Warning,
+  Key,
+  CircleCheck,
+  User,
+} from '@element-plus/icons-vue'
 import { baiduApi } from '@/api/baidu'
 import * as echarts from 'echarts/core'
 import { PieChart, BarChart } from 'echarts/charts'
@@ -57,22 +55,22 @@ const statistics = ref([
     title: '在线账号',
     value: 0,
     sub: '状态正常的网盘账号',
-    icon: CloudServerOutlined,
+    icon: User,
     color: '#18a058',
   },
-  { title: '失效账号', value: 0, sub: '需要重新登录的账号', icon: AlertOutlined, color: '#d03050' },
+  { title: '失效账号', value: 0, sub: '需要重新登录的账号', icon: Warning, color: '#d03050' },
   {
     title: '未使用卡密',
     value: 0,
     sub: '可用于兑换的卡密数量',
-    icon: KeyOutlined,
+    icon: Key,
     color: '#2080f0',
   },
   {
     title: '已使用卡密',
     value: 0,
     sub: '已被用户兑换的卡密',
-    icon: SafetyCertificateOutlined,
+    icon: CircleCheck,
     color: '#f0a020',
   },
 ])
@@ -165,3 +163,69 @@ function renderBar(unused, used, voided) {
   })
 }
 </script>
+
+<style scoped>
+.netdisk-dashboard {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.netdisk-dashboard__metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.netdisk-dashboard__metric-card :deep(.el-card__body) {
+  min-height: 118px;
+}
+
+.netdisk-dashboard__metric-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  color: #475569;
+}
+
+.netdisk-dashboard__metric-label {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.netdisk-dashboard__metric-value {
+  font-size: 28px;
+  line-height: 1.2;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.netdisk-dashboard__metric-help {
+  margin-top: 8px;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.netdisk-dashboard__charts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+@media (max-width: 1080px) {
+  .netdisk-dashboard__metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .netdisk-dashboard__charts {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .netdisk-dashboard__metrics {
+    grid-template-columns: 1fr;
+  }
+}
+</style>

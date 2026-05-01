@@ -1,22 +1,16 @@
 import axios, { type AxiosInstance } from "axios";
 import { NETDISK_API_BASE_URL } from "@/utils/request";
 import { DEFAULT_REQUEST_TIMEOUT_MS } from "@/utils/http-timeout";
+import {
+  clearAllSessionStorage,
+  getMainUser,
+} from "@/utils/session";
 
 const SESSION_REUSE_WINDOW_MS = 2 * 60 * 1000;
 const NETDISK_API_BASE = NETDISK_API_BASE_URL;
 
 let bootstrapPromise: Promise<boolean> | null = null;
 let trustedAt = 0;
-
-const readMainUser = () => {
-  const raw = localStorage.getItem("user_info");
-  if (!raw) return null;
-  try {
-    return JSON.parse(raw) as { username?: string; role?: string };
-  } catch {
-    return null;
-  }
-};
 
 const redirectToLogin = () => {
   if (
@@ -35,7 +29,7 @@ export const ensureNetdiskSession = async (force = false) => {
   if (bootstrapPromise) return bootstrapPromise;
 
   bootstrapPromise = (async () => {
-    const mainUser = readMainUser();
+    const mainUser = getMainUser<{ username?: string; role?: string }>();
     if (!mainUser?.username) return false;
 
     try {
@@ -57,8 +51,7 @@ export const ensureNetdiskSession = async (force = false) => {
       return false;
     } catch (error: any) {
       if (error?.response?.status === 401) {
-        localStorage.removeItem("auth_token");
-        localStorage.removeItem("user_info");
+        clearAllSessionStorage();
         redirectToLogin();
       }
       return false;

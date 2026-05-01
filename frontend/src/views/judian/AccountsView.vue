@@ -6,66 +6,161 @@
     :last-updated-text="lastUpdatedText"
   >
     <template #actions>
-      <n-space>
-        <n-button secondary :loading="loading" @click="loadAccounts">刷新列表</n-button>
-      </n-space>
+      <el-space>
+        <el-button :loading="loading" @click="loadAccounts">刷新列表</el-button>
+      </el-space>
     </template>
 
-    <n-card title="登录聚点账号" size="small">
-      <n-alert type="info" :show-icon="false" style="margin-bottom: 16px">
+    <el-card shadow="never">
+      <template #header>登录聚点账号</template>
+      <el-alert type="info" :closable="false" style="margin-bottom: 16px">
         当前已接入真实后端。提交邮箱和密码后，会按聚点安卓端协议登录远端，并同步会话 Token、UserSig 与钻石余额。
-      </n-alert>
+      </el-alert>
 
-      <n-form label-placement="top" :show-feedback="false">
-        <n-grid :cols="24" :x-gap="16">
-          <n-form-item-gi :span="9" label="登录邮箱">
-            <n-input v-model:value="form.loginEmail" placeholder="请输入聚点登录邮箱" @keyup.enter="submitLogin" />
-          </n-form-item-gi>
-          <n-form-item-gi :span="7" label="登录密码">
-            <n-input
-              v-model:value="form.loginPassword"
+      <el-form label-position="top">
+        <el-row :gutter="16">
+          <el-col :xs="24" :md="9">
+            <el-form-item label="登录邮箱">
+              <el-input v-model="form.loginEmail" placeholder="请输入聚点登录邮箱" @keyup.enter="submitLogin" />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :md="7">
+            <el-form-item label="登录密码">
+              <el-input
+                v-model="form.loginPassword"
               type="password"
-              show-password-on="click"
+                show-password
               placeholder="请输入登录密码"
               @keyup.enter="submitLogin"
             />
-          </n-form-item-gi>
-          <n-form-item-gi :span="4" label="显示名称">
-            <n-input v-model:value="form.displayName" placeholder="可选" />
-          </n-form-item-gi>
-          <n-form-item-gi :span="4" label="备注">
-            <n-input v-model:value="form.remark" placeholder="可选" />
-          </n-form-item-gi>
-        </n-grid>
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :md="4">
+            <el-form-item label="显示名称">
+              <el-input v-model="form.displayName" placeholder="可选" />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :md="4">
+            <el-form-item label="备注">
+              <el-input v-model="form.remark" placeholder="可选" />
+            </el-form-item>
+          </el-col>
+        </el-row>
 
-        <n-space justify="end">
-          <n-button @click="resetForm">清空</n-button>
-          <n-button type="primary" :loading="submitting" @click="submitLogin">账号密码登录</n-button>
-        </n-space>
-      </n-form>
-    </n-card>
+        <div class="form-actions">
+          <el-space>
+            <el-button @click="resetForm">清空</el-button>
+            <el-button type="primary" :loading="submitting" @click="submitLogin">账号密码登录</el-button>
+          </el-space>
+        </div>
+      </el-form>
+    </el-card>
 
-    <n-card title="账号池管理" size="small">
-      <n-data-table
-        :columns="columns"
-        :data="accounts"
-        :loading="loading"
-        :pagination="{ pageSize: 8 }"
-        :bordered="false"
-      />
-    </n-card>
+    <el-card shadow="never">
+      <template #header>账号池管理</template>
+      <el-table :data="accounts" stripe v-loading="loading">
+        <el-table-column prop="accountId" label="账号 ID" width="120" />
+        <el-table-column prop="displayName" label="显示名称" min-width="160" />
+        <el-table-column label="登录邮箱" min-width="220">
+          <template #default="{ row }">
+            {{ maskText(row.loginEmail, 3, 9) }}
+          </template>
+        </el-table-column>
+        <el-table-column label="钻石数量" width="120">
+          <template #default="{ row }">
+            <span class="diamond-value">{{ Number(row.diamondQuantity || 0) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="diamondQuantityUpdatedAt" label="钻石刷新" min-width="180" />
+        <el-table-column label="状态" width="100">
+          <template #default="{ row }">
+            <el-tag :type="resolveStatusType(row.status)">
+              {{ resolveStatusLabel(row.status) }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="lastLoginAt" label="最近登录" min-width="180" />
+        <el-table-column label="Session Token" min-width="220">
+          <template #default="{ row }">
+            {{ maskText(row.sessionToken, 6, 6) }}
+          </template>
+        </el-table-column>
+        <el-table-column label="UserSig" min-width="180">
+          <template #default="{ row }">
+            {{ maskText(row.userSig, 6, 6) }}
+          </template>
+        </el-table-column>
+        <el-table-column label="启用" width="90">
+          <template #default="{ row }">
+            <el-switch
+              :model-value="resolveEnabledDraft(row)"
+              :loading="Boolean(row._enabledSaving)"
+              @update:model-value="updateEnabledDraft(row, $event)"
+            />
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" min-width="360" fixed="right">
+          <template #default="{ row }">
+            <el-space wrap>
+              <el-tag
+                v-if="hasEnabledDraftChanged(row)"
+                type="warning"
+                effect="plain"
+              >
+                待保存
+              </el-tag>
+              <el-button
+                size="small"
+                type="primary"
+                plain
+                :disabled="!hasEnabledDraftChanged(row)"
+                :loading="Boolean(row._enabledSaving)"
+                @click="saveEnabledDraft(row)"
+              >
+                保存启用
+              </el-button>
+              <el-button
+                size="small"
+                :disabled="!hasEnabledDraftChanged(row) || Boolean(row._enabledSaving)"
+                @click="resetEnabledDraft(row)"
+              >
+                撤销
+              </el-button>
+              <el-button
+                size="small"
+                type="primary"
+                text
+                :loading="reloginId === row.id"
+                :disabled="Boolean(row._enabledSaving)"
+                @click="handleRelogin(row)"
+              >
+                账密登录
+              </el-button>
+              <el-button
+                size="small"
+                type="danger"
+                text
+                :disabled="Boolean(row._enabledSaving)"
+                @click="confirmDelete(row)"
+              >
+                删除
+              </el-button>
+            </el-space>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-card>
   </JudianPageLayout>
 </template>
 
 <script setup>
-import { computed, h, onMounted, reactive, ref } from 'vue'
-import { NButton, NPopconfirm, NSpace, NSwitch, NTag, useMessage } from 'naive-ui'
+import { computed, onMounted, reactive, ref } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 
 import { judianApi } from '@/api/judian'
 import JudianPageLayout from '@/components/judian/PageLayout.vue'
 import { getJudianSectionMeta } from '@/views/judian/shared/page-meta'
 
-const message = useMessage()
 const sectionMeta = getJudianSectionMeta('accounts')
 const loading = ref(false)
 const submitting = ref(false)
@@ -96,117 +191,13 @@ const stats = computed(() => {
   ]
 })
 
-const columns = [
-  { title: '账号 ID', key: 'accountId', width: 120 },
-  { title: '显示名称', key: 'displayName', width: 160 },
-  {
-    title: '登录邮箱',
-    key: 'loginEmail',
-    width: 220,
-    render: (row) => maskText(row.loginEmail, 3, 9),
-  },
-  {
-    title: '钻石数量',
-    key: 'diamondQuantity',
-    width: 120,
-    render: (row) => h('span', { style: 'font-weight: 600; color: #2563eb' }, Number(row.diamondQuantity || 0)),
-  },
-  { title: '钻石刷新', key: 'diamondQuantityUpdatedAt', width: 180 },
-  {
-    title: '状态',
-    key: 'status',
-    width: 100,
-    render: (row) => h(
-      NTag,
-      { type: statusMap[row.status]?.type || 'default', bordered: false, size: 'small' },
-      { default: () => statusMap[row.status]?.label || '未知' },
-    ),
-  },
-  { title: '最近登录', key: 'lastLoginAt', width: 180 },
-  {
-    title: 'Session Token',
-    key: 'sessionToken',
-    width: 220,
-    render: (row) => maskText(row.sessionToken, 6, 6),
-  },
-  {
-    title: 'UserSig',
-    key: 'userSig',
-    width: 180,
-    render: (row) => maskText(row.userSig, 6, 6),
-  },
-  {
-    title: '启用',
-    key: 'enabled',
-    width: 90,
-    render: (row) => h(NSwitch, {
-      value: resolveEnabledDraft(row),
-      disabled: Boolean(row._enabledSaving),
-      'onUpdate:value': (value) => updateEnabledDraft(row, value),
-    }),
-  },
-  {
-    title: '操作',
-    key: 'actions',
-    width: 420,
-    render: (row) => h(
-      NSpace,
-      { justify: 'center', size: 8, wrap: true },
-      {
-        default: () => [
-          hasEnabledDraftChanged(row)
-            ? h(NTag, { size: 'small', type: 'warning', bordered: false }, { default: () => '待保存' })
-            : null,
-          h(
-            NButton,
-            {
-              size: 'small',
-              type: 'primary',
-              secondary: true,
-              disabled: !hasEnabledDraftChanged(row),
-              loading: Boolean(row._enabledSaving),
-              onClick: () => saveEnabledDraft(row),
-            },
-            { default: () => '保存启用' },
-          ),
-          h(
-            NButton,
-            {
-              size: 'small',
-              disabled: !hasEnabledDraftChanged(row) || Boolean(row._enabledSaving),
-              onClick: () => resetEnabledDraft(row),
-            },
-            { default: () => '撤销' },
-          ),
-          h(
-            NButton,
-            {
-              size: 'small',
-              quaternary: true,
-              type: 'primary',
-              loading: reloginId.value === row.id,
-              disabled: Boolean(row._enabledSaving),
-              onClick: () => handleRelogin(row),
-            },
-            { default: () => '账密登录' },
-          ),
-          h(
-            NPopconfirm,
-            { onPositiveClick: () => handleDelete(row) },
-            {
-              trigger: () => h(
-                NButton,
-                { size: 'small', quaternary: true, type: 'error', disabled: Boolean(row._enabledSaving) },
-                { default: () => '删除' },
-              ),
-              default: () => `确认删除账号 ${row.displayName}？`,
-            },
-          ),
-        ].filter(Boolean),
-      },
-    ),
-  },
-]
+function resolveStatusLabel(status) {
+  return statusMap[status]?.label || '未知'
+}
+
+function resolveStatusType(status) {
+  return statusMap[status]?.type === 'default' ? 'info' : statusMap[status]?.type || 'info'
+}
 
 function looksLikeEmail(value) {
   return /^\S+@\S+\.\S+$/.test(String(value || '').trim())
@@ -260,7 +251,7 @@ async function loadAccounts(options = {}) {
     lastUpdatedText.value = rows[0]?.updatedAt || rows[0]?.lastLoginAt || '暂无数据'
   } catch (error) {
     if (!silent) {
-      message.error(extractErrorMessage(error))
+      ElMessage.error(extractErrorMessage(error))
     }
   } finally {
     loading.value = false
@@ -269,11 +260,11 @@ async function loadAccounts(options = {}) {
 
 async function submitLogin() {
   if (!looksLikeEmail(form.loginEmail)) {
-    message.warning('请输入正确的邮箱格式')
+    ElMessage.warning('请输入正确的邮箱格式')
     return
   }
   if (!String(form.loginPassword || '').trim()) {
-    message.warning('请输入登录密码')
+    ElMessage.warning('请输入登录密码')
     return
   }
 
@@ -287,9 +278,9 @@ async function submitLogin() {
     })
     await loadAccounts({ silent: true })
     resetForm()
-    message.success(data?.message || `已登录：${data?.item?.displayName || form.loginEmail}`)
+    ElMessage.success(data?.message || `已登录：${data?.item?.displayName || form.loginEmail}`)
   } catch (error) {
-    message.error(extractErrorMessage(error))
+    ElMessage.error(extractErrorMessage(error))
   } finally {
     submitting.value = false
   }
@@ -300,11 +291,22 @@ async function handleRelogin(row) {
   try {
     const { data } = await judianApi.reloginAccount(row.id)
     await loadAccounts({ silent: true })
-    message.success(data?.message || `${row.displayName} 已重新登录`)
+    ElMessage.success(data?.message || `${row.displayName} 已重新登录`)
   } catch (error) {
-    message.error(extractErrorMessage(error))
+    ElMessage.error(extractErrorMessage(error))
   } finally {
     reloginId.value = null
+  }
+}
+
+async function confirmDelete(row) {
+  try {
+    await ElMessageBox.confirm(`确认删除账号 ${row.displayName}？`, '删除确认', {
+      type: 'warning',
+    })
+    await handleDelete(row)
+  } catch {
+    // User cancelled.
   }
 }
 
@@ -312,9 +314,9 @@ async function handleDelete(row) {
   try {
     await judianApi.deleteAccount(row.id)
     await loadAccounts({ silent: true })
-    message.success('账号已删除')
+    ElMessage.success('账号已删除')
   } catch (error) {
-    message.error(extractErrorMessage(error))
+    ElMessage.error(extractErrorMessage(error))
   }
 }
 
@@ -327,9 +329,9 @@ async function saveEnabledDraft(row) {
     row.enabled = nextEnabled
     row.status = nextEnabled ? (String(row.sessionToken || '').trim() ? 'active' : 'pending') : 'disabled'
     row._draftEnabled = nextEnabled
-    message.success(nextEnabled ? '账号已启用' : '账号已停用')
+    ElMessage.success(nextEnabled ? '账号已启用' : '账号已停用')
   } catch (error) {
-    message.error(extractErrorMessage(error))
+    ElMessage.error(extractErrorMessage(error))
   } finally {
     row._enabledSaving = false
   }
@@ -339,4 +341,16 @@ onMounted(() => {
   loadAccounts()
 })
 </script>
+
+<style scoped>
+.form-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.diamond-value {
+  font-weight: 600;
+  color: #2563eb;
+}
+</style>
 

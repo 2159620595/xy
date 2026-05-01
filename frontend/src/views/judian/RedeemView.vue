@@ -156,6 +156,9 @@
               <div class="batch-progress-stats">
                 <span>成功 {{ batchDisplayedSuccessCount }}</span>
                 <span>失败 {{ batchDisplayedFailedCount }}</span>
+                <span v-if="batchDisplayedCanceledCount > 0"
+                  >已取消 {{ batchDisplayedCanceledCount }}</span
+                >
                 <span>待处理 {{ batchDisplayedPendingCount }}</span>
                 <span v-if="batchRequiredDiamond > 0"
                   >预计 {{ batchRequiredText }}</span
@@ -192,7 +195,8 @@
                   <pre
                     v-if="item.rawResponseText"
                     class="batch-progress-item__raw"
-                  >{{ item.rawResponseText }}</pre>
+                    >{{ item.rawResponseText }}</pre
+                  >
                   <div
                     v-if="item.consumedDiamond > 0"
                     class="batch-progress-item__message"
@@ -231,10 +235,7 @@
             <button
               class="action-button action-button--primary scan-primary-button"
               :disabled="
-                cameraBusy ||
-                scanSubmitting ||
-                batchSubmitting ||
-                isBatchRunning
+                cameraBusy || scanSubmitting || batchSubmitting || isBatchBusy
               "
               @click="openCamera"
             >
@@ -252,7 +253,12 @@
             <div class="actions-row actions-row--stack">
               <button
                 class="action-button action-button--primary action-button--secondary"
-                :disabled="scanSubmitting || batchSubmitting || batchCancelling"
+                :disabled="
+                  scanSubmitting ||
+                  batchSubmitting ||
+                  batchCancelling ||
+                  isBatchCanceling
+                "
                 @click="handleBatchPrimaryAction"
               >
                 {{
@@ -282,7 +288,7 @@
               class="upload-dropzone"
               :class="{
                 'upload-dropzone--disabled':
-                  scanSubmitting || batchSubmitting || isBatchRunning,
+                  scanSubmitting || batchSubmitting || isBatchBusy,
               }"
               @click="openQrImagePicker"
             >
@@ -316,7 +322,7 @@
                 :disabled="
                   scanSubmitting ||
                   batchSubmitting ||
-                  isBatchRunning ||
+                  isBatchBusy ||
                   clipboardReading
                 "
                 @paste="handlePasteIntoTextarea"
@@ -327,7 +333,7 @@
                   :disabled="
                     scanSubmitting ||
                     batchSubmitting ||
-                    isBatchRunning ||
+                    isBatchBusy ||
                     clipboardReading ||
                     !pastedQrText
                   "
@@ -340,7 +346,7 @@
                   :disabled="
                     scanSubmitting ||
                     batchSubmitting ||
-                    isBatchRunning ||
+                    isBatchBusy ||
                     clipboardReading
                   "
                   @click="readClipboardPayload"
@@ -401,7 +407,7 @@
             </div>
             <button
               class="confirm-modal__close"
-              :disabled="batchSubmitting || isBatchRunning"
+              :disabled="batchSubmitting || isBatchBusy"
               @click="closeBatchOrderModal"
             >
               ×
@@ -415,7 +421,7 @@
               class="batch-order-field__input"
               type="text"
               autocomplete="username"
-              :disabled="batchSubmitting || isBatchRunning"
+              :disabled="batchSubmitting || isBatchBusy"
             />
           </label>
 
@@ -426,7 +432,7 @@
               class="batch-order-field__input"
               type="password"
               autocomplete="current-password"
-              :disabled="batchSubmitting || isBatchRunning"
+              :disabled="batchSubmitting || isBatchBusy"
               @keydown.enter.prevent="submitBatchOrder"
             />
           </label>
@@ -443,7 +449,7 @@
                   'batch-package-option--active':
                     batchCountPreset === option.value,
                 }"
-                :disabled="batchSubmitting || isBatchRunning"
+                :disabled="batchSubmitting || isBatchBusy"
                 @click="applyBatchCountPreset(option)"
               >
                 {{ option.label }}
@@ -462,7 +468,7 @@
               step="1"
               inputmode="numeric"
               placeholder="请输入天卡数量"
-              :disabled="batchSubmitting || isBatchRunning"
+              :disabled="batchSubmitting || isBatchBusy"
               @change="handleBatchCountCommit"
               @blur="handleBatchCountCommit"
               @keydown.enter.prevent="handleBatchCountCommit"
@@ -498,7 +504,7 @@
           <div class="actions-row confirm-actions">
             <button
               class="action-button"
-              :disabled="batchSubmitting || isBatchRunning"
+              :disabled="batchSubmitting || isBatchBusy"
               @click="closeBatchOrderModal"
             >
               取消
@@ -507,7 +513,7 @@
               class="action-button action-button--primary"
               :disabled="
                 batchSubmitting ||
-                isBatchRunning ||
+                isBatchBusy ||
                 batchPreviewLoading ||
                 !batchCanSubmit
               "
@@ -766,10 +772,18 @@ function isConfirmedUnlockSuccess(payload) {
   );
 }
 const isBatchCanceling = computed(
-  () => currentBatchTask.value?.cancelRequested === true,
+  () =>
+    currentBatchTask.value?.cancelRequested === true && !isBatchTerminal.value,
 );
-const isBatchRunning = computed(
-  () => String(currentBatchTask.value?.status || "") === "running",
+const batchTaskStatus = computed(() =>
+  String(currentBatchTask.value?.status || ""),
+);
+const isBatchTerminal = computed(() =>
+  ["completed", "failed", "canceled"].includes(batchTaskStatus.value),
+);
+const isBatchRunning = computed(() => batchTaskStatus.value === "running");
+const isBatchBusy = computed(
+  () => isBatchRunning.value || isBatchCanceling.value,
 );
 const liveBatchConsumedDiamond = computed(() => {
   if (!isBatchRunning.value) return 0;
@@ -784,7 +798,7 @@ const liveBatchConsumedDiamond = computed(() => {
   return Math.max(0, totalConsumed - syncedConsumed);
 });
 const canCancelBatchTask = computed(() => {
-  const status = String(currentBatchTask.value?.status || "");
+  const status = batchTaskStatus.value;
   if (!["pending", "running"].includes(status)) return false;
   return currentBatchTask.value?.cancelRequested !== true;
 });
@@ -819,6 +833,7 @@ const cardStatusText = computed(() => {
 });
 
 const sessionStatusText = computed(() => {
+  if (batchTaskStatus.value === "canceled") return "批量任务已取消";
   if (isBatchCanceling.value) return "批量任务取消中";
   if (isBatchRunning.value) return "批量下单中";
   if (isUnlockCompleted.value) return "已完成解锁";
@@ -917,18 +932,18 @@ const canConfirmUnlock = computed(
     ),
 );
 const batchStatusText = computed(() => {
-  const status = String(currentBatchTask.value?.status || "");
-  if (currentBatchTask.value?.cancelRequested) return "批量任务取消中";
+  const status = batchTaskStatus.value;
   if (status === "canceled") return "批量任务已取消";
+  if (isBatchCanceling.value) return "批量任务取消中";
   if (status === "completed") return "批量下单已完成";
   if (status === "failed") return "批量下单失败";
   if (status === "running") return "批量下单进行中";
   return "暂无批量任务";
 });
 const batchStatusClass = computed(() => {
-  const status = String(currentBatchTask.value?.status || "");
-  if (currentBatchTask.value?.cancelRequested) return "warning";
+  const status = batchTaskStatus.value;
   if (status === "canceled") return "warning";
+  if (isBatchCanceling.value) return "warning";
   if (status === "completed") return "success";
   if (status === "failed") return "failed";
   return "running";
@@ -962,20 +977,26 @@ const batchDisplayedFailedCount = computed(
     batchItems.value.filter((item) => String(item.status || "") === "failed")
       .length,
 );
-const batchDisplayedPendingCount = computed(() =>
+const batchDisplayedCanceledCount = computed(() =>
   Math.max(
     0,
-    Number(currentBatchTask.value?.totalCount || 0) -
-      batchDisplayedSuccessCount.value -
-      batchDisplayedFailedCount.value,
+    Number(currentBatchTask.value?.canceledCount || 0) ||
+      batchItems.value.filter(
+        (item) => String(item.status || "") === "canceled",
+      ).length,
   ),
 );
+const batchDisplayedPendingCount = computed(() =>
+  Math.max(0, Number(currentBatchTask.value?.pendingCount || 0)),
+);
 function getBatchItemDisplayStatus(item) {
+  if (String(item?.status || "") === "canceled") return "canceled";
   if (item?.confirmedSuccess === true) return "completed";
   if (String(item?.status || "") === "failed") return "failed";
   return "pending";
 }
 function getBatchItemStatusText(item) {
+  if (String(item?.status || "") === "canceled") return "已取消";
   if (item?.confirmedSuccess === true) return "成功";
   if (String(item?.status || "") === "failed") return "失败";
   if (String(item?.status || "") === "completed") return "待确认";
@@ -1029,16 +1050,14 @@ const batchPreviewHintText = computed(() => {
 });
 const shouldAutoSync = computed(() => {
   if (state.value !== "ready" || !currentSessionId.value) return false;
-  if (currentBatchTask.value?.cancelRequested) return true;
+  if (isBatchCanceling.value) return true;
   if (isBatchRunning.value) return true;
   return ["pending", "scanned", "confirmed"].includes(
     String(currentSession.value?.status || ""),
   );
 });
 const autoSyncIntervalMs = computed(() =>
-  isBatchRunning.value || isBatchCanceling.value
-    ? BATCH_RUNNING_POLL_INTERVAL_MS
-    : DEFAULT_POLL_INTERVAL_MS,
+  isBatchBusy.value ? BATCH_RUNNING_POLL_INTERVAL_MS : DEFAULT_POLL_INTERVAL_MS,
 );
 
 onMounted(() => {
@@ -1233,6 +1252,7 @@ function normalizeBatchTask(batchTask) {
     successCount: Number(batchTask.successCount || 0),
     failedCount: Number(batchTask.failedCount || 0),
     pendingCount: Number(batchTask.pendingCount || 0),
+    canceledCount: Number(batchTask.canceledCount || 0),
     totalConsumedDiamond: Number(batchTask.totalConsumedDiamond || 0),
     currentIndex: Number(batchTask.currentIndex || 0),
     currentTradeNo: String(batchTask.currentTradeNo || ""),
@@ -1805,7 +1825,7 @@ async function handleGlobalPaste(event) {
   if (
     scanSubmitting.value ||
     batchSubmitting.value ||
-    isBatchRunning.value ||
+    isBatchBusy.value ||
     clipboardReading.value
   ) {
     return;
@@ -1852,7 +1872,7 @@ async function readClipboardPayload() {
   if (
     scanSubmitting.value ||
     batchSubmitting.value ||
-    isBatchRunning.value ||
+    isBatchBusy.value ||
     clipboardReading.value
   ) {
     return;
@@ -1901,7 +1921,7 @@ async function readClipboardPayload() {
 }
 
 function openBatchOrderModal() {
-  if (batchSubmitting.value || batchCancelling.value || isBatchRunning.value)
+  if (batchSubmitting.value || batchCancelling.value || isBatchBusy.value)
     return;
   batchOrderCount.value = Math.min(
     365,
@@ -1917,7 +1937,7 @@ function openBatchOrderModal() {
 }
 
 function closeBatchOrderModal() {
-  if (batchSubmitting.value || batchCancelling.value || isBatchRunning.value)
+  if (batchSubmitting.value || batchCancelling.value || isBatchBusy.value)
     return;
   batchOrderPassword.value = "";
   batchPreviewLoading.value = false;
@@ -1925,6 +1945,13 @@ function closeBatchOrderModal() {
 }
 
 function handleBatchPrimaryAction() {
+  if (
+    batchSubmitting.value ||
+    batchCancelling.value ||
+    isBatchCanceling.value
+  ) {
+    return;
+  }
   if (canCancelBatchTask.value) {
     cancelBatchTask();
     return;
@@ -2029,6 +2056,10 @@ async function submitBatchOrder() {
   }
   if (isBatchRunning.value) {
     showToast("当前已有批量下单任务正在执行，请稍后查看进度");
+    return;
+  }
+  if (isBatchCanceling.value) {
+    showToast("批量任务正在取消，请等待当前状态同步完成");
     return;
   }
   const count = Math.floor(Number(batchOrderCount.value || 0));
@@ -2799,6 +2830,10 @@ function showToast(message) {
 
 .batch-progress-item--failed {
   border-color: rgba(248, 113, 113, 0.35);
+}
+
+.batch-progress-item--canceled {
+  border-color: rgba(251, 191, 36, 0.35);
 }
 
 .batch-progress-item__top {

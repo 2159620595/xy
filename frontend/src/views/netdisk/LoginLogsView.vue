@@ -1,110 +1,181 @@
 <template>
-  <n-space vertical size="large">
-    <n-card title="登录审计筛选" :bordered="false">
-      <n-grid cols="1 s:2 m:4 l:6" responsive="screen" :x-gap="16" :y-gap="12">
-        <n-gi>
-          <n-form-item label="时间范围" label-placement="top">
-            <n-select v-model:value="filters.hours" :options="hoursOptions" />
-          </n-form-item>
-        </n-gi>
-        <n-gi>
-          <n-form-item label="结果状态" label-placement="top">
-            <n-select v-model:value="filters.status" :options="statusOptions" clearable placeholder="全部状态" />
-          </n-form-item>
-        </n-gi>
-        <n-gi>
-          <n-form-item label="风险等级" label-placement="top">
-            <n-select v-model:value="filters.risk_level" :options="riskLevelOptions" clearable placeholder="全部等级" />
-          </n-form-item>
-        </n-gi>
-        <n-gi>
-          <n-form-item label="用户名" label-placement="top">
-            <n-input v-model:value="filters.username" placeholder="按用户名筛选" @keyup.enter="loadLoginLogs" />
-          </n-form-item>
-        </n-gi>
-        <n-gi>
-          <n-form-item label="登录 IP" label-placement="top">
-            <n-input v-model:value="filters.ip_address" placeholder="按 IP 模糊搜索" @keyup.enter="loadLoginLogs" />
-          </n-form-item>
-        </n-gi>
-        <n-gi>
-          <n-form-item label="操作" label-placement="top">
-            <n-space>
-              <n-button type="primary" :loading="loading" @click="loadLoginLogs">查询</n-button>
-              <n-button @click="resetFilters">重置</n-button>
-            </n-space>
-          </n-form-item>
-        </n-gi>
-      </n-grid>
-      <n-alert type="info" :show-icon="false">
+  <section class="netdisk-login-logs">
+    <el-card shadow="never">
+      <template #header>登录审计筛选</template>
+      <el-form label-position="top">
+        <el-row :gutter="16">
+          <el-col :xs="24" :sm="12" :md="8" :lg="4">
+            <el-form-item label="时间范围">
+              <el-select v-model="filters.hours">
+                <el-option
+                  v-for="item in hoursOptions"
+                  :key="item.value"
+                  :label="item.label"
+                  :value="item.value"
+                />
+              </el-select>
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="12" :md="8" :lg="4">
+            <el-form-item label="结果状态">
+              <el-select v-model="filters.status" clearable placeholder="全部状态">
+                <el-option
+                  v-for="item in statusOptions"
+                  :key="item.value"
+                  :label="item.label"
+                  :value="item.value"
+                />
+              </el-select>
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="12" :md="8" :lg="4">
+            <el-form-item label="风险等级">
+              <el-select v-model="filters.risk_level" clearable placeholder="全部等级">
+                <el-option
+                  v-for="item in riskLevelOptions"
+                  :key="item.value"
+                  :label="item.label"
+                  :value="item.value"
+                />
+              </el-select>
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="12" :md="8" :lg="4">
+            <el-form-item label="用户名">
+              <el-input
+                v-model="filters.username"
+                placeholder="按用户名筛选"
+                @keyup.enter="loadLoginLogs"
+              />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="12" :md="8" :lg="4">
+            <el-form-item label="登录 IP">
+              <el-input
+                v-model="filters.ip_address"
+                placeholder="按 IP 模糊搜索"
+                @keyup.enter="loadLoginLogs"
+              />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="12" :md="8" :lg="4">
+            <el-form-item label="操作">
+              <el-space wrap>
+                <el-button type="primary" :loading="loading" @click="loadLoginLogs">
+                  查询
+                </el-button>
+                <el-button @click="resetFilters">重置</el-button>
+              </el-space>
+            </el-form-item>
+          </el-col>
+        </el-row>
+      </el-form>
+      <el-alert type="info" :closable="false">
         系统已启用管理员登录加固：密码哈希存储、连续失败自动锁定、成功登录新 IP / 高频失败后成功风险标记。
-      </n-alert>
-    </n-card>
+      </el-alert>
+    </el-card>
 
-    <n-grid cols="1 s:2 m:3 l:6" responsive="screen" :x-gap="12" :y-gap="12">
-      <n-gi v-for="item in statistics" :key="item.label">
-        <n-card size="small" :bordered="false">
-          <n-statistic :label="item.label" :value="item.value" />
-          <div class="stat-help">{{ item.help }}</div>
-        </n-card>
-      </n-gi>
-    </n-grid>
+    <div class="netdisk-login-logs__stats">
+      <el-card
+        v-for="item in statistics"
+        :key="item.label"
+        shadow="never"
+        class="netdisk-login-logs__stat-card"
+      >
+        <div class="netdisk-login-logs__stat-label">{{ item.label }}</div>
+        <div class="netdisk-login-logs__stat-value">{{ item.value }}</div>
+        <div class="stat-help">{{ item.help }}</div>
+      </el-card>
+    </div>
 
-    <n-grid cols="1 l:2" responsive="screen" :x-gap="16" :y-gap="16">
-      <n-gi>
-        <n-card title="可疑 IP" :bordered="false">
-          <n-empty v-if="!suspiciousIpRows.length && !loading" description="当前筛选范围内未发现高频失败 IP" />
-          <n-data-table
-            v-else
-            :columns="suspiciousColumns"
-            :data="suspiciousIpRows"
-            :loading="loading"
-            :pagination="false"
-            size="small"
-          />
-        </n-card>
-      </n-gi>
-      <n-gi>
-        <n-card title="当前锁定对象" :bordered="false">
-          <n-empty v-if="!activeLocks.length && !loading" description="当前没有处于锁定中的账号或 IP" />
-          <n-data-table
-            v-else
-            :columns="activeLockColumns"
-            :data="activeLocks"
-            :loading="loading"
-            :pagination="false"
-            size="small"
-          />
-        </n-card>
-      </n-gi>
-    </n-grid>
+    <div class="netdisk-login-logs__summary">
+      <el-card shadow="never">
+        <template #header>可疑 IP</template>
+        <el-empty
+          v-if="!suspiciousIpRows.length && !loading"
+          description="当前筛选范围内未发现高频失败 IP"
+        />
+        <el-table v-else :data="suspiciousIpRows" stripe v-loading="loading">
+          <el-table-column prop="ip_address" label="IP 地址" min-width="220" />
+          <el-table-column prop="fail_count" label="失败次数" width="120" />
+          <el-table-column label="最后出现时间" min-width="200">
+            <template #default="{ row }">
+              {{ formatTime(row.last_seen) }}
+            </template>
+          </el-table-column>
+        </el-table>
+      </el-card>
 
-    <n-card title="登录日志明细" :bordered="false">
-      <template #header-extra>
-        <n-space>
-          <n-tag size="small" type="warning" round>当前范围：{{ currentWindowLabel }}</n-tag>
-          <n-tag size="small" type="info" round>锁定规则：{{ lockRuleText }}</n-tag>
-          <n-button secondary :loading="loading" @click="loadLoginLogs">刷新</n-button>
-        </n-space>
+      <el-card shadow="never">
+        <template #header>当前锁定对象</template>
+        <el-empty
+          v-if="!activeLocks.length && !loading"
+          description="当前没有处于锁定中的账号或 IP"
+        />
+        <el-table v-else :data="activeLocks" stripe v-loading="loading">
+          <el-table-column prop="scope_label" label="锁定对象" min-width="240" />
+          <el-table-column prop="remaining_minutes" label="剩余分钟" width="120" />
+          <el-table-column label="解锁时间" min-width="200">
+            <template #default="{ row }">
+              {{ formatTime(row.locked_until) }}
+            </template>
+          </el-table-column>
+        </el-table>
+      </el-card>
+    </div>
+
+    <el-card shadow="never">
+      <template #header>
+        <div class="netdisk-login-logs__header">
+          <span>登录日志明细</span>
+          <el-space wrap>
+            <el-tag type="warning" effect="plain">
+              当前范围：{{ currentWindowLabel }}
+            </el-tag>
+            <el-tag type="info" effect="plain">
+              锁定规则：{{ lockRuleText }}
+            </el-tag>
+            <el-button :loading="loading" @click="loadLoginLogs">刷新</el-button>
+          </el-space>
+        </div>
       </template>
-      <n-data-table
-        :columns="columns"
-        :data="tableData"
-        :loading="loading"
-        :pagination="{ pageSize: 20 }"
-        :scroll-x="1860"
-        size="small"
-      />
-    </n-card>
-  </n-space>
+      <el-table :data="tableData" stripe v-loading="loading">
+        <el-table-column label="时间" min-width="180" fixed="left">
+          <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
+        </el-table-column>
+        <el-table-column label="状态" width="100">
+          <template #default="{ row }">
+            <el-tag :type="row.status === '成功' ? 'success' : 'danger'">
+              {{ row.status || '-' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="风险等级" width="110">
+          <template #default="{ row }">
+            <el-tag :type="resolveRiskTagType(row.risk_level)">
+              {{ row.risk_level || '正常' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="username" label="用户名" width="140" />
+        <el-table-column prop="tenant_id" label="租户" width="140" />
+        <el-table-column prop="ip_address" label="登录 IP" width="160" />
+        <el-table-column prop="risk_flags" label="风险标签" min-width="220" />
+        <el-table-column prop="login_source" label="登录来源" width="120" />
+        <el-table-column prop="request_path" label="接口路径" min-width="180" />
+        <el-table-column prop="reason" label="原因 / 说明" min-width="240" />
+        <el-table-column prop="log_message" label="完整日志" min-width="460" show-overflow-tooltip />
+        <el-table-column prop="user_agent" label="浏览器标识" min-width="360" show-overflow-tooltip />
+      </el-table>
+    </el-card>
+  </section>
 </template>
 
 <script setup>
-import { computed, h, onMounted, ref } from 'vue'
-import { NTag, useMessage } from 'naive-ui'
+import { computed, onMounted, ref } from 'vue'
+import { ElMessage } from 'element-plus'
 import { authApi } from '@/api/baidu'
 
-const message = useMessage()
 const loading = ref(false)
 const tableData = ref([])
 const summary = ref({
@@ -169,85 +240,6 @@ const statistics = computed(() => [
 const suspiciousIpRows = computed(() => summary.value.top_failed_ips || [])
 const activeLocks = computed(() => summary.value.active_locks || [])
 
-const suspiciousColumns = [
-  { title: 'IP 地址', key: 'ip_address', width: 220 },
-  { title: '失败次数', key: 'fail_count', width: 120 },
-  {
-    title: '最后出现时间',
-    key: 'last_seen',
-    width: 200,
-    render: (row) => formatTime(row.last_seen),
-  },
-]
-
-const activeLockColumns = [
-  { title: '锁定对象', key: 'scope_label', minWidth: 240 },
-  { title: '剩余分钟', key: 'remaining_minutes', width: 120 },
-  {
-    title: '解锁时间',
-    key: 'locked_until',
-    width: 200,
-    render: (row) => formatTime(row.locked_until),
-  },
-]
-
-const columns = [
-  {
-    title: '时间',
-    key: 'created_at',
-    width: 180,
-    fixed: 'left',
-    render: (row) => formatTime(row.created_at),
-  },
-  {
-    title: '状态',
-    key: 'status',
-    width: 100,
-    render: (row) => h(NTag, { size: 'small', type: row.status === '成功' ? 'success' : 'error' }, { default: () => row.status || '-' }),
-  },
-  {
-    title: '风险等级',
-    key: 'risk_level',
-    width: 110,
-    render: (row) => h(NTag, { size: 'small', type: resolveRiskTagType(row.risk_level) }, { default: () => row.risk_level || '正常' }),
-  },
-  { title: '用户名', key: 'username', width: 140 },
-  { title: '租户', key: 'tenant_id', width: 140 },
-  { title: '登录 IP', key: 'ip_address', width: 160 },
-  {
-    title: '风险标签',
-    key: 'risk_flags',
-    width: 220,
-    render: (row) => row.risk_flags || '-',
-  },
-  { title: '登录来源', key: 'login_source', width: 120 },
-  { title: '接口路径', key: 'request_path', width: 180 },
-  {
-    title: '原因 / 说明',
-    key: 'reason',
-    width: 240,
-    render: (row) => row.reason || '-',
-  },
-  {
-    title: '完整日志',
-    key: 'log_message',
-    minWidth: 460,
-    ellipsis: {
-      tooltip: true,
-    },
-    render: (row) => row.log_message || '-',
-  },
-  {
-    title: '浏览器标识',
-    key: 'user_agent',
-    minWidth: 360,
-    ellipsis: {
-      tooltip: true,
-    },
-    render: (row) => row.user_agent || '-',
-  },
-]
-
 onMounted(() => {
   loadLoginLogs()
 })
@@ -281,7 +273,7 @@ async function loadLoginLogs() {
     }
   } catch (error) {
     console.error('加载登录日志失败:', error)
-    message.error('登录日志加载失败，请稍后重试')
+    ElMessage.error('登录日志加载失败，请稍后重试')
   } finally {
     loading.value = false
   }
@@ -299,9 +291,9 @@ function resetFilters() {
 }
 
 function resolveRiskTagType(level) {
-  if (level === '高危') return 'error'
+  if (level === '高危') return 'danger'
   if (level === '关注') return 'warning'
-  return 'default'
+  return 'info'
 }
 
 function formatTime(timestamp) {
@@ -312,9 +304,71 @@ function formatTime(timestamp) {
 </script>
 
 <style scoped>
+.netdisk-login-logs {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.netdisk-login-logs__stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.netdisk-login-logs__stat-card {
+  min-height: 116px;
+}
+
+.netdisk-login-logs__stat-label {
+  color: #64748b;
+  font-size: 13px;
+  margin-bottom: 10px;
+}
+
+.netdisk-login-logs__stat-value {
+  color: #0f172a;
+  font-size: 26px;
+  font-weight: 700;
+}
+
+.netdisk-login-logs__summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.netdisk-login-logs__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .stat-help {
   margin-top: 8px;
   font-size: 12px;
   color: #64748b;
+}
+
+@media (max-width: 1080px) {
+  .netdisk-login-logs__stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .netdisk-login-logs__summary {
+    grid-template-columns: 1fr;
+  }
+
+  .netdisk-login-logs__header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}
+
+@media (max-width: 640px) {
+  .netdisk-login-logs__stats {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

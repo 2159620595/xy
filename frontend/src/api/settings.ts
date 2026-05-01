@@ -1,5 +1,6 @@
 import { buildApiUrl, get, post, put } from "@/utils/request";
 import type { ApiResponse, SystemSettings } from "@/types";
+import { getMainToken } from "@/utils/session";
 
 export const getSystemSettings = async (): Promise<{
   success: boolean;
@@ -120,7 +121,7 @@ export const exportUserBackup = async (): Promise<{
   blob: Blob;
   filename: string;
 }> => {
-  const token = localStorage.getItem("auth_token");
+  const token = getMainToken();
   if (!token) {
     throw new Error("未登录");
   }

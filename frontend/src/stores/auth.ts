@@ -1,24 +1,15 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import type { User } from '@/types'
-
-const TOKEN_KEY = 'auth_token'
-const USER_KEY = 'user_info'
-
-const readStoredUser = () => {
-  const raw = localStorage.getItem(USER_KEY)
-  if (!raw) return null
-
-  try {
-    return JSON.parse(raw) as User
-  } catch {
-    localStorage.removeItem(USER_KEY)
-    return null
-  }
-}
+import {
+  clearJudianSessionStorage,
+  getMainToken,
+  readStoredJson,
+} from '@/utils/session'
+const readStoredUser = () => readStoredJson<User>('user_info')
 
 export const useAuthStore = defineStore('auth', () => {
-  const token = ref<string | null>(localStorage.getItem(TOKEN_KEY))
+  const token = ref<string | null>(getMainToken() || null)
   const user = ref<User | null>(readStoredUser())
   const initialized = ref(false)
   const isAuthenticated = computed(() => Boolean(token.value))
@@ -26,23 +17,22 @@ export const useAuthStore = defineStore('auth', () => {
   const setAuth = (nextToken: string, nextUser: User) => {
     token.value = nextToken
     user.value = nextUser
-    localStorage.setItem(TOKEN_KEY, nextToken)
-    localStorage.setItem(USER_KEY, JSON.stringify(nextUser))
+    localStorage.setItem('auth_token', nextToken)
+    localStorage.setItem('user_info', JSON.stringify(nextUser))
     initialized.value = true
   }
 
   const clearSession = () => {
     token.value = null
     user.value = null
-    localStorage.removeItem(TOKEN_KEY)
-    localStorage.removeItem(USER_KEY)
+    localStorage.removeItem('auth_token')
+    localStorage.removeItem('user_info')
     initialized.value = true
   }
 
   const clearAuth = () => {
     clearSession()
-    localStorage.removeItem('judian_auth_token')
-    localStorage.removeItem('judian_user_info')
+    clearJudianSessionStorage()
   }
 
   const markInitialized = () => {

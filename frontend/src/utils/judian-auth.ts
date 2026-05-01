@@ -1,9 +1,16 @@
-import { DEFAULT_REQUEST_TIMEOUT_MS, createTimeoutController } from "@/utils/http-timeout";
+import {
+  DEFAULT_REQUEST_TIMEOUT_MS,
+  createTimeoutController,
+} from "@/utils/http-timeout";
 import { JUDIAN_API_BASE_URL, NETDISK_API_BASE_URL } from "@/utils/request";
+import {
+  clearAllSessionStorage,
+  getMainUser,
+  readStoredJson,
+} from "@/utils/session";
 
 const TOKEN_KEY = "judian_auth_token";
 const USER_KEY = "judian_user_info";
-const MAIN_USER_KEY = "user_info";
 const SESSION_TRUST_WINDOW_MS = 2 * 60 * 1000;
 
 const buildUrl = (base: string, path: string) =>
@@ -23,22 +30,9 @@ let sessionSyncPromise: Promise<boolean> | null = null;
 let trustedToken = "";
 let trustedAt = 0;
 
-const parseStoredJson = <T = Record<string, unknown>>(
-  key: string,
-): T | null => {
-  const raw = localStorage.getItem(key);
-  if (!raw) return null;
-  try {
-    return JSON.parse(raw) as T;
-  } catch {
-    return null;
-  }
-};
-
 const clearExpiredMainSession = () => {
   clearJudianSession();
-  localStorage.removeItem("auth_token");
-  localStorage.removeItem(MAIN_USER_KEY);
+  clearAllSessionStorage();
 };
 
 const redirectToLogin = () => {
@@ -63,17 +57,15 @@ const markTrustedToken = (token: string) => {
   trustedAt = Date.now();
 };
 
-export function getMainUser() {
-  return parseStoredJson<{ username?: string; role?: string }>(MAIN_USER_KEY);
-}
-
 export function getJudianToken() {
   return localStorage.getItem(TOKEN_KEY) || "";
 }
 
 export function getJudianUser() {
-  return parseStoredJson(USER_KEY);
+  return readStoredJson(USER_KEY);
 }
+
+export { getMainUser };
 
 export function setJudianSession(payload: {
   token?: string;
@@ -102,7 +94,9 @@ export function clearJudianSession() {
 
 export async function verifyStoredJudianSession(token: string) {
   if (!token) return false;
-  const { signal, cancel } = createTimeoutController(DEFAULT_REQUEST_TIMEOUT_MS);
+  const { signal, cancel } = createTimeoutController(
+    DEFAULT_REQUEST_TIMEOUT_MS,
+  );
   try {
     const response = await fetch(JUDIAN_VERIFY_URL, {
       method: "GET",
@@ -143,7 +137,9 @@ export async function ensureJudianSession(force = false) {
     const mainUser = getMainUser();
     if (!mainUser?.username) return false;
 
-    const { signal, cancel } = createTimeoutController(DEFAULT_REQUEST_TIMEOUT_MS);
+    const { signal, cancel } = createTimeoutController(
+      DEFAULT_REQUEST_TIMEOUT_MS,
+    );
     try {
       const response = await fetch(JUDIAN_SESSION_BOOTSTRAP_URL, {
         method: "POST",

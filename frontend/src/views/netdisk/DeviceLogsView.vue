@@ -1,210 +1,161 @@
 <template>
-  <div style="background: #f5f6f7; min-height: 100%; border-radius: 8px; overflow: hidden;">
-    <!-- 主体内容 -->
-    <div style="background: #fff; display: flex; min-height: 600px;">
-      
-      <!-- 右侧内容区 -->
-      <div style="flex: 1; padding: 30px 40px; min-width: 0;">
-        
-        <!-- 标签页模拟 -->
-        <div style="display: flex; gap: 32px; border-bottom: 1px solid #f0f0f0; padding-bottom: 12px; margin-bottom: 24px;">
-          <div 
-            @click="activeDeviceType = 'client'"
-            :style="{ fontSize: '15px', fontWeight: activeDeviceType === 'client' ? '500' : '400', color: activeDeviceType === 'client' ? '#333' : '#666', position: 'relative', cursor: 'pointer' }"
-          >
-            客户端设备
-            <div v-if="activeDeviceType === 'client'" style="position: absolute; bottom: -13px; left: 50%; transform: translateX(-50%); width: 20px; height: 3px; background: #333; border-radius: 2px;"></div>
-          </div>
-          <div 
-            @click="activeDeviceType = 'web'"
-            :style="{ fontSize: '15px', fontWeight: activeDeviceType === 'web' ? '500' : '400', color: activeDeviceType === 'web' ? '#333' : '#666', position: 'relative', cursor: 'pointer' }"
-          >
-            网页版设备
-            <div v-if="activeDeviceType === 'web'" style="position: absolute; bottom: -13px; left: 50%; transform: translateX(-50%); width: 20px; height: 3px; background: #333; border-radius: 2px;"></div>
-          </div>
-          <div 
-            @click="activeDeviceType = 'smart'"
-            :style="{ fontSize: '15px', fontWeight: activeDeviceType === 'smart' ? '500' : '400', color: activeDeviceType === 'smart' ? '#333' : '#666', position: 'relative', cursor: 'pointer' }"
-          >
-            智能端设备
-            <div v-if="activeDeviceType === 'smart'" style="position: absolute; bottom: -13px; left: 50%; transform: translateX(-50%); width: 20px; height: 3px; background: #333; border-radius: 2px;"></div>
-          </div>
+  <div class="device-logs-shell">
+    <div class="device-logs-panel">
+      <div class="device-type-tabs">
+        <button
+          v-for="item in deviceTypeTabs"
+          :key="item.value"
+          type="button"
+          class="device-type-tabs__item"
+          :class="{ 'is-active': activeDeviceType === item.value }"
+          @click="activeDeviceType = item.value"
+        >
+          {{ item.label }}
+        </button>
+      </div>
+
+      <div class="device-logs-intro">
+        <span class="device-logs-intro__title">功能介绍：</span>
+        <div>
+          【退出登录】该设备会退出当前账号登录状态，需要重新输入账号密码登录。<br />
+          【锁定】网页端设备仅可被锁定，锁定后无法进行任何操作，可以短信验证码方式解锁。
         </div>
+      </div>
 
-        <!-- 提示框 -->
-        <div style="background: #fafafa; border: 1px solid #f0f0f0; border-radius: 4px; padding: 12px 16px; font-size: 12px; color: #666; margin-bottom: 24px; display: flex; align-items: flex-start; gap: 8px;">
-          <span style="font-weight: bold; color: #333; flex-shrink: 0;">功能介绍：</span>
-          <div style="line-height: 1.6;">
-            【退出登录】该设备会退出当前账号登录状态，需要重新输入账号密码登录。<br>
-            【锁定】网页端设备仅可被锁定，锁定后无法进行任何操作，可以短信验证码方式解锁。
-          </div>
-        </div>
+      <div v-if="activeTab === 'devices'" class="device-toolbar">
+        <el-space wrap>
+          <el-select v-model="filterAccount" clearable placeholder="筛选账号" style="width: 160px">
+            <el-option v-for="item in accountOptions" :key="item.value" :label="item.label" :value="item.value" />
+          </el-select>
+          <el-select v-model="filterStatus" clearable placeholder="筛选状态" style="width: 130px">
+            <el-option v-for="item in statusOptions" :key="item.value" :label="item.label" :value="item.value" />
+          </el-select>
+          <el-select v-model="filterUnused" clearable placeholder="闲置时间" style="width: 120px">
+            <el-option v-for="item in unusedOptions" :key="item.value" :label="item.label" :value="item.value" />
+          </el-select>
+          <el-button :loading="loading" @click="loadLogs">刷新</el-button>
+        </el-space>
 
-        <!-- 筛选区域 (因为需要多账号管理保留) -->
-        <div v-if="activeTab === 'devices'" style="margin-bottom: 24px; display: flex; justify-content: space-between; align-items: center; background: #fdfdfd; padding: 12px 16px; border-radius: 8px; border: 1px solid #f0f0f0;">
-          <n-space style="align-items: center;">
-            <n-select v-model:value="filterAccount" :options="accountOptions" placeholder="筛选账号" clearable style="width: 160px" size="small" />
-            <n-select v-model:value="filterStatus" :options="statusOptions" placeholder="筛选状态" clearable style="width: 130px" size="small" />
-            <n-select v-model:value="filterUnused" :options="unusedOptions" placeholder="闲置时间" clearable style="width: 120px" size="small" />
-            <n-button @click="loadLogs" :loading="loading" size="small" secondary>刷新</n-button>
-          </n-space>
-          
-          <n-popconfirm @positive-click="handleBatchKick" v-if="kickableDevices.length > 0">
-            <template #trigger>
-              <n-button type="info" color="#06a7ff" :loading="batchKicking" size="small" style="border-radius: 16px; padding: 0 16px;">
-                一键踢出匹配设备 ({{ kickableDevices.length }})
-              </n-button>
-            </template>
-            确定要一键踢出当前筛选出的 {{ kickableDevices.length }} 个在线设备吗？
-          </n-popconfirm>
-        </div>
+        <el-button
+          v-if="kickableDevices.length > 0"
+          type="primary"
+          :loading="batchKicking"
+          @click="confirmBatchKick"
+        >
+          一键踢出匹配设备 ({{ kickableDevices.length }})
+        </el-button>
+      </div>
 
-        <div v-else style="margin-bottom: 24px; display: flex; justify-content: space-between; align-items: center; background: #fdfdfd; padding: 12px 16px; border-radius: 8px; border: 1px solid #f0f0f0;">
-          <n-space style="align-items: center;">
-            <n-select v-model:value="filterAccount" :options="accountOptions" placeholder="筛选账号" clearable style="width: 160px" size="small" />
-            <n-button @click="loadHistory" :loading="loadingHistory" size="small" secondary>刷新</n-button>
-          </n-space>
-        </div>
+      <div v-else class="device-toolbar">
+        <el-space wrap>
+          <el-select v-model="filterAccount" clearable placeholder="筛选账号" style="width: 160px">
+            <el-option v-for="item in accountOptions" :key="item.value" :label="item.label" :value="item.value" />
+          </el-select>
+          <el-button :loading="loadingHistory" @click="loadHistory">刷新</el-button>
+        </el-space>
+      </div>
 
-        <!-- 列表 -->
-        <n-spin :show="activeTab === 'devices' ? loading : loadingHistory">
-          <!-- 在线设备试图 -->
-          <div v-if="activeTab === 'devices'">
-            <div v-if="filteredTableData.length > 0">
-              <div style="font-size: 15px; font-weight: bold; color: #333; margin-bottom: 16px;">
-                已登录设备 ({{ filteredTableData.length }})
-              </div>
-
-              <div style="display: flex; flex-wrap: wrap; gap: 24px;">
-                <div v-for="log in filteredTableData" :key="log.id" style="width: 380px; border: 1px solid #f0f0f0; border-radius: 8px; padding: 20px 24px; display: flex; justify-content: space-between; align-items: center; transition: all 0.3s; background: #fff;" @mouseover="$event.currentTarget.style.boxShadow='0 4px 12px rgba(0,0,0,0.08)'" @mouseout="$event.currentTarget.style.boxShadow='none'">
-                  
-                  <div style="display: flex; align-items: center; gap: 16px;">
-                    <!-- Icon -->
-                    <div style="width: 48px; height: 48px; display: flex; align-items: center; justify-content: center;">
-                      <img v-if="log.icon" :src="log.icon" style="max-width: 100%; max-height: 100%; object-fit: contain;" @error="(e) => e.target.style.display='none'" />
-                      <template v-else>
-                        <img v-if="log.location && log.location.includes('Mac')" src="https://ndstatic.cdn.bcebos.com/diskDevice/mac.png" style="max-width:100%;max-height:100%;object-fit:contain;" />
-                        <img v-else-if="log.location && log.location.includes('Android')" src="https://ndstatic.cdn.bcebos.com/diskDevice/android.png" style="max-width:100%;max-height:100%;object-fit:contain;" />
-                        <img v-else-if="log.location && log.location.includes('iPhone')" src="https://ndstatic.cdn.bcebos.com/diskDevice/iphone.png" style="max-width:100%;max-height:100%;object-fit:contain;" />
-                        <img v-else-if="log.location && log.location.includes('iPad')" src="https://ndstatic.cdn.bcebos.com/diskDevice/ipad.png" style="max-width:100%;max-height:100%;object-fit:contain;" />
-                        <img v-else-if="log.location && (log.location.includes('Windows') || log.location.includes('Edge'))" src="https://ndstatic.cdn.bcebos.com/diskDevice/ie.png" style="max-width:100%;max-height:100%;object-fit:contain;" />
-                        <img v-else-if="log.location && log.location.includes('Chrome')" src="https://ndstatic.cdn.bcebos.com/diskDevice/chrome.png" style="max-width:100%;max-height:100%;object-fit:contain;" />
-                        <img v-else-if="log.device_name && log.device_name.includes('Chrome')" src="https://ndstatic.cdn.bcebos.com/diskDevice/chrome.png" style="max-width:100%;max-height:100%;object-fit:contain;" />
-                        <img v-else-if="log.device_name && log.device_name.includes('Firefox')" src="https://ndstatic.cdn.bcebos.com/diskDevice/firefox.png" style="max-width:100%;max-height:100%;object-fit:contain;" />
-                        <img v-else-if="log.device_name && log.device_name.includes('Safari')" src="https://ndstatic.cdn.bcebos.com/diskDevice/safari.png" style="max-width:100%;max-height:100%;object-fit:contain;" />
-                        <img v-else src="https://ndstatic.cdn.bcebos.com/diskDevice/pc.png" style="max-width:100%;max-height:100%;object-fit:contain;" />
-                      </template>
+      <div
+        v-loading="activeTab === 'devices' ? loading : loadingHistory"
+        class="device-logs-content"
+      >
+        <div v-if="activeTab === 'devices'">
+          <template v-if="filteredTableData.length > 0">
+            <div class="device-logs-title">已登录设备 ({{ filteredTableData.length }})</div>
+            <div class="device-card-grid">
+              <div
+                v-for="log in filteredTableData"
+                :key="log.id"
+                class="device-card"
+              >
+                <div class="device-card__main">
+                  <div class="device-card__icon">
+                    <img
+                      :src="resolveDeviceIcon(log)"
+                      alt=""
+                      @error="handleImageError"
+                    />
+                  </div>
+                  <div class="device-card__info">
+                    <div class="device-card__name">{{ log.device_name || '未知设备' }}</div>
+                    <div class="device-card__meta">
+                      <span>{{ log.location || '未知端' }}</span>
+                      <span v-if="log.account_name" class="device-card__badge">
+                        {{ log.account_name }}
+                      </span>
+                      <el-tooltip
+                        :content="buildDeviceTooltip(log)"
+                        placement="top"
+                      >
+                        <span
+                          v-if="log.unused_days > 0"
+                          class="device-card__unused"
+                        >
+                          (闲置{{ log.unused_days }}天)
+                        </span>
+                        <el-icon v-else class="device-card__help-icon">
+                          <InfoFilled />
+                        </el-icon>
+                      </el-tooltip>
                     </div>
+                  </div>
+                </div>
+                <div class="device-card__actions">
+                  <template v-if="log.action === '当前使用设备' || log.is_current">
+                    <span class="device-card__status-text">本机</span>
+                  </template>
+                  <el-button
+                    v-else-if="log.button"
+                    size="small"
+                    type="primary"
+                    :loading="lockingId === log.id"
+                    @click="confirmLockDevice(log)"
+                  >
+                    {{ log.button }}
+                  </el-button>
+                  <span v-else class="device-card__status-text">{{ log.status }}</span>
+                </div>
+              </div>
+            </div>
+          </template>
+          <el-empty
+            v-else-if="!loading"
+            description="暂无匹配设备"
+          />
+        </div>
 
-                    <!-- Info -->
-                    <div style="max-width: 180px;">
-                      <div style="font-size: 15px; color: #333; margin-bottom: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 500;">
+        <div v-else>
+          <template v-if="filteredHistoryData.length > 0">
+            <div class="device-history-tip">显示所有账号最近6个月的使用记录</div>
+            <div v-for="group in groupedHistoryData" :key="group.date" class="device-history-group">
+              <div class="device-history-group__title">{{ group.date }}</div>
+              <div class="device-history-list">
+                <div v-for="log in group.items" :key="log.id" class="device-history-item">
+                  <div class="device-history-item__main">
+                    <div class="device-history-item__icon">
+                      <img :src="resolveDeviceIcon(log)" alt="" @error="handleImageError" />
+                    </div>
+                    <div>
+                      <div class="device-history-item__name">
                         {{ log.device_name || '未知设备' }}
+                        <span v-if="log.account_name" class="device-history-item__badge">
+                          {{ log.account_name }}
+                        </span>
                       </div>
-                      <div style="font-size: 12px; color: #999; display: flex; flex-wrap: wrap; gap: 6px; align-items: center;">
-                        <span>{{ log.location || '未知端' }}</span>
-                        <span v-if="log.account_name" style="background: #f0f0f0; padding: 1px 6px; border-radius: 4px; font-size: 10px; color: #666; display: inline-block;">{{ log.account_name }}</span>
-                        <n-tooltip v-if="log.unused_days > 0" trigger="hover">
-                          <template #trigger>
-                            <span style="color: #f28b46; font-size: 11px;">(闲置{{ log.unused_days }}天)</span>
-                          </template>
-                          IP: {{ log.ip_address }} | 最近使用: {{ log.created_at ? new Date(log.created_at * 1000).toLocaleString('zh-CN', { hour12: false }) : '未知' }}
-                        </n-tooltip>
-                        <n-tooltip v-else trigger="hover">
-                          <template #trigger>
-                            <n-icon size="12" style="color: #ccc; cursor: help;"><InfoCircleOutlined /></n-icon>
-                          </template>
-                          IP: {{ log.ip_address }} | 最近使用: {{ log.created_at ? new Date(log.created_at * 1000).toLocaleString('zh-CN', { hour12: false }) : '未知' }}
-                        </n-tooltip>
-                      </div>
+                      <div class="device-history-item__meta">{{ log.location || '未知端' }}</div>
+                      <div class="device-history-item__meta">({{ log.ip_address }})</div>
                     </div>
                   </div>
-
-                  <!-- Button -->
-                  <div>
-                    <div v-if="log.action === '当前使用设备' || log.is_current" style="font-size: 12px; color: #999; text-align: right; padding-right: 8px;">
-                      本机
-                    </div>
-                    <n-button 
-                      v-else-if="log.button" 
-                      type="info"
-                      color="#06a7ff"
-                      size="small" 
-                      style="border-radius: 16px; padding: 0 16px; font-size: 12px;"
-                      @click="handleLockDevice(log)"
-                      :loading="lockingId === log.id"
-                    >{{ log.button }}</n-button>
-                    <div v-else style="font-size: 12px; color: #999; text-align: right; padding-right: 8px;">
-                      {{ log.status }}
-                    </div>
-                  </div>
-
+                  <div class="device-history-item__time">{{ formatTime(log.created_at) }}</div>
                 </div>
               </div>
             </div>
-            <n-empty v-else-if="!loading" description="暂无匹配设备" style="margin: 80px 0;" />
-          </div>
-
-          <!-- 使用记录视图 -->
-          <div v-else>
-            <div v-if="filteredHistoryData.length > 0">
-              <div style="font-size: 12px; color: #999; margin-bottom: 24px;">
-                显示所有账号最近6个月的使用记录
-              </div>
-              
-              <div v-for="group in groupedHistoryData" :key="group.date" style="margin-bottom: 32px;">
-                <div style="font-size: 16px; font-weight: 500; color: #333; margin-bottom: 16px;">
-                  {{ group.date }}
-                </div>
-                
-                <div style="border-top: 1px solid #f0f0f0;">
-                  <div v-for="log in group.items" :key="log.id" style="display: flex; justify-content: space-between; align-items: center; padding: 16px 0; border-bottom: 1px solid #f0f0f0; transition: background 0.2s;" @mouseover="$event.currentTarget.style.background='#fafafa'" @mouseout="$event.currentTarget.style.background='transparent'">
-                    
-                    <div style="display: flex; align-items: center; gap: 16px;">
-                      <!-- Icon -->
-                      <div style="width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; flex-shrink: 0;">
-                        <img v-if="log.icon" :src="log.icon" style="max-width: 100%; max-height: 100%; object-fit: contain;" @error="(e) => e.target.style.display='none'" />
-                        <template v-else>
-                          <img v-if="log.location && log.location.includes('Mac')" src="https://ndstatic.cdn.bcebos.com/diskDevice/mac.png" style="max-width:100%;max-height:100%;object-fit:contain;" />
-                          <img v-else-if="log.location && log.location.includes('Android')" src="https://ndstatic.cdn.bcebos.com/diskDevice/android.png" style="max-width:100%;max-height:100%;object-fit:contain;" />
-                          <img v-else-if="log.location && log.location.includes('iPhone')" src="https://ndstatic.cdn.bcebos.com/diskDevice/iphone.png" style="max-width:100%;max-height:100%;object-fit:contain;" />
-                          <img v-else-if="log.location && log.location.includes('iPad')" src="https://ndstatic.cdn.bcebos.com/diskDevice/ipad.png" style="max-width:100%;max-height:100%;object-fit:contain;" />
-                          <img v-else-if="log.location && (log.location.includes('Windows') || log.location.includes('Edge'))" src="https://ndstatic.cdn.bcebos.com/diskDevice/ie.png" style="max-width:100%;max-height:100%;object-fit:contain;" />
-                          <img v-else-if="log.location && log.location.includes('Chrome')" src="https://ndstatic.cdn.bcebos.com/diskDevice/chrome.png" style="max-width:100%;max-height:100%;object-fit:contain;" />
-                          <img v-else-if="log.device_name && log.device_name.includes('Chrome')" src="https://ndstatic.cdn.bcebos.com/diskDevice/chrome.png" style="max-width:100%;max-height:100%;object-fit:contain;" />
-                          <img v-else-if="log.device_name && log.device_name.includes('Firefox')" src="https://ndstatic.cdn.bcebos.com/diskDevice/firefox.png" style="max-width:100%;max-height:100%;object-fit:contain;" />
-                          <img v-else-if="log.device_name && log.device_name.includes('Safari')" src="https://ndstatic.cdn.bcebos.com/diskDevice/safari.png" style="max-width:100%;max-height:100%;object-fit:contain;" />
-                          <img v-else src="https://ndstatic.cdn.bcebos.com/diskDevice/pc.png" style="max-width:100%;max-height:100%;object-fit:contain;" />
-                        </template>
-                      </div>
-
-                      <!-- Info -->
-                      <div>
-                        <div style="font-size: 14px; font-weight: 500; color: #333; margin-bottom: 4px; display: flex; align-items: center; gap: 8px;">
-                          {{ log.device_name || '未知设备' }}
-                          <span v-if="log.account_name" style="background: #eef7ff; padding: 2px 6px; border-radius: 4px; font-size: 11px; color: #06a7ff; font-weight: normal; border: 1px solid #d4eeff;">{{ log.account_name }}</span>
-                        </div>
-                        <div style="font-size: 12px; color: #999; margin-bottom: 2px;">
-                          {{ log.location || '未知端' }}
-                        </div>
-                        <div style="font-size: 12px; color: #999;">
-                          ({{ log.ip_address }})
-                        </div>
-                      </div>
-                    </div>
-
-                    <!-- Time -->
-                    <div style="font-size: 13px; color: #999;">
-                      {{ formatTime(log.created_at) }}
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-            <n-empty v-else-if="!loadingHistory" description="暂无使用记录" style="margin: 80px 0;" />
-          </div>
-        </n-spin>
-
+          </template>
+          <el-empty
+            v-else-if="!loadingHistory"
+            description="暂无使用记录"
+          />
+        </div>
       </div>
     </div>
   </div>
@@ -213,12 +164,11 @@
 <script setup>
 import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
-import { useMessage } from 'naive-ui'
-import { InfoCircleOutlined } from '@vicons/antd'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { InfoFilled } from '@element-plus/icons-vue'
 import { baiduApi } from '@/api/baidu'
 
 const route = useRoute()
-const message = useMessage()
 const loading = ref(false)
 const tableData = ref([])
 const lockingId = ref(null)
@@ -232,6 +182,11 @@ const loadingHistory = ref(false)
 const filterAccount = ref(null)
 const filterStatus = ref(null)
 const filterUnused = ref(null)
+const deviceTypeTabs = [
+  { label: '客户端设备', value: 'client' },
+  { label: '网页版设备', value: 'web' },
+  { label: '智能端设备', value: 'smart' },
+]
 
 // Watch route to sync activeTab
 watch(() => route.name, (newName) => {
@@ -260,7 +215,7 @@ const getDeviceCategory = (item) => {
 }
 
 const accountOptions = computed(() => {
-  const source = activeTab.value === 'devices' ? tableData.value : historyData.value;
+  const source = activeTab.value === 'devices' ? tableData.value : historyData.value
   const accounts = new Set(source.map(item => item.account_name).filter(Boolean))
   return Array.from(accounts).map(name => ({ label: name, value: name }))
 })
@@ -363,6 +318,38 @@ const formatTime = (timestamp) => {
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`
 }
 
+const DEVICE_ICON_MAP = [
+  { match: (text) => text.includes('mac'), icon: 'https://ndstatic.cdn.bcebos.com/diskDevice/mac.png' },
+  { match: (text) => text.includes('android'), icon: 'https://ndstatic.cdn.bcebos.com/diskDevice/android.png' },
+  { match: (text) => text.includes('iphone'), icon: 'https://ndstatic.cdn.bcebos.com/diskDevice/iphone.png' },
+  { match: (text) => text.includes('ipad'), icon: 'https://ndstatic.cdn.bcebos.com/diskDevice/ipad.png' },
+  { match: (text) => text.includes('windows') || text.includes('edge'), icon: 'https://ndstatic.cdn.bcebos.com/diskDevice/ie.png' },
+  { match: (text) => text.includes('chrome'), icon: 'https://ndstatic.cdn.bcebos.com/diskDevice/chrome.png' },
+  { match: (text) => text.includes('firefox'), icon: 'https://ndstatic.cdn.bcebos.com/diskDevice/firefox.png' },
+  { match: (text) => text.includes('safari'), icon: 'https://ndstatic.cdn.bcebos.com/diskDevice/safari.png' },
+]
+
+const resolveDeviceIcon = (item) => {
+  if (item.icon) return item.icon
+  const text = `${item.location || ''} ${item.device_name || ''} ${item.os || ''}`.toLowerCase()
+  return DEVICE_ICON_MAP.find((candidate) => candidate.match(text))?.icon
+    || 'https://ndstatic.cdn.bcebos.com/diskDevice/pc.png'
+}
+
+const handleImageError = (event) => {
+  const target = event.target
+  if (target instanceof HTMLImageElement) {
+    target.style.display = 'none'
+  }
+}
+
+const buildDeviceTooltip = (item) =>
+  `IP: ${item.ip_address || '未知'} | 最近使用: ${
+    item.created_at
+      ? new Date(item.created_at * 1000).toLocaleString('zh-CN', { hour12: false })
+      : '未知'
+  }`
+
 const kickableDevices = computed(() => {
   return filteredTableData.value.filter(item => item.button && item.account_id && item.device_id && !item.is_current)
 })
@@ -382,9 +369,22 @@ const handleBatchKick = async () => {
     }
   }
   
-  message.info(`批量踢出完成：成功 ${successCount} 个，失败 ${failCount} 个`)
+  ElMessage.info(`批量踢出完成：成功 ${successCount} 个，失败 ${failCount} 个`)
   batchKicking.value = false
   loadLogs()
+}
+
+const confirmBatchKick = async () => {
+  try {
+    await ElMessageBox.confirm(
+      `确定要一键踢出当前筛选出的 ${kickableDevices.value.length} 个在线设备吗？`,
+      '批量踢出确认',
+      { type: 'warning' },
+    )
+    await handleBatchKick()
+  } catch {
+    // User cancelled.
+  }
 }
 
 const loadLogs = async () => {
@@ -393,7 +393,7 @@ const loadLogs = async () => {
     const res = await baiduApi.getDeviceLogs()
     tableData.value = res.data || []
   } catch (err) {
-    message.error('获取记录失败，请检查后端服务是否正常运行')
+    ElMessage.error('获取记录失败，请检查后端服务是否正常运行')
     console.error(err)
   } finally {
     loading.value = false
@@ -406,7 +406,7 @@ const loadHistory = async () => {
     const res = await baiduApi.getDeviceHistory()
     historyData.value = res.data || []
   } catch (err) {
-    message.error('获取历史记录失败')
+    ElMessage.error('获取历史记录失败')
     console.error(err)
   } finally {
     loadingHistory.value = false
@@ -423,19 +423,320 @@ onMounted(() => {
 
 const handleLockDevice = async (log) => {
   if (!log.account_id || !log.device_id) {
-    message.warning('该记录缺少设备识别参数，无法踢出')
+    ElMessage.warning('该记录缺少设备识别参数，无法踢出')
     return
   }
   
   lockingId.value = log.id
   try {
     await baiduApi.lockDevice(log.account_id, log.device_id)
-    message.success('设备已成功踢出/锁定')
+    ElMessage.success('设备已成功踢出/锁定')
     loadLogs()
   } catch (e) {
-    message.error(e?.response?.data?.detail || '锁定失败，请重试')
+    ElMessage.error(e?.response?.data?.detail || '锁定失败，请重试')
   } finally {
     lockingId.value = null
   }
 }
+
+const confirmLockDevice = async (log) => {
+  try {
+    await ElMessageBox.confirm('确认要踢出该设备吗？', '锁定确认', {
+      type: 'warning',
+    })
+    await handleLockDevice(log)
+  } catch {
+    // User cancelled.
+  }
+}
 </script>
+
+<style scoped>
+.device-logs-shell {
+  background: #f5f6f7;
+  min-height: 100%;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.device-logs-panel {
+  background: #fff;
+  min-height: 600px;
+  padding: 30px 40px;
+}
+
+.device-type-tabs {
+  display: flex;
+  gap: 32px;
+  border-bottom: 1px solid #f0f0f0;
+  padding-bottom: 12px;
+  margin-bottom: 24px;
+}
+
+.device-type-tabs__item {
+  position: relative;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  color: #666;
+  font-size: 15px;
+  padding: 0;
+}
+
+.device-type-tabs__item.is-active {
+  color: #333;
+  font-weight: 500;
+}
+
+.device-type-tabs__item.is-active::after {
+  content: '';
+  position: absolute;
+  bottom: -13px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 20px;
+  height: 3px;
+  border-radius: 2px;
+  background: #333;
+}
+
+.device-logs-intro {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 24px;
+  padding: 12px 16px;
+  border: 1px solid #f0f0f0;
+  border-radius: 4px;
+  background: #fafafa;
+  color: #666;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.device-logs-intro__title {
+  flex-shrink: 0;
+  color: #333;
+  font-weight: 700;
+}
+
+.device-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 24px;
+  padding: 12px 16px;
+  border: 1px solid #f0f0f0;
+  border-radius: 8px;
+  background: #fdfdfd;
+}
+
+.device-logs-content {
+  min-height: 260px;
+}
+
+.device-logs-title {
+  margin-bottom: 16px;
+  color: #333;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.device-card-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 24px;
+}
+
+.device-card {
+  width: 380px;
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 20px 24px;
+  border: 1px solid #f0f0f0;
+  border-radius: 8px;
+  background: #fff;
+  transition: box-shadow 0.2s ease;
+}
+
+.device-card:hover {
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+}
+
+.device-card__main {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
+}
+
+.device-card__icon,
+.device-history-item__icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.device-card__icon {
+  width: 48px;
+  height: 48px;
+}
+
+.device-history-item__icon {
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+}
+
+.device-card__icon img,
+.device-history-item__icon img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.device-card__info {
+  min-width: 0;
+}
+
+.device-card__name,
+.device-history-item__name {
+  color: #333;
+  font-weight: 500;
+}
+
+.device-card__name {
+  margin-bottom: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.device-card__meta,
+.device-history-item__meta {
+  color: #999;
+  font-size: 12px;
+}
+
+.device-card__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.device-card__badge,
+.device-history-item__badge {
+  display: inline-block;
+  border-radius: 4px;
+  font-size: 11px;
+}
+
+.device-card__badge {
+  background: #f0f0f0;
+  color: #666;
+  padding: 1px 6px;
+}
+
+.device-history-item__badge {
+  margin-left: 8px;
+  background: #eef7ff;
+  color: #06a7ff;
+  border: 1px solid #d4eeff;
+  padding: 2px 6px;
+  font-weight: 400;
+}
+
+.device-card__unused {
+  color: #f28b46;
+  font-size: 11px;
+}
+
+.device-card__help-icon {
+  color: #ccc;
+  cursor: help;
+}
+
+.device-card__actions {
+  display: flex;
+  align-items: center;
+}
+
+.device-card__status-text {
+  color: #999;
+  font-size: 12px;
+}
+
+.device-history-tip {
+  margin-bottom: 24px;
+  color: #999;
+  font-size: 12px;
+}
+
+.device-history-group {
+  margin-bottom: 32px;
+}
+
+.device-history-group__title {
+  margin-bottom: 16px;
+  color: #333;
+  font-size: 16px;
+  font-weight: 500;
+}
+
+.device-history-list {
+  border-top: 1px solid #f0f0f0;
+}
+
+.device-history-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: center;
+  padding: 16px 0;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.device-history-item__main {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.device-history-item__time {
+  color: #999;
+  font-size: 13px;
+}
+
+@media (max-width: 960px) {
+  .device-logs-panel {
+    padding: 20px 16px;
+  }
+
+  .device-toolbar {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .device-card {
+    width: 100%;
+  }
+
+  .device-history-item {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}
+
+@media (max-width: 640px) {
+  .device-type-tabs {
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+
+  .device-card {
+    flex-direction: column;
+  }
+}
+</style>

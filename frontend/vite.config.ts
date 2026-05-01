@@ -121,17 +121,6 @@ export default defineConfig({
             return "vendor-echarts";
           }
 
-          if (
-            id.includes("naive-ui") ||
-            id.includes("vueuc") ||
-            id.includes("vooks") ||
-            id.includes("evtd") ||
-            id.includes("@css-render") ||
-            id.includes("@vicons")
-          ) {
-            return "vendor-naive";
-          }
-
           if (id.includes("element-plus") || id.includes("@element-plus")) {
             return "vendor-element";
           }

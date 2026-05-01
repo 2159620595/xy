@@ -5,6 +5,7 @@ import axios, {
 } from "axios";
 import { useAuthStore } from "@/stores/auth";
 import { DEFAULT_REQUEST_TIMEOUT_MS } from "@/utils/http-timeout";
+import { clearAllSessionStorage, getMainToken } from "@/utils/session";
 
 const normalizeBase = (value: string | undefined) =>
   String(value || "")
@@ -65,7 +66,7 @@ const request = axios.create({
 
 request.interceptors.request.use(
   (config) => {
-    const token = localStorage.getItem("auth_token");
+    const token = getMainToken();
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
     }
@@ -81,8 +82,7 @@ request.interceptors.response.use(
       try {
         useAuthStore().clearAuth();
       } catch {
-        localStorage.removeItem("auth_token");
-        localStorage.removeItem("user_info");
+        clearAllSessionStorage();
       }
     }
     return Promise.reject(error);

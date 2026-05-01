@@ -1,5 +1,5 @@
 {
-  "name": "test-vip-script",
+  "name": "judian-batch-script",
   "private": true,
   "version": "1.0.0",
   "appName": "dmghg",
@@ -9,10 +9,10 @@
     "version": "1.1.9"
   },
   "description": "One-path VIP order and autopay script",
-  "main": "test-vip.js",
+  "main": "judian-batch.js",
   "scripts": {
-    "start": "node test-vip.js",
-    "one": "node test-vip.js one"
+    "start": "node judian-batch.js",
+    "one": "node judian-batch.js one"
   },
   "dependencies": {
     "axios": "^1.15.2",

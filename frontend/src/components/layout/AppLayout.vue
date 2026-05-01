@@ -2,7 +2,6 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { Expand, Fold } from '@element-plus/icons-vue'
 import { useRoute } from 'vue-router'
-import NaiveProviders from '@/components/common/NaiveProviders.vue'
 import AppSidebar from '@/components/layout/AppSidebar.vue'
 
 const MOBILE_BREAKPOINT = 1024
@@ -58,47 +57,45 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <NaiveProviders>
-    <div class="layout-shell">
-      <transition name="layout-fade">
-        <div
-          v-if="isMobile && mobileSidebarOpen"
-          class="layout-overlay"
-          @click="closeMobileSidebar"
-        />
-      </transition>
-
+  <div class="layout-shell">
+    <transition name="layout-fade">
       <div
-        class="layout-sidebar"
-        :class="{
-          collapsed: sidebarCollapsed,
-          mobile: isMobile,
-          'mobile-open': mobileSidebarOpen,
-        }"
-      >
-        <AppSidebar
-          :collapsed="sidebarCollapsed"
-          :is-mobile="isMobile"
-          :mobile-open="mobileSidebarOpen"
-          @navigate="closeMobileSidebar"
-        />
-      </div>
+        v-if="isMobile && mobileSidebarOpen"
+        class="layout-overlay"
+        @click="closeMobileSidebar"
+      />
+    </transition>
 
-      <div class="layout-main">
-        <el-button
-          class="layout-sidebar-trigger"
-          :icon="sidebarCollapsed && !isMobile ? Expand : Fold"
-          circle
-          @click="toggleSidebar"
-        />
-        <main class="layout-content">
-          <div class="content-inner">
-            <router-view />
-          </div>
-        </main>
-      </div>
+    <div
+      class="layout-sidebar"
+      :class="{
+        collapsed: sidebarCollapsed,
+        mobile: isMobile,
+        'mobile-open': mobileSidebarOpen,
+      }"
+    >
+      <AppSidebar
+        :collapsed="sidebarCollapsed"
+        :is-mobile="isMobile"
+        :mobile-open="mobileSidebarOpen"
+        @navigate="closeMobileSidebar"
+      />
     </div>
-  </NaiveProviders>
+
+    <div class="layout-main">
+      <el-button
+        class="layout-sidebar-trigger"
+        :icon="sidebarCollapsed && !isMobile ? Expand : Fold"
+        circle
+        @click="toggleSidebar"
+      />
+      <main class="layout-content">
+        <div class="content-inner">
+          <router-view />
+        </div>
+      </main>
+    </div>
+  </div>
 </template>
 
 <style scoped>
