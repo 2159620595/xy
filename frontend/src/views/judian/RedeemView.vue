@@ -61,7 +61,7 @@
             >
               {{ countdown }}
             </div>
-            <div class="stat-help">卡密首次打开后开始计时</div>
+            <div class="stat-help">{{ countdownHelpText }}</div>
           </article>
 
           <article class="panel stat-card">
@@ -235,7 +235,11 @@
             <button
               class="action-button action-button--primary scan-primary-button"
               :disabled="
-                cameraBusy || scanSubmitting || batchSubmitting || isBatchBusy
+                cameraBusy ||
+                scanSubmitting ||
+                batchSubmitting ||
+                isBatchBusy ||
+                isCardReadOnly
               "
               @click="openCamera"
             >
@@ -254,6 +258,7 @@
               <button
                 class="action-button action-button--primary action-button--secondary"
                 :disabled="
+                  isCardReadOnly ||
                   scanSubmitting ||
                   batchSubmitting ||
                   batchCancelling ||
@@ -277,7 +282,7 @@
               </button>
               <button
                 class="action-button"
-                :disabled="pageRefreshing"
+                :disabled="pageRefreshing || isCardReadOnly"
                 @click="refreshSession"
               >
                 {{ pageRefreshing ? "创建中..." : "新建会话" }}
@@ -288,7 +293,10 @@
               class="upload-dropzone"
               :class="{
                 'upload-dropzone--disabled':
-                  scanSubmitting || batchSubmitting || isBatchBusy,
+                  scanSubmitting ||
+                  batchSubmitting ||
+                  isBatchBusy ||
+                  isCardReadOnly,
               }"
               @click="openQrImagePicker"
             >
@@ -320,6 +328,7 @@
                 class="paste-panel__textarea"
                 placeholder="在这里粘贴二维码链接、tradeNo、orderNo，或直接 Ctrl+V / 长按粘贴二维码图片"
                 :disabled="
+                  isCardReadOnly ||
                   scanSubmitting ||
                   batchSubmitting ||
                   isBatchBusy ||
@@ -331,6 +340,7 @@
                 <button
                   class="action-button"
                   :disabled="
+                    isCardReadOnly ||
                     scanSubmitting ||
                     batchSubmitting ||
                     isBatchBusy ||
@@ -846,7 +856,12 @@ const sessionStatusText = computed(() => {
 });
 
 const sessionMessage = computed(
-  () => currentSession.value?.message || "请先打开摄像头扫码",
+  () => {
+    if (isCardReadOnly.value) {
+      return `卡密已${cardInvalidReasonText.value}，当前处于 7 天存活期内，仅保留 0 权限展示，无法支付。`;
+    }
+    return currentSession.value?.message || "请先打开摄像头扫码";
+  },
 );
 
 const accountStatusText = computed(() => {
@@ -865,22 +880,39 @@ const heroBadgeClass = computed(() => {
   return "hero-badge--warning";
 });
 
+const isCardReadOnly = computed(() => redeemInfo.value.canPay === false);
+const cardInvalidReasonText = computed(() => {
+  const reason = String(
+    redeemInfo.value.invalidReason || redeemInfo.value.status || "",
+  );
+  if (reason === "void") return "作废";
+  if (reason === "expired") return "过期";
+  return "失效";
+});
+
 const countdown = computed(() => {
+  const survivalExpiresAt = Number(redeemInfo.value.survivalExpiresAt || 0);
+  if (isCardReadOnly.value && survivalExpiresAt > nowTimestamp.value) {
+    return `存活期 ${formatDurationText(survivalExpiresAt - nowTimestamp.value)}`;
+  }
   const expiresAt = Number(redeemInfo.value.expiresAt || 0);
   if (!expiresAt) return "尚未开始";
   const left = expiresAt - nowTimestamp.value;
   if (left <= 0) return "已过期";
-  const days = Math.floor(left / 86400);
-  const hours = Math.floor((left % 86400) / 3600);
-  const minutes = Math.floor((left % 3600) / 60);
-  const seconds = left % 60;
-  const hhmmss = [hours, minutes, seconds]
-    .map((item) => String(item).padStart(2, "0"))
-    .join(":");
-  return days > 0 ? `${days}天 ${hhmmss}` : hhmmss;
+  return formatDurationText(left);
+});
+
+const countdownHelpText = computed(() => {
+  if (!isCardReadOnly.value) return "卡密首次打开后开始计时";
+  return `卡密已${cardInvalidReasonText.value}，当前仅保留 7 天查看存活期，到期后彻底失效`;
 });
 
 const remainingDiamondText = computed(() => {
+  const remainingQuota = Number(redeemInfo.value.remainingQuota);
+  if (isCardReadOnly.value) return "0 钻";
+  if (Number.isFinite(remainingQuota) && remainingQuota >= 0) {
+    return `${Math.max(0, remainingQuota)} 钻`;
+  }
   const maxUses = Number(redeemInfo.value.maxUses || 0);
   const used =
     Number(redeemInfo.value.useCount || 0) + liveBatchConsumedDiamond.value;
@@ -895,12 +927,17 @@ const totalDiamondText = computed(() => {
 });
 
 const usedDiamondText = computed(() => {
+  const maxUses = Number(redeemInfo.value.maxUses || 0);
+  if (isCardReadOnly.value && maxUses > 0) {
+    return `${maxUses} 钻`;
+  }
   const used =
     Number(redeemInfo.value.useCount || 0) + liveBatchConsumedDiamond.value;
   return `${used} 钻`;
 });
 
 const remainingPercent = computed(() => {
+  if (isCardReadOnly.value) return 0;
   const maxUses = Number(redeemInfo.value.maxUses || 0);
   const used =
     Number(redeemInfo.value.useCount || 0) + liveBatchConsumedDiamond.value;
@@ -926,6 +963,7 @@ const orderStatusText = computed(() => {
 
 const canConfirmUnlock = computed(
   () =>
+    !isCardReadOnly.value &&
     !isUnlockCompleted.value &&
     ["scanned", "confirmed"].includes(
       String(currentSession.value?.status || ""),
@@ -1026,6 +1064,7 @@ const batchPreviewRequiredText = computed(
 const batchCanSubmit = computed(() => {
   const count = Math.floor(Number(batchOrderCount.value || 0));
   if (!Number.isFinite(count) || count < 1 || count > 365) return false;
+  if (isCardReadOnly.value) return false;
   return batchPreview.value.canSubmit !== false;
 });
 const batchPreviewHintClass = computed(() => {
@@ -1036,6 +1075,9 @@ const batchPreviewHintClass = computed(() => {
 });
 const batchPreviewHintText = computed(() => {
   if (batchPreviewLoading.value) return "正在校验额度...";
+  if (isCardReadOnly.value) {
+    return `卡密已${cardInvalidReasonText.value}，当前处于 7 天存活期内，仅保留 0 权限展示，无法支付。`;
+  }
   if (batchPreview.value.error) return batchPreview.value.error;
   if (batchPreview.value.canSubmit) {
     return `当前额度充足，本次预计预扣 ${batchPreviewRequiredText.value}。`;
@@ -1147,6 +1189,12 @@ function createEmptyRedeemInfo() {
     expiresAt: null,
     useCount: 0,
     maxUses: 0,
+    remainingQuota: -1,
+    canPay: true,
+    invalidReason: "",
+    invalidSinceAt: null,
+    survivalExpiresAt: null,
+    withinSurvival: true,
     remark: "",
     account: {
       accountId: "",
@@ -1187,6 +1235,18 @@ function createEmptyBatchPreview() {
     canSubmit: true,
     error: "",
   };
+}
+
+function formatDurationText(totalSeconds) {
+  const safeSeconds = Math.max(0, Math.floor(Number(totalSeconds || 0)));
+  const days = Math.floor(safeSeconds / 86400);
+  const hours = Math.floor((safeSeconds % 86400) / 3600);
+  const minutes = Math.floor((safeSeconds % 3600) / 60);
+  const seconds = safeSeconds % 60;
+  const hhmmss = [hours, minutes, seconds]
+    .map((item) => String(item).padStart(2, "0"))
+    .join(":");
+  return days > 0 ? `${days}天 ${hhmmss}` : hhmmss;
 }
 
 function normalizeOrder(order) {
@@ -1310,6 +1370,24 @@ function mergeRedeemInfo(partial) {
     next.useCount = Number(partial.useCount ?? next.useCount ?? 0);
   if (partial?.maxUses !== undefined)
     next.maxUses = Number(partial.maxUses ?? next.maxUses ?? 0);
+  if (partial?.remainingQuota !== undefined)
+    next.remainingQuota = Number(partial.remainingQuota ?? next.remainingQuota);
+  if (partial?.canPay !== undefined)
+    next.canPay = partial.canPay !== false;
+  if (partial?.invalidReason !== undefined)
+    next.invalidReason = String(partial.invalidReason || "");
+  if (partial?.invalidSinceAt !== undefined)
+    next.invalidSinceAt =
+      partial.invalidSinceAt != null && partial.invalidSinceAt !== ""
+        ? Number(partial.invalidSinceAt)
+        : null;
+  if (partial?.survivalExpiresAt !== undefined)
+    next.survivalExpiresAt =
+      partial.survivalExpiresAt != null && partial.survivalExpiresAt !== ""
+        ? Number(partial.survivalExpiresAt)
+        : null;
+  if (partial?.withinSurvival !== undefined)
+    next.withinSurvival = partial.withinSurvival !== false;
 
   if (partial?.remark !== undefined)
     next.remark = String(partial.remark || next.remark || "");
@@ -1534,6 +1612,12 @@ async function refreshSession() {
 }
 
 async function openCamera() {
+  if (isCardReadOnly.value) {
+    showToast(
+      `卡密已${cardInvalidReasonText.value}，当前仅保留 7 天存活期，无法支付`,
+    );
+    return;
+  }
   if (cameraBusy.value) return;
   if (window.isSecureContext === false) {
     showToast("必须使用 HTTPS 或 localhost 才能调用摄像头");
@@ -1639,6 +1723,12 @@ function scanVideoFrame() {
 }
 
 async function submitScan(qrText) {
+  if (isCardReadOnly.value) {
+    showToast(
+      `卡密已${cardInvalidReasonText.value}，当前仅保留 7 天存活期，无法支付`,
+    );
+    return;
+  }
   const sessionId = String(currentSession.value?.sessionId || "");
   if (!sessionId) {
     showToast("当前解锁会话不存在，请刷新页面后重试");
@@ -1668,7 +1758,12 @@ async function submitScan(qrText) {
 }
 
 function openQrImagePicker() {
-  if (scanSubmitting.value || batchSubmitting.value || isBatchRunning.value) {
+  if (
+    isCardReadOnly.value ||
+    scanSubmitting.value ||
+    batchSubmitting.value ||
+    isBatchRunning.value
+  ) {
     return;
   }
   qrImageInputRef.value?.click();
@@ -1762,6 +1857,12 @@ async function handleQrImageChange(event) {
     showToast("请选择图片文件");
     return;
   }
+  if (isCardReadOnly.value) {
+    showToast(
+      `卡密已${cardInvalidReasonText.value}，当前仅保留 7 天存活期，无法支付`,
+    );
+    return;
+  }
 
   try {
     scanSubmitting.value = true;
@@ -1774,6 +1875,12 @@ async function handleQrImageChange(event) {
 }
 
 async function submitPastedQrText() {
+  if (isCardReadOnly.value) {
+    showToast(
+      `卡密已${cardInvalidReasonText.value}，当前仅保留 7 天存活期，无法支付`,
+    );
+    return;
+  }
   if (!pastedQrText.value) {
     showToast("请先粘贴二维码文本或链接");
     return;
@@ -1786,6 +1893,10 @@ async function submitPastedQrText() {
 }
 
 async function handlePasteIntoTextarea(event) {
+  if (isCardReadOnly.value) {
+    event?.preventDefault?.();
+    return;
+  }
   const clipboard = event?.clipboardData;
   if (!clipboard) return;
 
@@ -1823,6 +1934,7 @@ async function handlePasteIntoTextarea(event) {
 
 async function handleGlobalPaste(event) {
   if (
+    isCardReadOnly.value ||
     scanSubmitting.value ||
     batchSubmitting.value ||
     isBatchBusy.value ||
@@ -1921,6 +2033,12 @@ async function readClipboardPayload() {
 }
 
 function openBatchOrderModal() {
+  if (isCardReadOnly.value) {
+    showToast(
+      `卡密已${cardInvalidReasonText.value}，当前仅保留 7 天存活期，无法支付`,
+    );
+    return;
+  }
   if (batchSubmitting.value || batchCancelling.value || isBatchBusy.value)
     return;
   batchOrderCount.value = Math.min(

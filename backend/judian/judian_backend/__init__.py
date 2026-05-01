@@ -233,6 +233,21 @@ def now_text() -> str:
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
 
+PUBLIC_CDKEY_SURVIVAL_SECONDS = 7 * 86400
+
+
+def parse_text_datetime_to_ts(value: Any) -> int | None:
+    text = str(value or '').strip()
+    if not text:
+        return None
+    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+        try:
+            return int(datetime.strptime(text, fmt).timestamp())
+        except ValueError:
+            continue
+    return None
+
+
 def ensure_judian_schema(db: Session | None = None) -> None:
     global _JUDIAN_SCHEMA_READY
     if _JUDIAN_SCHEMA_READY:
@@ -1015,13 +1030,12 @@ def build_public_batch_purchase_preview(
         vip_id=vip_id,
         package_type=package_type,
     )
+    cdkey_meta = resolve_public_cdkey_runtime_meta(cdkey_row)
     available_diamond = max(0, resolve_account_diamond_quantity(account))
-    max_uses = pick_int(cdkey_row.max_uses)
-    used_uses = pick_int(cdkey_row.use_count)
-    remaining_quota = -1 if max_uses <= 0 else max(0, max_uses - used_uses)
+    remaining_quota = pick_int(cdkey_meta.get('remainingQuota'))
     enough_diamond = available_diamond >= required_diamond
     enough_quota = remaining_quota < 0 or remaining_quota >= required_diamond
-    can_submit = enough_diamond and enough_quota
+    can_submit = bool(cdkey_meta.get('canPay')) and enough_diamond and enough_quota
     return {
         'vipId': resolved_vip_id,
         'packageType': str(package_type or '').strip().lower(),
@@ -1033,16 +1047,21 @@ def build_public_batch_purchase_preview(
         'enoughDiamond': enough_diamond,
         'enoughQuota': enough_quota,
         'canSubmit': can_submit,
+        'cardStatus': cdkey_meta.get('status'),
+        'canPay': cdkey_meta.get('canPay'),
+        'survivalExpiresAt': cdkey_meta.get('survivalExpiresAt'),
+        'withinSurvival': cdkey_meta.get('withinSurvival'),
     }
 
 
 def ensure_public_cdkey_quota_sufficient(cdkey_row: models.JudianCdKey, required_diamond: int) -> None:
+    ensure_public_cdkey_payment_allowed(cdkey_row)
     required = max(0, pick_int(required_diamond))
+    meta = resolve_public_cdkey_runtime_meta(cdkey_row)
     max_uses = pick_int(cdkey_row.max_uses)
     if max_uses <= 0 or required <= 0:
         return
-    used_uses = pick_int(cdkey_row.use_count)
-    remaining_quota = max(0, max_uses - used_uses)
+    remaining_quota = max(0, pick_int(meta.get('remainingQuota')))
     if required > remaining_quota:
         raise HTTPException(status_code=400, detail=f'卡密额度不足，需 {required} 钻，剩余 {remaining_quota} 钻')
 
@@ -1057,6 +1076,15 @@ def apply_public_cdkey_consumption(
     cdkey_row.use_count = int(cdkey_row.use_count or 0) + consumed
     if int(cdkey_row.max_uses or 0) > 0 and int(cdkey_row.use_count or 0) >= int(cdkey_row.max_uses or 0):
         cdkey_row.status = 'expired'
+        payload = dict_like(cdkey_row.payload)
+        invalid_at = int(time.time())
+        if pick_int(payload.get('expiredAt')) <= 0:
+            payload['expiredAt'] = invalid_at
+        if pick_int(payload.get('quotaExhaustedAt')) <= 0:
+            payload['quotaExhaustedAt'] = invalid_at
+        if pick_int(payload.get('invalidatedAt')) <= 0:
+            payload['invalidatedAt'] = invalid_at
+        cdkey_row.payload = payload
     else:
         cdkey_row.status = 'active'
     if latest_order_id:
@@ -1163,6 +1191,142 @@ def pick_nullable_int(*values: Any) -> int | None:
         except (TypeError, ValueError):
             continue
     return None
+
+
+def resolve_public_cdkey_runtime_meta(
+    row: models.JudianCdKey,
+    *,
+    now_ts: int | None = None,
+) -> dict[str, Any]:
+    now = int(time.time()) if now_ts is None else int(now_ts)
+    payload = dict_like(row.payload)
+    raw_status = str(row.status or '').strip().lower()
+    expires_at = pick_nullable_int(row.expires_at)
+    max_uses = pick_int(row.max_uses)
+    used_uses = pick_int(row.use_count)
+    invalid_reason = ''
+    invalid_since_at: int | None = None
+    expired_by_quota = False
+
+    if raw_status == 'void':
+        invalid_reason = 'void'
+        invalid_since_at = pick_nullable_int(
+            payload.get('voidedAt'),
+            payload.get('invalidatedAt'),
+            parse_text_datetime_to_ts(row.updated_at),
+            expires_at,
+            now,
+        )
+    elif max_uses > 0 and used_uses >= max_uses:
+        invalid_reason = 'expired'
+        expired_by_quota = True
+        invalid_since_at = pick_nullable_int(
+            payload.get('quotaExhaustedAt'),
+            payload.get('expiredAt'),
+            payload.get('invalidatedAt'),
+            expires_at,
+            parse_text_datetime_to_ts(row.updated_at),
+            now,
+        )
+    elif raw_status == 'expired':
+        invalid_reason = 'expired'
+        invalid_since_at = pick_nullable_int(
+            payload.get('expiredAt'),
+            payload.get('invalidatedAt'),
+            expires_at,
+            parse_text_datetime_to_ts(row.updated_at),
+            now,
+        )
+    elif expires_at and now > expires_at:
+        invalid_reason = 'expired'
+        invalid_since_at = pick_nullable_int(
+            payload.get('expiredAt'),
+            payload.get('invalidatedAt'),
+            expires_at,
+        )
+
+    survival_expires_at = (
+        int(invalid_since_at) + PUBLIC_CDKEY_SURVIVAL_SECONDS
+        if invalid_since_at
+        else None
+    )
+    within_survival = (
+        True
+        if not invalid_reason
+        else bool(survival_expires_at and now <= survival_expires_at)
+    )
+    remaining_quota = -1 if max_uses <= 0 else max(0, max_uses - used_uses)
+    if invalid_reason:
+        remaining_quota = 0
+
+    if invalid_reason:
+        effective_status = invalid_reason
+    else:
+        effective_status = raw_status or 'active'
+
+    return {
+        'status': effective_status,
+        'rawStatus': raw_status or 'active',
+        'invalidReason': invalid_reason,
+        'invalidSinceAt': int(invalid_since_at) if invalid_since_at else None,
+        'survivalExpiresAt': survival_expires_at,
+        'withinSurvival': within_survival,
+        'canPay': not invalid_reason,
+        'remainingQuota': remaining_quota,
+        'expiredByQuota': expired_by_quota,
+    }
+
+
+def sync_public_cdkey_runtime_state(
+    row: models.JudianCdKey,
+    *,
+    now_ts: int | None = None,
+) -> tuple[dict[str, Any], bool]:
+    meta = resolve_public_cdkey_runtime_meta(row, now_ts=now_ts)
+    payload = dict_like(row.payload)
+    changed = False
+    invalid_reason = str(meta.get('invalidReason') or '').strip().lower()
+    invalid_since_at = pick_nullable_int(meta.get('invalidSinceAt'))
+
+    if meta['status'] != str(row.status or '').strip().lower():
+        row.status = meta['status']
+        changed = True
+
+    if invalid_reason == 'void':
+        if invalid_since_at and pick_int(payload.get('voidedAt')) <= 0:
+            payload['voidedAt'] = invalid_since_at
+            changed = True
+        if invalid_since_at and pick_int(payload.get('invalidatedAt')) <= 0:
+            payload['invalidatedAt'] = invalid_since_at
+            changed = True
+    elif invalid_reason == 'expired':
+        if invalid_since_at and pick_int(payload.get('expiredAt')) <= 0:
+            payload['expiredAt'] = invalid_since_at
+            changed = True
+        if meta.get('expiredByQuota') and invalid_since_at and pick_int(payload.get('quotaExhaustedAt')) <= 0:
+            payload['quotaExhaustedAt'] = invalid_since_at
+            changed = True
+        if invalid_since_at and pick_int(payload.get('invalidatedAt')) <= 0:
+            payload['invalidatedAt'] = invalid_since_at
+            changed = True
+
+    if changed:
+        row.payload = payload
+        row.updated_at = now_text()
+
+    return meta, changed
+
+
+def ensure_public_cdkey_payment_allowed(cdkey_row: models.JudianCdKey) -> dict[str, Any]:
+    meta = resolve_public_cdkey_runtime_meta(cdkey_row)
+    if meta['canPay']:
+        return meta
+    if meta['withinSurvival']:
+        raise HTTPException(
+            status_code=410,
+            detail='聚点卡密已失效，当前处于 7 天存活期内，仅保留 0 权限展示，无法支付',
+        )
+    raise HTTPException(status_code=410, detail='聚点卡密已失效，7 天存活期已结束')
 
 
 def get_account_payload(row: models.JudianAccount) -> dict[str, Any]:
@@ -1626,9 +1790,6 @@ def get_public_account_or_404(db: Session, row: models.JudianCdKey) -> models.Ju
 
 
 def ensure_public_cdkey_ready(db: Session, row: models.JudianCdKey) -> models.JudianAccount:
-    if row.status == 'void':
-        raise HTTPException(status_code=410, detail='聚点卡密已作废')
-
     account = get_public_account_or_404(db, row)
     if account.enabled is False:
         raise HTTPException(status_code=503, detail='关联聚点账号不可用')
@@ -1641,17 +1802,13 @@ def ensure_public_cdkey_ready(db: Session, row: models.JudianCdKey) -> models.Ju
             row.status = 'active'
         row.updated_at = now_text()
 
-    if row.expires_at and now > int(row.expires_at):
-        row.status = 'expired'
-        row.updated_at = now_text()
+    meta, changed = sync_public_cdkey_runtime_state(row, now_ts=now)
+    if changed:
         db.commit()
-        raise HTTPException(status_code=410, detail='聚点卡密已过期')
+        db.refresh(row)
 
-    if int(row.max_uses or 0) > 0 and int(row.use_count or 0) >= int(row.max_uses or 0):
-        row.status = 'void'
-        row.updated_at = now_text()
-        db.commit()
-        raise HTTPException(status_code=410, detail=f'卡密额度已用尽（{row.max_uses} 钻）')
+    if not meta['withinSurvival']:
+        raise HTTPException(status_code=410, detail='聚点卡密已失效，7 天存活期已结束')
 
     db.commit()
     db.refresh(row)
@@ -1681,13 +1838,20 @@ def serialize_public_order(row: models.JudianOrder | None) -> dict[str, Any] | N
 
 
 def serialize_public_cdkey_summary(row: models.JudianCdKey) -> dict[str, Any]:
+    meta = resolve_public_cdkey_runtime_meta(row)
     return {
         'code': row.code,
-        'status': row.status or 'active',
+        'status': meta['status'],
         'duration': int(row.duration or 0),
         'expiresAt': int(row.expires_at or 0) if row.expires_at else None,
         'useCount': int(row.use_count or 0),
         'maxUses': int(row.max_uses or 0),
+        'remainingQuota': pick_int(meta.get('remainingQuota')),
+        'canPay': bool(meta.get('canPay')),
+        'invalidReason': pick_text(meta.get('invalidReason')),
+        'invalidSinceAt': pick_nullable_int(meta.get('invalidSinceAt')),
+        'survivalExpiresAt': pick_nullable_int(meta.get('survivalExpiresAt')),
+        'withinSurvival': bool(meta.get('withinSurvival')),
         'remark': row.remark or '',
     }
 
@@ -1771,14 +1935,21 @@ def build_public_unlock_response(
         order_row = db.query(models.JudianOrder).filter_by(order_id=session_row.order_id).first()
     if batch_task_row is None:
         batch_task_row = get_latest_public_batch_task(db, session_row)
+    cdkey_meta = resolve_public_cdkey_runtime_meta(cdkey_row)
     return {
         'success': True,
         'code': cdkey_row.code,
-        'status': cdkey_row.status or 'active',
+        'status': cdkey_meta['status'],
         'duration': int(cdkey_row.duration or 0),
         'expiresAt': int(cdkey_row.expires_at or 0) if cdkey_row.expires_at else None,
         'useCount': int(cdkey_row.use_count or 0),
         'maxUses': int(cdkey_row.max_uses or 0),
+        'remainingQuota': pick_int(cdkey_meta.get('remainingQuota')),
+        'canPay': bool(cdkey_meta.get('canPay')),
+        'invalidReason': pick_text(cdkey_meta.get('invalidReason')),
+        'invalidSinceAt': pick_nullable_int(cdkey_meta.get('invalidSinceAt')),
+        'survivalExpiresAt': pick_nullable_int(cdkey_meta.get('survivalExpiresAt')),
+        'withinSurvival': bool(cdkey_meta.get('withinSurvival')),
         'remark': cdkey_row.remark or '',
         'account': serialize_public_account(account),
         'session': serialize_public_session(session_row, order_row),
@@ -2920,6 +3091,7 @@ def process_public_unlock_scan(
     trade_no: str = '',
     order_no: str = '',
 ) -> tuple[models.JudianAccount, requests.Session, models.JudianOrder]:
+    ensure_public_cdkey_payment_allowed(cdkey_row)
     trade_candidate, order_candidate, scan_url = extract_public_trade_candidate(qr_text, trade_no, order_no)
 
     def load_scan_order(runtime_session: requests.Session):
@@ -4508,6 +4680,7 @@ def public_unlock_batch_cancel(session_id: str, db: Session = Depends(get_db)):
 @app.post('/public/unlock/{session_id}/confirm')
 def public_unlock_confirm(session_id: str, db: Session = Depends(get_db)):
     session_row, cdkey_row, account = get_public_unlock_session_or_404(db, session_id)
+    ensure_public_cdkey_payment_allowed(cdkey_row)
     if not session_row.order_id:
         raise HTTPException(status_code=400, detail='当前会话还没有识别到订单，请先扫码')
     order_row = db.query(models.JudianOrder).filter_by(order_id=session_row.order_id).first()
@@ -4536,6 +4709,7 @@ def public_unlock_confirm(session_id: str, db: Session = Depends(get_db)):
 @app.post('/public/unlock/{session_id}/complete')
 def public_unlock_complete(session_id: str, db: Session = Depends(get_db)):
     session_row, cdkey_row, account = get_public_unlock_session_or_404(db, session_id)
+    ensure_public_cdkey_payment_allowed(cdkey_row)
     order_row = db.query(models.JudianOrder).filter_by(order_id=session_row.order_id).first() if session_row.order_id else None
     if order_row is None:
         raise HTTPException(status_code=400, detail='当前订单尚未同步，请重新扫码后再试')
@@ -5233,13 +5407,26 @@ def update_cdkey(
     db: Session = Depends(get_db),
 ):
     row = get_cdkey_or_404(db, user, row_id)
+    payload = dict_like(row.payload)
     if body.status is not None:
         next_status = str(body.status or '').strip().lower()
         if next_status not in {'unused', 'active', 'expired', 'void'}:
             raise HTTPException(status_code=400, detail='聚点卡密状态不合法')
         row.status = next_status
+        now_ts = int(time.time())
+        if next_status == 'void':
+            if pick_int(payload.get('voidedAt')) <= 0:
+                payload['voidedAt'] = now_ts
+            if pick_int(payload.get('invalidatedAt')) <= 0:
+                payload['invalidatedAt'] = now_ts
+        elif next_status == 'expired':
+            if pick_int(payload.get('expiredAt')) <= 0:
+                payload['expiredAt'] = now_ts
+            if pick_int(payload.get('invalidatedAt')) <= 0:
+                payload['invalidatedAt'] = now_ts
     if body.remark is not None:
         row.remark = str(body.remark or '').strip()
+    row.payload = payload
     row.updated_at = now_text()
     db.commit()
     db.refresh(row)
@@ -5252,11 +5439,17 @@ def update_cdkey(
 
 @app.delete('/cdkeys/inactive')
 def clean_inactive_cdkeys(user: dict[str, Any] = Depends(get_current_user), db: Session = Depends(get_db)):
-    rows = owner_scoped_cdkey_query(db, user).filter(models.JudianCdKey.status.in_(['expired', 'void'])).all()
-    removed = len(rows)
+    removed = 0
     owner_username = str(user.get('username') or '').strip()
+    rows = owner_scoped_cdkey_query(db, user).all()
     for row in rows:
+        meta = resolve_public_cdkey_runtime_meta(row)
+        if not meta['invalidReason']:
+            continue
+        if meta['withinSurvival']:
+            continue
         db.delete(row)
+        removed += 1
     db.commit()
     invalidate_judian_owner_cache(owner_username)
     return {
