@@ -91,6 +91,10 @@ const buildProxyMap = () => {
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [vue()],
+  test: {
+    environment: "jsdom",
+    globals: true,
+  },
   base: buildBase,
   resolve: {
     alias: {

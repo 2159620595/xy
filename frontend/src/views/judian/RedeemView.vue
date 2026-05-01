@@ -112,10 +112,10 @@
             </div>
 
             <div
-              v-if="resultMessage"
+              v-if="displayedResultMessage"
               class="result-message result-message--inline"
             >
-              {{ resultMessage }}
+              {{ displayedResultMessage }}
             </div>
 
             <div
@@ -154,9 +154,9 @@
                 />
               </div>
               <div class="batch-progress-stats">
-                <span>成功 {{ currentBatchTask.successCount }}</span>
-                <span>失败 {{ currentBatchTask.failedCount }}</span>
-                <span>待处理 {{ currentBatchTask.pendingCount }}</span>
+                <span>成功 {{ batchDisplayedSuccessCount }}</span>
+                <span>失败 {{ batchDisplayedFailedCount }}</span>
+                <span>待处理 {{ batchDisplayedPendingCount }}</span>
                 <span v-if="batchRequiredDiamond > 0"
                   >预计 {{ batchRequiredText }}</span
                 >
@@ -173,17 +173,11 @@
                   v-for="item in batchItems"
                   :key="`${item.index}-${item.tradeNo || item.orderNo || 'empty'}`"
                   class="batch-progress-item"
-                  :class="`batch-progress-item--${item.status}`"
+                  :class="`batch-progress-item--${getBatchItemDisplayStatus(item)}`"
                 >
                   <div class="batch-progress-item__top">
                     <span>第 {{ item.index }} 单</span>
-                    <span>{{
-                      item.status === "completed"
-                        ? "成功"
-                        : item.status === "failed"
-                          ? "失败"
-                          : "处理中"
-                    }}</span>
+                    <span>{{ getBatchItemStatusText(item) }}</span>
                   </div>
                   <div class="batch-progress-item__code">
                     {{
@@ -195,6 +189,10 @@
                   <div class="batch-progress-item__message">
                     {{ item.message || "等待处理" }}
                   </div>
+                  <pre
+                    v-if="item.rawResponseText"
+                    class="batch-progress-item__raw"
+                  >{{ item.rawResponseText }}</pre>
                   <div
                     v-if="item.consumedDiamond > 0"
                     class="batch-progress-item__message"
@@ -243,9 +241,11 @@
               {{
                 cameraBusy
                   ? "摄像头启动中..."
-                  : isBatchRunning
-                    ? "批量下单进行中"
-                    : "打开后置摄像头扫码"
+                  : isBatchCanceling
+                    ? "批量任务取消中"
+                    : isBatchRunning
+                      ? "批量下单进行中"
+                      : "打开后置摄像头扫码"
               }}
             </button>
 
@@ -262,9 +262,11 @@
                       ? "正在取消批量任务..."
                       : canCancelBatchTask
                         ? "取消批量任务"
-                        : isBatchRunning
-                          ? "批量任务执行中..."
-                          : "批量下单"
+                        : isBatchCanceling
+                          ? "批量任务取消中..."
+                          : isBatchRunning
+                            ? "批量任务执行中..."
+                            : "批量下单"
                 }}
               </button>
               <button
@@ -514,11 +516,13 @@
               {{
                 batchSubmitting
                   ? "批量下单提交中..."
-                  : isBatchRunning
-                    ? "批量任务执行中..."
-                    : batchPreviewLoading
-                      ? "正在校验额度..."
-                      : "立即开始"
+                  : isBatchCanceling
+                    ? "批量任务取消中..."
+                    : isBatchRunning
+                      ? "批量任务执行中..."
+                      : batchPreviewLoading
+                        ? "正在校验额度..."
+                        : "立即开始"
               }}
             </button>
           </div>
@@ -563,9 +567,7 @@
             </div>
             <div class="order-item">
               <span class="order-label">账户当前余额</span>
-              <span class="order-value"
-                >{{ redeemInfo.account?.diamondQuantity || 0 }} 钻</span
-              >
+              <span class="order-value">{{ liveAccountDiamondText }}</span>
             </div>
             <div class="order-item order-item--full">
               <span class="order-label">订单备注</span>
@@ -742,27 +744,56 @@ const resultPayload = computed(() => currentSession.value?.resultPayload || {});
 const resultMessage = computed(
   () => resultPayload.value?.rendered_message || "",
 );
+function hasExplicitJudianPaySuccess(payPayload) {
+  return (
+    payPayload &&
+    typeof payPayload === "object" &&
+    payPayload.success === true &&
+    payPayload.settledByPolling !== true
+  );
+}
+function hasRealDiamondDecrease(payload) {
+  const consumed = Number(payload?.consumedDiamond ?? 0);
+  if (consumed > 0) return true;
+  const before = Number(payload?.beforeDiamond ?? -1);
+  const after = Number(payload?.afterDiamond ?? payload?.diamondQuantity ?? -1);
+  return before >= 0 && after >= 0 && after < before;
+}
+function isConfirmedUnlockSuccess(payload) {
+  return (
+    hasExplicitJudianPaySuccess(payload?.payPayload) &&
+    hasRealDiamondDecrease(payload)
+  );
+}
+const isBatchCanceling = computed(
+  () => currentBatchTask.value?.cancelRequested === true,
+);
 const isBatchRunning = computed(
   () => String(currentBatchTask.value?.status || "") === "running",
 );
+const liveBatchConsumedDiamond = computed(() => {
+  if (!isBatchRunning.value) return 0;
+  const totalConsumed = Math.max(
+    0,
+    Number(currentBatchTask.value?.totalConsumedDiamond || 0),
+  );
+  const syncedConsumed = Math.max(
+    0,
+    Number(currentBatchTask.value?.payload?.syncedConsumedDiamond || 0),
+  );
+  return Math.max(0, totalConsumed - syncedConsumed);
+});
 const canCancelBatchTask = computed(() => {
   const status = String(currentBatchTask.value?.status || "");
   if (!["pending", "running"].includes(status)) return false;
   return currentBatchTask.value?.cancelRequested !== true;
 });
-const isUnlockCompleted = computed(() => {
-  const sessionStatus = String(currentSession.value?.status || "");
-  const orderStatus = String(currentOrder.value?.status || "");
-  const paySuccess = resultPayload.value?.payPayload?.success === true;
-  const consumed = Number(resultPayload.value?.consumedDiamond || 0);
-  return (
-    sessionStatus === "completed" ||
-    orderStatus === "completed" ||
-    paySuccess ||
-    consumed > 0 ||
-    Boolean(resultMessage.value)
-  );
-});
+const isUnlockCompleted = computed(() =>
+  isConfirmedUnlockSuccess(resultPayload.value),
+);
+const displayedResultMessage = computed(() =>
+  isUnlockCompleted.value ? resultMessage.value : "",
+);
 
 const confirmDialogDescription = computed(() => {
   const order = currentOrder.value;
@@ -788,9 +819,11 @@ const cardStatusText = computed(() => {
 });
 
 const sessionStatusText = computed(() => {
+  if (isBatchCanceling.value) return "批量任务取消中";
   if (isBatchRunning.value) return "批量下单中";
   if (isUnlockCompleted.value) return "已完成解锁";
   const status = String(currentSession.value?.status || "pending");
+  if (status === "completed") return "结果待确认";
   if (status === "failed") return "处理失败";
   if (status === "confirmed") return "自动扣钻中";
   if (status === "scanned") return "已识别订单";
@@ -834,7 +867,8 @@ const countdown = computed(() => {
 
 const remainingDiamondText = computed(() => {
   const maxUses = Number(redeemInfo.value.maxUses || 0);
-  const used = Number(redeemInfo.value.useCount || 0);
+  const used =
+    Number(redeemInfo.value.useCount || 0) + liveBatchConsumedDiamond.value;
   if (maxUses <= 0) return "不限";
   const left = Math.max(0, maxUses - used);
   return `${left} 钻`;
@@ -846,21 +880,29 @@ const totalDiamondText = computed(() => {
 });
 
 const usedDiamondText = computed(() => {
-  const used = Number(redeemInfo.value.useCount || 0);
+  const used =
+    Number(redeemInfo.value.useCount || 0) + liveBatchConsumedDiamond.value;
   return `${used} 钻`;
 });
 
 const remainingPercent = computed(() => {
   const maxUses = Number(redeemInfo.value.maxUses || 0);
-  const used = Number(redeemInfo.value.useCount || 0);
+  const used =
+    Number(redeemInfo.value.useCount || 0) + liveBatchConsumedDiamond.value;
   if (maxUses <= 0) return 100;
   const left = Math.max(0, maxUses - used);
   return Math.max(0, Math.min(100, Math.round((left / maxUses) * 100)));
+});
+const liveAccountDiamondText = computed(() => {
+  const currentDiamond = Number(redeemInfo.value.account?.diamondQuantity || 0);
+  const left = Math.max(0, currentDiamond - liveBatchConsumedDiamond.value);
+  return `${left} 钻`;
 });
 
 const orderStatusText = computed(() => {
   if (isUnlockCompleted.value) return "已支付";
   const status = String(currentOrder.value?.status || "");
+  if (status === "completed") return "结果待确认";
   if (status === "failed") return "支付失败";
   if (status === "confirmed") return "自动支付中";
   if (status === "scanned") return "已识别";
@@ -911,6 +953,34 @@ const batchRequiredDiamond = computed(() =>
 const batchRequiredText = computed(
   () => `${Math.max(0, batchRequiredDiamond.value)} 钻`,
 );
+const batchDisplayedSuccessCount = computed(
+  () =>
+    batchItems.value.filter((item) => item.confirmedSuccess === true).length,
+);
+const batchDisplayedFailedCount = computed(
+  () =>
+    batchItems.value.filter((item) => String(item.status || "") === "failed")
+      .length,
+);
+const batchDisplayedPendingCount = computed(() =>
+  Math.max(
+    0,
+    Number(currentBatchTask.value?.totalCount || 0) -
+      batchDisplayedSuccessCount.value -
+      batchDisplayedFailedCount.value,
+  ),
+);
+function getBatchItemDisplayStatus(item) {
+  if (item?.confirmedSuccess === true) return "completed";
+  if (String(item?.status || "") === "failed") return "failed";
+  return "pending";
+}
+function getBatchItemStatusText(item) {
+  if (item?.confirmedSuccess === true) return "成功";
+  if (String(item?.status || "") === "failed") return "失败";
+  if (String(item?.status || "") === "completed") return "待确认";
+  return "处理中";
+}
 const batchSelectedOption = computed(
   () =>
     BATCH_PACKAGE_OPTIONS.find(
@@ -924,7 +994,8 @@ const batchSelectedTypeText = computed(() => {
   return `${batchSelectedOption.value?.label || "天卡"} · ${Math.max(0, count)} 单`;
 });
 const batchRemainingQuotaText = computed(() => {
-  const remainingQuota = Number(batchPreview.value.remainingQuota);
+  const remainingQuota =
+    Number(batchPreview.value.remainingQuota) - liveBatchConsumedDiamond.value;
   if (remainingQuota < 0) return "不限";
   return `${Math.max(0, remainingQuota)} 钻`;
 });
@@ -965,7 +1036,7 @@ const shouldAutoSync = computed(() => {
   );
 });
 const autoSyncIntervalMs = computed(() =>
-  isBatchRunning.value
+  isBatchRunning.value || isBatchCanceling.value
     ? BATCH_RUNNING_POLL_INTERVAL_MS
     : DEFAULT_POLL_INTERVAL_MS,
 );
@@ -1174,16 +1245,31 @@ function normalizeBatchTask(batchTask) {
     afterDiamond: Number(payload.afterDiamond ?? -1),
     payload,
     items: items.map((item, index) => ({
+      rawResponse: item?.rawResponse || {},
+      rawResponseText: formatRawResponse(item?.rawResponse),
       index: Number(item?.index || index + 1),
       status: String(item?.status || "pending"),
       tradeNo: String(item?.tradeNo || ""),
       orderNo: String(item?.orderNo || ""),
       message: String(item?.message || ""),
       consumedDiamond: Number(item?.consumedDiamond || 0),
+      explicitPaySuccess: item?.explicitPaySuccess === true,
+      balanceDecreased: item?.balanceDecreased === true,
+      confirmedSuccess: item?.confirmedSuccess === true,
       sessionStatus: String(item?.sessionStatus || ""),
       orderStatus: String(item?.orderStatus || ""),
     })),
   };
+}
+
+function formatRawResponse(value) {
+  if (!value || typeof value !== "object") return "";
+  if (!Object.keys(value).length) return "";
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return "";
+  }
 }
 
 function mergeRedeemInfo(partial) {
@@ -2094,10 +2180,7 @@ function maybeOpenPayResult(payload) {
   if (Number(batchTask?.totalCount || 0) > 1) return;
   const session = payload?.session || redeemInfo.value.session || {};
   const result = session?.resultPayload || {};
-  const success =
-    result?.payPayload?.success === true ||
-    Number(result?.consumedDiamond || 0) > 0 ||
-    Boolean(result?.rendered_message);
+  const success = isConfirmedUnlockSuccess(result);
   const sessionKey = [
     String(session?.sessionId || ""),
     Number(result?.beforeDiamond || 0),
@@ -2657,6 +2740,19 @@ function showToast(message) {
   font-size: 13px;
   line-height: 1.65;
   color: #93a1bf;
+}
+
+.batch-progress-item__raw {
+  margin-top: 8px;
+  padding: 10px;
+  border-radius: 10px;
+  background: rgba(2, 6, 23, 0.72);
+  border: 1px solid rgba(59, 130, 246, 0.18);
+  color: #bfdbfe;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 .batch-progress-bar {

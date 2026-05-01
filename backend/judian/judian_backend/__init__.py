@@ -93,6 +93,7 @@ ACCOUNT_ID_PATTERN = re.compile(r'(\d+)$')
 _JUDIAN_SCHEMA_READY = False
 _PUBLIC_VIP_PLANS_CACHE: list[dict[str, Any]] = []
 _PUBLIC_VIP_PLANS_CACHE_AT = 0.0
+_PUBLIC_WEB_CLIENT_RECEIVE_PEM = ''
 
 
 class JudianRemoteError(RuntimeError):
@@ -624,6 +625,54 @@ def build_public_web_headers(token: str = '') -> dict[str, Any]:
     return headers
 
 
+def get_public_web_client_receive_pem() -> str:
+    global _PUBLIC_WEB_CLIENT_RECEIVE_PEM
+    if _PUBLIC_WEB_CLIENT_RECEIVE_PEM:
+        return _PUBLIC_WEB_CLIENT_RECEIVE_PEM
+    script_path = get_batch_script_path()
+    if not os.path.isfile(script_path):
+        return ''
+    try:
+        script_text = open(script_path, 'r', encoding='utf-8', errors='replace').read()
+    except OSError:
+        return ''
+    match = re.search(r'MAIN_VITE_CLIENT_RECEIVE:\s*\n\s*"([^"]+)"', script_text)
+    if not match:
+        return ''
+    try:
+        _PUBLIC_WEB_CLIENT_RECEIVE_PEM = base64.b64decode(match.group(1)).decode('utf-8')
+    except Exception:
+        return ''
+    return _PUBLIC_WEB_CLIENT_RECEIVE_PEM
+
+
+def decrypt_public_web_payload_text(text: str) -> Any:
+    payload_text = str(text or '').strip()
+    if not payload_text:
+        raise JudianRemoteError('聚点套餐列表响应为空')
+    parts = payload_text.split('.', 1)
+    if len(parts) != 2:
+        raise JudianRemoteError(f'聚点套餐列表返回了非 JSON 响应：{payload_text[:160] or "empty"}')
+    private_pem = get_public_web_client_receive_pem()
+    if not private_pem:
+        raise JudianRemoteError('缺少公开套餐列表响应解密私钥')
+    try:
+        private_key = serialization.load_pem_private_key(
+            private_pem.encode('utf-8'),
+            password=None,
+            backend=default_backend(),
+        )
+        aes_key = private_key.decrypt(base64.b64decode(parts[0]), rsa_padding.PKCS1v15()).decode()
+        aes_iv = aes_key[::-1].encode()
+        cipher = AES.new(aes_key.encode(), AES.MODE_CBC, aes_iv)
+        plain = unpad(cipher.decrypt(base64.b64decode(parts[1])), AES.block_size).decode()
+        return json.loads(plain)
+    except JudianRemoteError:
+        raise
+    except Exception as exc:
+        raise JudianRemoteError('聚点套餐列表响应解密失败') from exc
+
+
 def aes_encrypt(text: str, key: str) -> str:
     cipher = AES.new(key.encode(), AES.MODE_ECB)
     return base64.b64encode(cipher.encrypt(pad(text.encode(), AES.block_size))).decode()
@@ -846,8 +895,7 @@ def remote_get_public_vip_plans(*, timeout: int | float = REMOTE_SUPPLEMENTAL_TI
     try:
         payload = response.json()
     except ValueError as exc:
-        text = str(response.text or '').strip()[:160]
-        raise JudianRemoteError(f'聚点套餐列表返回了非 JSON 响应：{text or response.status_code}') from exc
+        payload = decrypt_public_web_payload_text(str(response.text or ''))
 
     if isinstance(payload, dict):
         code = str(payload.get('code') or '').strip()
@@ -1043,26 +1091,30 @@ def apply_public_batch_script_consumption(
     total_consumed_diamond: int,
 ) -> None:
     payload = dict_like(batch_task_row.payload)
-    if payload.get('localDiamondSynced') is True:
+    consumed = max(0, pick_int(total_consumed_diamond))
+    synced_consumed = max(0, pick_int(payload.get('syncedConsumedDiamond')))
+    if synced_consumed >= consumed:
         return
 
-    consumed = max(0, pick_int(total_consumed_diamond))
+    delta_consumed = consumed - synced_consumed
+    current_diamond = max(0, resolve_account_diamond_quantity(account))
     before_diamond = max(
         0,
         pick_int(
-            result_payload.get('availableDiamond'),
             payload.get('beforeDiamond'),
-            account.diamond_quantity,
+            result_payload.get('availableDiamond'),
+            current_diamond + synced_consumed,
         ),
     )
-    after_diamond = max(0, before_diamond - consumed)
+    after_diamond = max(0, current_diamond - delta_consumed)
     latest_trade_no = resolve_public_batch_latest_trade_no(items_result)
 
     apply_public_account_diamond_snapshot(account, after_diamond)
-    apply_public_cdkey_consumption(cdkey_row, consumed, latest_order_id=latest_trade_no)
+    apply_public_cdkey_consumption(cdkey_row, delta_consumed, latest_order_id=latest_trade_no)
 
     batch_task_row.payload = {
         **payload,
+        'syncedConsumedDiamond': consumed,
         'localDiamondSynced': True,
         'beforeDiamond': before_diamond,
         'afterDiamond': after_diamond,
@@ -1727,36 +1779,58 @@ def build_public_unlock_response(
 
 
 
-def has_public_unlock_success_result(value: Any) -> bool:
-    payload = dict_like(value)
-    payload = dict_like(value)
+def has_public_unlock_balance_decreased(value: Any) -> bool:
     payload = dict_like(value)
     if not payload:
         return False
-
-    text = str(payload.get('rendered_message') or payload.get('renderedMessage') or '').strip()
-    if text:
-        return True
-
     try:
-        consumed = int(payload.get('consumedDiamond') or -1)
-        after = int(payload.get('afterDiamond') or -1)
-        before = int(payload.get('beforeDiamond') or -1)
-        if consumed >= 0:
-            return True
-        if after >= 0 and before >= 0:
+        consumed = int(payload.get('consumedDiamond') or 0)
+        if consumed > 0:
             return True
     except (TypeError, ValueError):
         pass
+    try:
+        before = int(payload.get('beforeDiamond') or -1)
+        after = int(payload.get('afterDiamond') or payload.get('diamondQuantity') or -1)
+        return before >= 0 and after >= 0 and after < before
+    except (TypeError, ValueError):
+        return False
 
+
+def has_public_unlock_explicit_pay_success(value: Any) -> bool:
+    payload = dict_like(value)
+    if not payload:
+        return False
+    if payload.get('explicitPaySuccess') is True:
+        return True
     pay_payload = dict_like(payload.get('payPayload'))
-    fund_payload = dict_like(payload.get('fundPayload'))
-    if pay_payload.get('success') is True or pay_payload.get('settledByPolling') is True:
-        return True
-    if fund_payload:
-        return True
+    return (
+        pay_payload.get('success') is True
+        and pay_payload.get('settledByPolling') is not True
+    )
 
-    return False
+
+def has_public_unlock_confirmed_success(value: Any) -> bool:
+    payload = dict_like(value)
+    if not payload:
+        return False
+    if payload.get('confirmedSuccess') is True:
+        return True
+    return (
+        has_public_unlock_explicit_pay_success(payload)
+        and has_public_unlock_balance_decreased(payload)
+    )
+
+
+def has_public_unlock_success_result(value: Any) -> bool:
+    return has_public_unlock_confirmed_success(value)
+
+
+def is_public_batch_item_confirmed_success(value: Any) -> bool:
+    item = dict_like(value)
+    if not item:
+        return False
+    return has_public_unlock_confirmed_success(item)
 
 
 def append_unique_text(items: list[str], *values: Any) -> None:
@@ -2235,8 +2309,12 @@ def execute_public_unlock_payment(
     if order_row is None:
         raise HTTPException(status_code=400, detail='当前订单尚未同步，请重新扫码后再尝试支付')
 
-    if str(session_row.status or '') == 'completed' or str(order_row.order_status or '') == 'completed' or has_public_unlock_success_result(session_row.result_payload):
-        result_payload = dict_like(session_row.result_payload)
+    existing_result_payload = {
+        **dict_like(order_row.raw_payload),
+        **dict_like(session_row.result_payload),
+    }
+    if has_public_unlock_success_result(existing_result_payload):
+        result_payload = existing_result_payload
         rendered_message = pick_text(result_payload.get('rendered_message'), '该订单已完成支付，VIP 已解锁')
         after_diamond = pick_int(result_payload.get('afterDiamond'), result_payload.get('diamondQuantity'), account.diamond_quantity)
         return {
@@ -2845,6 +2923,10 @@ def create_public_batch_script_task(
             'packageType': str(package_type or '').strip().lower(),
             'unitDiamond': max(0, int(unit_diamond or 0)),
             'requiredDiamond': max(0, int(required_diamond or 0)),
+            'beforeDiamond': max(0, resolve_account_diamond_quantity(account)),
+            'afterDiamond': max(0, resolve_account_diamond_quantity(account)),
+            'syncedConsumedDiamond': 0,
+            'localDiamondSynced': False,
         },
         created_at=now,
         updated_at=now,
@@ -3082,8 +3164,12 @@ def merge_public_batch_progress_items(items_result: list[dict[str, Any]], next_i
         'orderNo': pick_text(next_item.get('orderNo')),
         'message': pick_text(next_item.get('message')),
         'consumedDiamond': max(0, pick_int(next_item.get('consumedDiamond'))),
+        'explicitPaySuccess': bool(next_item.get('explicitPaySuccess')),
+        'balanceDecreased': bool(next_item.get('balanceDecreased')),
+        'confirmedSuccess': bool(next_item.get('confirmedSuccess')),
         'sessionStatus': pick_text(next_item.get('sessionStatus')),
         'orderStatus': pick_text(next_item.get('orderStatus')),
+        'rawResponse': dict_like(next_item.get('rawResponse')),
     })
     normalized.sort(key=lambda item: max(1, pick_int(item.get('index'), 1)))
     return normalized
@@ -3163,15 +3249,20 @@ def build_public_batch_progress_item_from_script_event(event: dict[str, Any]) ->
     if event_type != 'autopay_item':
         return None
     if event.get('ok') is True:
+        confirmed_success = bool(event.get('confirmedSuccess'))
         return {
             'index': index,
             'status': 'completed',
             'tradeNo': pick_text(event.get('tradeNo')),
             'orderNo': pick_text(event.get('orderNo')),
-            'message': pick_text(event.get('message'), '自动支付成功'),
+            'message': pick_text(event.get('message'), '自动支付成功') if confirmed_success else '自动支付结果待确认',
             'consumedDiamond': max(0, pick_int(event.get('consumedDiamond'))),
-            'sessionStatus': 'completed',
-            'orderStatus': 'completed',
+            'explicitPaySuccess': bool(event.get('explicitPaySuccess')),
+            'balanceDecreased': bool(event.get('balanceDecreased')),
+            'confirmedSuccess': confirmed_success,
+            'sessionStatus': 'completed' if confirmed_success else 'confirmed',
+            'orderStatus': 'completed' if confirmed_success else 'confirmed',
+            'rawResponse': dict_like(event.get('rawResponse')),
         }
     return {
         'index': index,
@@ -3180,6 +3271,9 @@ def build_public_batch_progress_item_from_script_event(event: dict[str, Any]) ->
         'orderNo': pick_text(event.get('orderNo')),
         'message': pick_text(event.get('error'), '自动支付失败'),
         'consumedDiamond': 0,
+        'explicitPaySuccess': False,
+        'balanceDecreased': False,
+        'confirmedSuccess': False,
         'sessionStatus': 'failed',
         'orderStatus': 'failed',
     }
@@ -3189,6 +3283,8 @@ def apply_public_batch_script_progress_event(
     db: Session,
     batch_task_row: models.JudianBatchPurchaseTask,
     session_row: models.JudianScanSession,
+    cdkey_row: models.JudianCdKey,
+    account: models.JudianAccount,
     event: dict[str, Any],
 ) -> models.JudianBatchPurchaseTask:
     event_type = str(event.get('type') or '').strip().lower()
@@ -3215,10 +3311,25 @@ def apply_public_batch_script_progress_event(
         if item_result is None:
             return batch_task_row
         items_result = merge_public_batch_progress_items(items_result, item_result)
+        total_consumed_diamond = sum(max(0, pick_int(item.get('consumedDiamond'))) for item in items_result)
+        if is_public_batch_item_confirmed_success(item_result):
+            apply_public_batch_script_consumption(
+                batch_task_row,
+                cdkey_row,
+                account,
+                items_result=items_result,
+                result_payload=dict_like(batch_task_row.result_payload),
+                total_consumed_diamond=total_consumed_diamond,
+            )
+        confirmed_count = sum(1 for item in items_result if is_public_batch_item_confirmed_success(item))
         message = (
-            f'已完成 {len(items_result)}/{int(batch_task_row.total_count or total)} 单'
-            if str(item_result.get('status') or '') == 'completed'
-            else f'第 {index}/{total} 单失败：{item_result["message"]}'
+            f'已确认成功 {confirmed_count}/{int(batch_task_row.total_count or total)} 单'
+            if is_public_batch_item_confirmed_success(item_result)
+            else (
+                f'第 {index}/{total} 单失败：{item_result["message"]}'
+                if str(item_result.get('status') or '') == 'failed'
+                else f'第 {index}/{total} 单支付结果待确认'
+            )
         )
         batch_task_row = finalize_public_batch_task(
             db,
@@ -3297,14 +3408,21 @@ def build_public_batch_items_from_script_result(result_payload: dict[str, Any], 
         buy_failed = buy_item.get('ok') is False
         consumed = max(0, pick_int(pay_result.get('consumedDiamond')))
         total_consumed_diamond += consumed
+        explicit_pay_success = bool(pay_result.get('explicitPaySuccess'))
+        balance_decreased = bool(pay_result.get('balanceDecreased'))
+        confirmed_success = bool(pay_result.get('confirmedSuccess'))
         if pay_ok:
             status = 'completed'
-            message = pick_text(
-                pay_result.get('scanResult', {}).get('message') if isinstance(pay_result.get('scanResult'), dict) else '',
-                '自动支付成功',
+            message = (
+                pick_text(
+                    pay_result.get('scanResult', {}).get('message') if isinstance(pay_result.get('scanResult'), dict) else '',
+                    '自动支付成功',
+                )
+                if confirmed_success
+                else '自动支付结果待确认'
             )
-            session_status = 'completed'
-            order_status = 'completed'
+            session_status = 'completed' if confirmed_success else 'confirmed'
+            order_status = 'completed' if confirmed_success else 'confirmed'
         elif pay_failed:
             status = 'failed'
             message = pick_text(pay_item.get('error'), '自动支付失败')
@@ -3332,8 +3450,12 @@ def build_public_batch_items_from_script_result(result_payload: dict[str, Any], 
             'orderNo': pick_text(pay_result.get('orderNo'), create_result.get('orderNo')),
             'message': message,
             'consumedDiamond': consumed,
+            'explicitPaySuccess': explicit_pay_success,
+            'balanceDecreased': balance_decreased,
+            'confirmedSuccess': confirmed_success,
             'sessionStatus': session_status,
             'orderStatus': order_status,
+            'rawResponse': pay_result,
         })
     return items_result, total_consumed_diamond
 
@@ -3351,9 +3473,9 @@ def finalize_public_batch_task(
 ) -> models.JudianBatchPurchaseTask:
     total_count = int(row.total_count or 0)
     processed_count = len(items_result)
-    success_count = sum(1 for item in items_result if str(item.get('status') or '') == 'completed')
+    success_count = sum(1 for item in items_result if is_public_batch_item_confirmed_success(item))
     failed_count = sum(1 for item in items_result if str(item.get('status') or '') == 'failed')
-    pending_count = max(0, total_count - processed_count)
+    pending_count = max(0, total_count - success_count - failed_count)
     if status == 'failed' and processed_count == 0:
         pending_count = 0
     computed_consumed = sum(max(0, pick_int(item.get('consumedDiamond'))) for item in items_result)
@@ -3429,15 +3551,31 @@ def run_public_batch_purchase(
                 remote_session=remote_session,
             )
             account = runtime_account
+            payment_payload = dict_like(session_row.result_payload)
+            explicit_pay_success = has_public_unlock_explicit_pay_success(payment_payload)
+            balance_decreased = has_public_unlock_balance_decreased(payment_payload)
+            confirmed_success = has_public_unlock_confirmed_success(payment_payload)
             item_result = {
                 'index': index,
                 'status': 'completed',
                 'tradeNo': order_row.order_id or str(item.get('tradeNo') or ''),
                 'orderNo': pick_text(dict_like(order_row.raw_payload).get('data', {}).get('orderNo') if isinstance(dict_like(order_row.raw_payload).get('data'), dict) else '', item.get('orderNo')),
-                'message': str(payment_result.get('message') or payment_result.get('renderedMessage') or '处理成功'),
+                'message': (
+                    str(
+                        payment_result.get('message')
+                        or payment_result.get('renderedMessage')
+                        or '处理成功'
+                    )
+                    if confirmed_success
+                    else '支付结果待确认'
+                ),
                 'consumedDiamond': max(0, pick_int(payment_result.get('consumedDiamond'))),
-                'sessionStatus': session_row.status or '',
-                'orderStatus': order_row.order_status or '',
+                'explicitPaySuccess': explicit_pay_success,
+                'balanceDecreased': balance_decreased,
+                'confirmedSuccess': confirmed_success,
+                'sessionStatus': 'completed' if confirmed_success else 'confirmed',
+                'orderStatus': 'completed' if confirmed_success else 'confirmed',
+                'rawResponse': payment_payload,
             }
         except HTTPException as exc:
             item_result = {
@@ -3517,21 +3655,41 @@ def run_public_batch_purchase(
             ), batch_task_row
 
         results.append(item_result)
+        confirmed_count = sum(1 for item in results if is_public_batch_item_confirmed_success(item))
         batch_task_row = finalize_public_batch_task(
             db,
             batch_task_row,
             status='running',
-            message=f'已完成 {len(results)}/{len(items)} 单',
+            message=(
+                f'已确认成功 {confirmed_count}/{len(items)} 单'
+                if is_public_batch_item_confirmed_success(item_result)
+                else (
+                    f'第 {index} 单处理失败：{item_result["message"]}'
+                    if str(item_result.get('status') or '') == 'failed'
+                    else f'第 {index} 单支付结果待确认'
+                )
+            ),
             items_result=results,
             current_index=index,
             current_trade_no=item_result['tradeNo'],
         )
 
+    final_success_count = sum(1 for item in results if is_public_batch_item_confirmed_success(item))
+    final_failed_count = sum(1 for item in results if str(item.get('status') or '') == 'failed')
+    final_confirmed = len(results) == len(items) and final_success_count == len(items)
     batch_task_row = finalize_public_batch_task(
         db,
         batch_task_row,
-        status='completed',
-        message=f'批量购买完成，共处理 {len(results)} 单',
+        status='completed' if final_confirmed else 'failed',
+        message=(
+            f'批量购买完成，确认成功 {final_success_count}/{len(items)} 单'
+            if final_confirmed
+            else (
+                f'批量购买执行结束，确认成功 {final_success_count}/{len(items)} 单'
+                if final_failed_count == 0
+                else f'批量购买执行结束，确认成功 {final_success_count}/{len(items)} 单，存在失败订单'
+            )
+        ),
         items_result=results,
         current_index=len(results),
         current_trade_no=str(results[-1].get('tradeNo') or '') if results else '',
@@ -3542,7 +3700,7 @@ def run_public_batch_purchase(
     session_row.result_payload = {
         **dict_like(session_row.result_payload),
         'latestBatchId': batch_task_row.batch_id,
-        'batchCompletedCount': len(results),
+        'batchCompletedCount': final_success_count,
         'batchConsumedDiamond': int(batch_task_row.total_consumed_diamond or 0),
     }
     db.commit()
@@ -3723,6 +3881,8 @@ def run_public_batch_script_job(
                         db,
                         batch_task_row,
                         session_row,
+                        cdkey_row,
+                        account,
                         event_payload,
                     )
                 continue
@@ -3749,6 +3909,8 @@ def run_public_batch_script_job(
                     db,
                     batch_task_row,
                     session_row,
+                    cdkey_row,
+                    account,
                     event_payload,
                 )
         if canceled:
@@ -3769,12 +3931,19 @@ def run_public_batch_script_job(
             raise RuntimeError(pick_text(lines[-1] if lines else '', '批量下单脚本执行失败'))
 
         items_result, total_consumed_diamond = build_public_batch_items_from_script_result(result_payload, count)
-        final_ok = result_payload.get('ok') is True and all(
-            str(item.get('status') or '') == 'completed' for item in items_result
+        final_success_count = sum(1 for item in items_result if is_public_batch_item_confirmed_success(item))
+        final_ok = (
+            result_payload.get('ok') is True
+            and len(items_result) == count
+            and final_success_count == count
         )
-        final_message = pick_text(
-            result_payload.get('message'),
-            f'批量下单完成，共处理 {len(items_result)} 单' if final_ok else '批量下单执行结束，存在失败订单',
+        final_message = (
+            pick_text(
+                result_payload.get('message'),
+                f'批量下单完成，确认成功 {final_success_count}/{count} 单',
+            )
+            if final_ok
+            else f'批量下单执行结束，确认成功 {final_success_count}/{count} 单'
         )
         batch_task_row.payload = {
             **dict_like(batch_task_row.payload),
@@ -3814,7 +3983,7 @@ def run_public_batch_script_job(
         session_row.result_payload = {
             **dict_like(session_row.result_payload),
             'latestBatchId': batch_task_row.batch_id,
-            'batchCompletedCount': len(items_result),
+            'batchCompletedCount': final_success_count,
             'batchConsumedDiamond': int(batch_task_row.total_consumed_diamond or 0),
         }
         db.commit()

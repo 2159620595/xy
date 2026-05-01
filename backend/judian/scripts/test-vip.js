@@ -2306,11 +2306,35 @@ function summarizeCreateResult(createResult) {
   };
 }
 
+function hasExplicitJudianPaySuccess(payPayload) {
+  return (
+    payPayload &&
+    typeof payPayload === "object" &&
+    payPayload.success === true &&
+    payPayload.settledByPolling !== true
+  );
+}
+
+function hasAutoPayBalanceDecrease(result) {
+  const consumedDiamond = Number(result?.consumedDiamond ?? 0) || 0;
+  if (consumedDiamond > 0) {
+    return true;
+  }
+  const beforeDiamond = Number(result?.beforeDiamond ?? -1);
+  const afterDiamond = Number(result?.afterDiamond ?? -1);
+  return beforeDiamond >= 0 && afterDiamond >= 0 && afterDiamond < beforeDiamond;
+}
+
 function summarizeAutoPayResult(result) {
+  const explicitPaySuccess = hasExplicitJudianPaySuccess(result?.payPayload);
+  const balanceDecreased = hasAutoPayBalanceDecrease(result);
   return {
     ok: Boolean(result?.ok),
     pending: Boolean(result?.pending),
     settledByPolling: Boolean(result?.settledByPolling),
+    explicitPaySuccess,
+    balanceDecreased,
+    confirmedSuccess: explicitPaySuccess && balanceDecreased,
     tradeNo: pickText(result?.tradeNo),
     orderNo: pickText(result?.orderNo),
     beforeDiamond: Number(result?.beforeDiamond ?? 0) || 0,
@@ -2337,7 +2361,30 @@ function summarizeAutoPayResult(result) {
       account: pickText(result?.remoteUserInfo?.data?.account),
       nickName: pickText(result?.remoteUserInfo?.data?.nickName),
     },
+    payPayload: dictLike(result?.payPayload),
+    beforeFundPayload: dictLike(result?.beforeFundPayload),
+    afterFundPayload: dictLike(result?.afterFundPayload),
+    orderPayload: dictLike(result?.orderPayload),
   };
+}
+
+function ensureAutoPaySettledResult(payResult, fallbackOrderNo = "") {
+  const normalized =
+    payResult && typeof payResult === "object" ? payResult : {};
+  const consumedDiamond = Number(normalized.consumedDiamond ?? 0) || 0;
+  if (normalized.ok === true && consumedDiamond > 0) {
+    return normalized;
+  }
+  const detail = pickText(
+    normalized?.scanResult?.message,
+    normalized?.payPayload?.msg,
+    normalized?.payPayload?.message,
+    normalized?.orderPayload?.message,
+    normalized?.orderPayload?.data?.message,
+    normalized?.orderNo,
+    fallbackOrderNo,
+  );
+  throw new Error(detail || "自动支付未确认扣钻成功");
 }
 
 function summarizeBatchBuyOrder(item) {
@@ -2702,15 +2749,18 @@ async function runBatchAutoPayItems(sourceItems, args, options = {}) {
     }
 
     try {
-      const payResult = await runAutoPayFlow(
-        {
-          ...args,
-          "scan-url": scanUrl || args["scan-url"],
-          "order-no": orderNo || args["order-no"],
-        },
-        {
-          remoteSession,
-        },
+      const payResult = ensureAutoPaySettledResult(
+        await runAutoPayFlow(
+          {
+            ...args,
+            "scan-url": scanUrl || args["scan-url"],
+            "order-no": orderNo || args["order-no"],
+          },
+          {
+            remoteSession,
+          },
+        ),
+        orderNo,
       );
       items.push({
         index: index + 1,
@@ -2732,8 +2782,15 @@ async function runBatchAutoPayItems(sourceItems, args, options = {}) {
         orderNo: payResult.orderNo || orderNo,
         tradeNo: payResult.tradeNo,
         scanUrl: sanitizeUrlLike(scanUrl),
+        explicitPaySuccess:
+          hasExplicitJudianPaySuccess(payResult?.payPayload) === true,
+        balanceDecreased: hasAutoPayBalanceDecrease(payResult) === true,
+        confirmedSuccess:
+          hasExplicitJudianPaySuccess(payResult?.payPayload) === true &&
+          hasAutoPayBalanceDecrease(payResult) === true,
         consumedDiamond: Number(payResult.consumedDiamond ?? 0) || 0,
         message: pickText(payResult?.scanResult?.message, "自动支付成功"),
+        rawResponse: summarizeAutoPayResult(payResult),
       });
     } catch (error) {
       items.push({
@@ -2765,6 +2822,9 @@ async function runBatchAutoPayItems(sourceItems, args, options = {}) {
         ok: false,
         orderNo,
         scanUrl: sanitizeUrlLike(scanUrl),
+        explicitPaySuccess: false,
+        balanceDecreased: false,
+        confirmedSuccess: false,
         error: error.message,
       });
       if (stopOnError) {
@@ -2846,22 +2906,244 @@ async function runBatchCreateAndAutoPayFlow(host, token, payload, args) {
     };
   }
 
-  const buyResult = await runBatchBuyFlow(host, token, payload, {
-    ...args,
+  const intervalMs = Math.max(0, Number(args["batch-interval-ms"] ?? 1200));
+  const createRetry = Math.max(1, Number(args["create-retry"] ?? 6));
+  const createRetryIntervalMs = Math.max(
+    0,
+    Number(args["create-retry-interval-ms"] ?? 1800),
+  );
+  const stopOnError = Boolean(args["stop-on-error"]);
+  const buyOutputFile = resolveBatchOutputPath(
+    args["batch-output"],
+    "vip-orders",
+  );
+  const autoPayOutputFile = resolveBatchOutputPath(
+    args["autopay-output"],
+    "vip-autopay",
+  );
+  const buyOrders = [];
+  const autoPayItems = [];
+
+  emitBatchProgressEvent(args, {
+    type: "buy_phase_started",
+    total: count,
+    outputFile: buyOutputFile,
+  });
+
+  for (let index = 1; index <= count; index += 1) {
+    let createAttempt = null;
+    let createFailed = false;
+
+    try {
+      createAttempt = await createVipOrderWithRetry(host, token, payload, {
+        maxAttempts: createRetry,
+        retryIntervalMs: createRetryIntervalMs,
+        onRetry: ({ attempt, maxAttempts, retryIntervalMs, error }) => {
+          console.error(
+            `批量下单 ${index}/${count} 命中限流，${retryIntervalMs}ms 后重试 (${attempt}/${maxAttempts}): ${error.message}`,
+          );
+        },
+      });
+      const { orderNo, scanUrl, createResult } = createAttempt;
+      buyOrders.push({
+        index,
+        ok: true,
+        createAttempts: createAttempt.attempt,
+        orderNo,
+        scanUrl,
+        createResult,
+      });
+      console.error(
+        `批量下单 ${index}/${count} 成功: ${orderNo || "无订单号"}${createAttempt.attempt > 1 ? ` (重试 ${createAttempt.attempt - 1} 次)` : ""}`,
+      );
+      emitBatchProgressEvent(args, {
+        type: "buy_item",
+        index,
+        total: count,
+        ok: true,
+        createAttempts: createAttempt.attempt,
+        orderNo,
+        scanUrl: sanitizeUrlLike(scanUrl),
+      });
+    } catch (error) {
+      createFailed = true;
+      const failedCreateResult = error?.createResult ?? null;
+      const failedOrderInfo = extractBuyOrderInfo(failedCreateResult);
+      buyOrders.push({
+        index,
+        ok: false,
+        createAttempts: Number(error?.attempt ?? 1) || 1,
+        orderNo: failedOrderInfo.orderNo,
+        scanUrl: failedOrderInfo.scanUrl,
+        error: error.message,
+        createResult: failedCreateResult,
+      });
+      emitBatchDiagnostic(
+        args,
+        "dmghg",
+        "create_order",
+        `动漫共和国创建订单失败: ${error.message}`,
+        { index, total: count },
+      );
+      console.error(`批量下单 ${index}/${count} 失败: ${error.message}`);
+      emitBatchProgressEvent(args, {
+        type: "buy_item",
+        index,
+        total: count,
+        ok: false,
+        createAttempts: Number(error?.attempt ?? 1) || 1,
+        orderNo: failedOrderInfo.orderNo,
+        scanUrl: sanitizeUrlLike(failedOrderInfo.scanUrl),
+        error: error.message,
+      });
+      if (stopOnError) {
+        break;
+      }
+      if (isCreateVipOrderRateLimited(error) && index < count) {
+        const cooldownMs = Math.max(3000, createRetryIntervalMs * 2);
+        console.error(
+          `批量下单 ${index}/${count} 最终仍命中限流，额外冷却 ${cooldownMs}ms 后继续下一单...`,
+        );
+        await delay(cooldownMs);
+      }
+    }
+
+    if (createFailed) {
+      if (index < count && intervalMs > 0) {
+        await delay(intervalMs);
+      }
+      continue;
+    }
+
+    const currentOrder = buyOrders[buyOrders.length - 1];
+    const orderNo = pickText(currentOrder?.orderNo);
+    const scanUrl = sanitizeUrlLike(pickText(currentOrder?.scanUrl));
+
+    try {
+      const payResult = ensureAutoPaySettledResult(
+        await runAutoPayFlow(
+          {
+            ...args,
+            "scan-url": scanUrl || args["scan-url"],
+            "order-no": orderNo || args["order-no"],
+          },
+          {
+            remoteSession: precheck.remoteSession,
+          },
+        ),
+        orderNo,
+      );
+      autoPayItems.push({
+        index,
+        ok: true,
+        orderNo: payResult.orderNo || orderNo,
+        scanUrl,
+        result: payResult,
+      });
+      console.error(
+        `批量支付 ${index}/${count} 成功: ${
+          payResult.orderNo || orderNo || "未知订单"
+        }`,
+      );
+      emitBatchProgressEvent(args, {
+        type: "autopay_item",
+        index,
+        total: count,
+        ok: true,
+        orderNo: payResult.orderNo || orderNo,
+        tradeNo: payResult.tradeNo,
+        scanUrl,
+        explicitPaySuccess:
+          hasExplicitJudianPaySuccess(payResult?.payPayload) === true,
+        balanceDecreased: hasAutoPayBalanceDecrease(payResult) === true,
+        confirmedSuccess:
+          hasExplicitJudianPaySuccess(payResult?.payPayload) === true &&
+          hasAutoPayBalanceDecrease(payResult) === true,
+        consumedDiamond: Number(payResult.consumedDiamond ?? 0) || 0,
+        message: pickText(payResult?.scanResult?.message, "自动支付成功"),
+        rawResponse: summarizeAutoPayResult(payResult),
+      });
+    } catch (error) {
+      autoPayItems.push({
+        index,
+        ok: false,
+        orderNo,
+        scanUrl,
+        error: error.message,
+      });
+      emitBatchDiagnostic(
+        args,
+        "judian",
+        "autopay",
+        `聚点自动支付失败: ${error.message}`,
+        {
+          index,
+          total: count,
+          orderNo,
+          scanUrl,
+        },
+      );
+      console.error(`批量支付 ${index}/${count} 失败: ${error.message}`);
+      emitBatchProgressEvent(args, {
+        type: "autopay_item",
+        index,
+        total: count,
+        ok: false,
+        orderNo,
+        scanUrl,
+        explicitPaySuccess: false,
+        balanceDecreased: false,
+        confirmedSuccess: false,
+        error: error.message,
+      });
+      if (stopOnError) {
+        break;
+      }
+    }
+
+    if (index < count && intervalMs > 0) {
+      await delay(intervalMs);
+    }
+  }
+
+  const buyResult = {
+    ok: buyOrders.every((item) => item.ok),
+    mode: "batch_buy",
     count,
-    "single-buy": true,
-  });
-  const payableItems = buyResult.orders.filter((item) => item && item.ok);
-  const autoPayResult = await runBatchAutoPayItems(payableItems, args, {
-    remoteSession: precheck.remoteSession,
-    outputFile: resolveBatchOutputPath(args["autopay-output"], "vip-autopay"),
-    sourceFile: buyResult.outputFile,
-  });
+    createdCount: buyOrders.filter((item) => item.ok).length,
+    failedCount: buyOrders.filter((item) => !item.ok).length,
+    intervalMs,
+    stopOnError,
+    outputFile: buyOutputFile,
+    payload,
+    orders: buyOrders.map(summarizeBatchBuyOrder),
+  };
+  const autoPayResult = {
+    ok: autoPayItems.every((item) => item.ok),
+    mode: "batch_autopay",
+    count: autoPayItems.length,
+    successCount: autoPayItems.filter((item) => item.ok).length,
+    failedCount: autoPayItems.filter((item) => !item.ok).length,
+    intervalMs,
+    stopOnError,
+    sourceFile: buyOutputFile,
+    outputFile: autoPayOutputFile,
+    items: autoPayItems.map(summarizeBatchAutoPayItem),
+  };
+  writeJsonFile(buyOutputFile, buyResult);
+  writeJsonFile(autoPayOutputFile, autoPayResult);
 
   return {
     ok: buyResult.ok && autoPayResult.ok,
     mode: "batch_create_and_autopay",
-    phase: autoPayResult.ok ? "completed" : "autopay_partial_failed",
+    phase:
+      buyResult.ok && autoPayResult.ok
+        ? "completed"
+        : buyResult.ok
+          ? "autopay_partial_failed"
+          : autoPayItems.length > 0
+            ? "partial_failed"
+            : "create_partial_failed",
     vipId,
     count,
     unitDiamond: precheck.unitDiamond,

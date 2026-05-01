@@ -1884,7 +1884,7 @@ class XianyuApis:
                 if ret_value and ret_value[0] == 'FAIL_SYS_USER_VALIDATE':
                     url = res_json["data"]["url"]
                     drission = DrissionHandler(
-                        is_headless=False,
+                        is_headless=True,
                         maximize_window=True,  # 启用窗口最大化
                         show_mouse_trace=True  # 启用鼠标轨迹
                     )

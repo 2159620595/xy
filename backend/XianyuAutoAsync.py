@@ -120,17 +120,9 @@ def _is_container_runtime() -> bool:
 
 
 def _resolve_password_login_show_browser(requested_show_browser: bool) -> bool:
-    if not requested_show_browser:
-        return False
-
-    # Linux 容器通常没有图形环境，强制切到无头模式避免 Playwright 启动即崩。
-    if _is_container_runtime() and sys.platform.startswith("linux"):
-        return False
-
-    if sys.platform.startswith("linux") and not os.getenv("DISPLAY"):
-        return False
-
-    return True
+    # Automatic password refresh runs in the background and should not pop up
+    # a browser window even if the account record asked for one.
+    return False
 
 
 async def _run_password_login_in_subprocess(

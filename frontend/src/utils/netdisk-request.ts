@@ -1,5 +1,6 @@
 import axios, { type AxiosInstance } from "axios";
 import { NETDISK_API_BASE_URL } from "@/utils/request";
+import { DEFAULT_REQUEST_TIMEOUT_MS } from "@/utils/http-timeout";
 
 const SESSION_REUSE_WINDOW_MS = 2 * 60 * 1000;
 const NETDISK_API_BASE = NETDISK_API_BASE_URL;
@@ -45,6 +46,7 @@ export const ensureNetdiskSession = async (force = false) => {
           role: mainUser.role || "admin",
         },
         {
+          timeout: DEFAULT_REQUEST_TIMEOUT_MS,
           withCredentials: true,
         },
       );
@@ -73,7 +75,7 @@ export const ensureNetdiskSession = async (force = false) => {
 const buildAdminClient = (): AxiosInstance => {
   const client = axios.create({
     baseURL: NETDISK_API_BASE,
-    timeout: 30000,
+    timeout: DEFAULT_REQUEST_TIMEOUT_MS,
     withCredentials: true,
   });
 
@@ -112,7 +114,7 @@ export const netdiskRequest = buildAdminClient();
 
 export const netdiskPublicRequest = axios.create({
   baseURL: NETDISK_API_BASE,
-  timeout: 30000,
+  timeout: DEFAULT_REQUEST_TIMEOUT_MS,
   withCredentials: true,
 });
 

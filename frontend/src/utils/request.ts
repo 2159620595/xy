@@ -4,6 +4,7 @@ import axios, {
   type AxiosResponse,
 } from "axios";
 import { useAuthStore } from "@/stores/auth";
+import { DEFAULT_REQUEST_TIMEOUT_MS } from "@/utils/http-timeout";
 
 const normalizeBase = (value: string | undefined) =>
   String(value || "")
@@ -56,7 +57,7 @@ export const buildStaticUrl = (path: string) => {
 
 const request = axios.create({
   baseURL: API_BASE_URL,
-  timeout: 30000,
+  timeout: DEFAULT_REQUEST_TIMEOUT_MS,
   headers: {
     "Content-Type": "application/json",
   },
