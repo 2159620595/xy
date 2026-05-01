@@ -6,114 +6,109 @@
     :last-updated-text="lastUpdatedText"
   >
     <template #actions>
-      <n-space>
-        <n-button secondary :loading="loading" @click="loadPage"
-          >刷新列表</n-button
-        >
-      </n-space>
+      <el-space>
+        <el-button :loading="loading" @click="loadPage">刷新列表</el-button>
+      </el-space>
     </template>
 
-    <n-card title="批量生成卡密" size="small" class="cdkey-generate-card">
-      <n-alert
+    <el-card shadow="never" class="cdkey-generate-card">
+      <template #header>批量生成卡密</template>
+      <el-alert
         v-if="!accountOptions.length"
         type="warning"
-        :show-icon="false"
+        :closable="false"
         class="cdkey-card-alert"
       >
         当前还没有可用的聚点账号，请先去“账户登录”页面完成真实账号登录。
-      </n-alert>
-      <n-alert v-else type="info" :show-icon="false" class="cdkey-card-alert">
+      </el-alert>
+      <el-alert v-else type="info" :closable="false" class="cdkey-card-alert">
         以下卡密数据直接写入聚点真实数据库；生成后会立即出现在库存列表，并可用于后续兑换流程。
-      </n-alert>
+      </el-alert>
 
-      <n-form
-        label-placement="top"
-        :show-feedback="false"
-        class="cdkey-generate-form"
-      >
+      <el-form label-position="top" class="cdkey-generate-form">
         <div class="cdkey-generate-grid">
-          <n-form-item
+          <el-form-item
             label="卡密规格"
             class="cdkey-generate-field cdkey-generate-field--spec"
           >
             <div class="cdkey-spec-picker">
-              <n-space size="small" wrap>
-                <n-button
+              <el-space wrap>
+                <el-button
                   v-for="item in specOptions"
                   :key="item.value"
                   size="small"
                   :type="
                     activeSpecPreset === item.value ? 'primary' : 'default'
                   "
-                  :secondary="activeSpecPreset === item.value"
+                  :plain="activeSpecPreset !== item.value"
                   @click="applySpecPreset(item)"
                 >
                   {{ item.label }}
-                </n-button>
-              </n-space>
+                </el-button>
+              </el-space>
               <span class="cdkey-spec-picker__hint"
                 >按 5 钻 = 1 天自动换算，可继续手动微调</span
               >
             </div>
-          </n-form-item>
-          <n-form-item
+          </el-form-item>
+          <el-form-item
             label="绑定账户"
             class="cdkey-generate-field cdkey-generate-field--account"
           >
-            <n-select
-              v-model:value="form.accountId"
-              :options="accountOptions"
-              placeholder="请选择聚点账号"
-            />
-          </n-form-item>
-          <n-form-item
+            <el-select v-model="form.accountId" placeholder="请选择聚点账号">
+              <el-option
+                v-for="item in accountOptions"
+                :key="item.value"
+                :label="item.label"
+                :value="item.value"
+              />
+            </el-select>
+          </el-form-item>
+          <el-form-item
             label="授权天数"
             class="cdkey-generate-field cdkey-generate-field--number"
           >
-            <n-input-number
-              v-model:value="form.duration"
+            <el-input-number
+              v-model="form.duration"
               :min="1"
               :max="365"
               style="width: 100%"
-              @update:value="handleDurationChange"
+              @change="handleDurationChange"
             />
-          </n-form-item>
-          <n-form-item
+          </el-form-item>
+          <el-form-item
             label="生成数量"
             class="cdkey-generate-field cdkey-generate-field--number"
           >
-            <n-input-number
-              v-model:value="form.count"
+            <el-input-number
+              v-model="form.count"
               :min="1"
               :max="50"
               style="width: 100%"
             />
-          </n-form-item>
-          <n-form-item
+          </el-form-item>
+          <el-form-item
             label="使用额度（钻石）"
             class="cdkey-generate-field cdkey-generate-field--number"
           >
-            <n-input-number
-              v-model:value="form.maxUses"
+            <el-input-number
+              v-model="form.maxUses"
               :min="0"
               style="width: 100%"
             />
-          </n-form-item>
-          <n-form-item
+          </el-form-item>
+          <el-form-item
             label="备注"
             class="cdkey-generate-field cdkey-generate-field--remark"
           >
-            <n-input
-              v-model:value="form.remark"
-              placeholder="例如：直播间活动"
-            />
-          </n-form-item>
+            <el-input v-model="form.remark" placeholder="例如：直播间活动" />
+          </el-form-item>
         </div>
 
         <div class="cdkey-generate-actions">
           <div class="cdkey-generate-actions__inner">
-            <n-button size="small" @click="resetForm">重置</n-button>
-            <n-button
+            <el-button size="small" @click="resetForm">重置</el-button>
+            <el-button
               size="small"
               type="primary"
               :loading="generating"
@@ -121,78 +116,370 @@
               @click="handleGenerate"
             >
               立即生成
-            </n-button>
+            </el-button>
           </div>
         </div>
-      </n-form>
-    </n-card>
+      </el-form>
+    </el-card>
 
-    <n-card title="卡密库存管理" size="small" class="cdkey-table-card">
-      <template #header-extra>
-        <n-space class="cdkey-toolbar">
-          <n-select
-            v-model:value="exportSpec"
-            :options="exportSpecOptions"
-            placeholder="导出规格"
-            style="width: 200px"
-          />
-          <n-button
-            type="primary"
-            secondary
-            @click="handleExportUnusedCodesBySpec"
-            >导出原卡密</n-button
-          >
-          <n-button
-            type="info"
-            secondary
-            @click="handleExportUnusedRedeemUrlsBySpec"
-            >导出访问卡密</n-button
-          >
-          <n-select
-            v-model:value="filterAccount"
-            :options="filterAccountOptions"
-            placeholder="筛选账户"
-            clearable
-            style="width: 180px"
-          />
-          <n-select
-            v-model:value="filterStatus"
-            :options="statusOptions"
-            placeholder="筛选状态"
-            clearable
-            style="width: 140px"
-          />
-          <n-popconfirm @positive-click="handleCleanInactive">
-            <template #trigger>
-              <n-button type="warning" secondary>清理过期/作废卡密</n-button>
-            </template>
-            确认要清理所有已过期或已作废的真实卡密吗？
-          </n-popconfirm>
-        </n-space>
+    <el-card shadow="never" class="cdkey-table-card">
+      <template #header>
+        <div class="cdkey-card-header">
+          <span>卡密库存管理</span>
+          <el-space class="cdkey-toolbar" wrap>
+            <el-input
+              v-model="searchKeyword"
+              clearable
+              placeholder="搜索卡密/备注/订单号/会话号"
+              style="width: 240px"
+            />
+            <el-select
+              v-model="exportSpec"
+              placeholder="导出规格"
+              style="width: 200px"
+            >
+              <el-option
+                v-for="item in exportSpecOptions"
+                :key="item.value"
+                :label="item.label"
+                :value="item.value"
+              />
+            </el-select>
+            <el-button
+              type="primary"
+              plain
+              @click="handleExportUnusedCodesBySpec"
+            >
+              导出原卡密
+            </el-button>
+            <el-button
+              type="info"
+              plain
+              @click="handleExportUnusedRedeemUrlsBySpec"
+            >
+              导出访问卡密
+            </el-button>
+            <el-select
+              v-model="filterAccount"
+              placeholder="筛选账户"
+              clearable
+              style="width: 180px"
+            >
+              <el-option
+                v-for="item in filterAccountOptions"
+                :key="item.value"
+                :label="item.label"
+                :value="item.value"
+              />
+            </el-select>
+            <el-select
+              v-model="filterStatus"
+              placeholder="筛选状态"
+              clearable
+              style="width: 140px"
+            >
+              <el-option
+                v-for="item in statusOptions"
+                :key="item.value"
+                :label="item.label"
+                :value="item.value"
+              />
+            </el-select>
+            <el-button type="warning" plain @click="confirmCleanInactive">
+              清理过期/作废卡密
+            </el-button>
+          </el-space>
+        </div>
       </template>
 
-      <n-data-table
+      <el-table
         class="cdkey-table"
-        :columns="columns"
-        :data="filteredRows"
-        :loading="loading"
-        :pagination="{ pageSize: 10 }"
-        :bordered="false"
-      />
-    </n-card>
+        :data="pagedRows"
+        stripe
+        v-loading="loading"
+      >
+        <el-table-column label="卡密串码" min-width="180">
+          <template #default="{ row }">
+            <span class="cdkey-code">{{ row.code }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="绑定账号" min-width="180">
+          <template #default="{ row }">
+            {{ resolveAccountName(row.accountId) }}
+          </template>
+        </el-table-column>
+        <el-table-column label="授权天数" width="140">
+          <template #default="{ row }">
+            {{ resolveDurationText(row.duration) }}
+          </template>
+        </el-table-column>
+        <el-table-column label="已使用进度" min-width="220">
+          <template #default="{ row }">
+            <div class="cdkey-usage-progress">
+              <div class="cdkey-usage-progress__summary">
+                {{ resolveUsageProgress(row).summary }}
+              </div>
+              <template v-if="!resolveUsageProgress(row).unlimited">
+                <el-progress
+                  :percentage="resolveUsageProgress(row).percentage"
+                  :status="resolveUsageProgress(row).status"
+                  :show-text="false"
+                  :stroke-width="14"
+                />
+              </template>
+              <div class="cdkey-usage-progress__meta">
+                {{ resolveUsageProgress(row).meta }}
+              </div>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="状态" width="100">
+          <template #default="{ row }">
+            <el-tag :type="resolveStatusType(row.status)">
+              {{ statusMap[row.status]?.label || "未知" }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="createdAt" label="创建时间" min-width="180" />
+        <el-table-column prop="remark" label="备注" min-width="160" />
+        <el-table-column label="操作" min-width="280" fixed="right">
+          <template #default="{ row }">
+            <el-space wrap>
+              <el-button
+                size="small"
+                text
+                type="primary"
+                @click="copyCode(row.code)"
+              >
+                复制
+              </el-button>
+              <el-button
+                size="small"
+                text
+                type="primary"
+                @click="copyRedeemUrl(row.code)"
+              >
+                兑换链接
+              </el-button>
+              <el-button
+                size="small"
+                text
+                type="success"
+                @click="previewRedeem(row.code)"
+              >
+                打开页面
+              </el-button>
+              <el-button
+                size="small"
+                text
+                type="info"
+                @click="openUsageDetail(row)"
+              >
+                使用详情
+              </el-button>
+              <el-button
+                size="small"
+                text
+                type="danger"
+                :disabled="row.status === 'void'"
+                @click="confirmVoid(row)"
+              >
+                作废
+              </el-button>
+            </el-space>
+          </template>
+        </el-table-column>
+      </el-table>
+
+      <div class="pagination-wrap">
+        <el-pagination
+          v-model:current-page="currentPage"
+          v-model:page-size="pageSize"
+          background
+          layout="total, sizes, prev, pager, next"
+          :page-sizes="[20, 50, 100, 200]"
+          :total="filteredRows.length"
+        />
+        <div class="pagination-text">
+          第 {{ currentPage }} / {{ totalPages || 1 }} 页
+        </div>
+      </div>
+    </el-card>
+
+    <el-dialog
+      v-model="usageDetailVisible"
+      title="卡密使用详情"
+      width="920px"
+      class="cdkey-detail-dialog"
+    >
+      <template v-if="detailRow">
+        <div class="cdkey-detail-summary">
+          <div class="cdkey-detail-summary__item">
+            <span class="cdkey-detail-summary__label">卡密</span>
+            <span
+              class="cdkey-detail-summary__value cdkey-detail-summary__value--mono"
+            >
+              {{ detailRow.code || "—" }}
+            </span>
+          </div>
+          <div class="cdkey-detail-summary__item">
+            <span class="cdkey-detail-summary__label">绑定账号</span>
+            <span class="cdkey-detail-summary__value">
+              {{ resolveAccountName(detailRow.accountId) }}
+            </span>
+          </div>
+          <div class="cdkey-detail-summary__item">
+            <span class="cdkey-detail-summary__label">最近订单</span>
+            <span
+              class="cdkey-detail-summary__value cdkey-detail-summary__value--mono"
+            >
+              {{ detailRow.latestOrderId || "—" }}
+            </span>
+          </div>
+          <div class="cdkey-detail-summary__item">
+            <span class="cdkey-detail-summary__label">最近会话</span>
+            <span
+              class="cdkey-detail-summary__value cdkey-detail-summary__value--mono"
+            >
+              {{ detailRow.latestSessionId || "—" }}
+            </span>
+          </div>
+          <div class="cdkey-detail-summary__item">
+            <span class="cdkey-detail-summary__label">记录条数</span>
+            <span class="cdkey-detail-summary__value">
+              {{ detailRecords.length }} 条
+            </span>
+          </div>
+          <div class="cdkey-detail-summary__item">
+            <span class="cdkey-detail-summary__label">最近存证时间</span>
+            <span class="cdkey-detail-summary__value">
+              {{ detailRow.latestSuccessPaymentAt || "—" }}
+            </span>
+          </div>
+        </div>
+
+        <el-alert
+          v-if="!detailRecords.length"
+          type="info"
+          :closable="false"
+          class="cdkey-detail-empty"
+        >
+          这张卡密目前还没有售后存证记录。
+        </el-alert>
+
+        <div v-else class="cdkey-detail-content">
+          <div class="cdkey-detail-section">
+            <div class="cdkey-detail-section__title">最近售后记录</div>
+            <div class="cdkey-detail-records">
+              <div
+                v-for="(record, index) in detailRecords"
+                :key="record.recordKey || `${record.tradeNo}-${index}`"
+                class="cdkey-detail-record"
+              >
+                <div class="cdkey-detail-record__header">
+                  <span>记录 {{ index + 1 }}</span>
+                  <el-tag
+                    size="small"
+                    :type="
+                      record.paymentResult?.confirmedSuccess
+                        ? 'success'
+                        : 'warning'
+                    "
+                  >
+                    {{
+                      record.paymentResult?.confirmedSuccess
+                        ? "已确认成功"
+                        : "待核实"
+                    }}
+                  </el-tag>
+                </div>
+                <div class="cdkey-detail-record__grid">
+                  <div class="cdkey-detail-record__item">
+                    <span class="cdkey-detail-record__label">存证时间</span>
+                    <span class="cdkey-detail-record__value">
+                      {{ record.savedAt || "—" }}
+                    </span>
+                  </div>
+                  <div class="cdkey-detail-record__item">
+                    <span class="cdkey-detail-record__label">订单号</span>
+                    <span
+                      class="cdkey-detail-record__value cdkey-detail-summary__value--mono"
+                    >
+                      {{ record.orderNo || "—" }}
+                    </span>
+                  </div>
+                  <div class="cdkey-detail-record__item">
+                    <span class="cdkey-detail-record__label">tradeNo</span>
+                    <span
+                      class="cdkey-detail-record__value cdkey-detail-summary__value--mono"
+                    >
+                      {{ record.tradeNo || "—" }}
+                    </span>
+                  </div>
+                  <div class="cdkey-detail-record__item">
+                    <span class="cdkey-detail-record__label">会话号</span>
+                    <span
+                      class="cdkey-detail-record__value cdkey-detail-summary__value--mono"
+                    >
+                      {{ record.sessionId || "—" }}
+                    </span>
+                  </div>
+                  <div class="cdkey-detail-record__item">
+                    <span class="cdkey-detail-record__label">消耗钻石</span>
+                    <span class="cdkey-detail-record__value">
+                      {{ record.consumedDiamond ?? 0 }}
+                    </span>
+                  </div>
+                  <div class="cdkey-detail-record__item">
+                    <span class="cdkey-detail-record__label">扫码返回</span>
+                    <span class="cdkey-detail-record__value">
+                      {{ record.paymentResult?.scanResult?.message || "—" }}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="cdkey-detail-section">
+            <div class="cdkey-detail-section__header">
+              <div class="cdkey-detail-section__title">
+                最近一次原始支付 JSON
+              </div>
+              <el-space wrap>
+                <el-button
+                  size="small"
+                  type="primary"
+                  plain
+                  :disabled="!detailLatestRecord"
+                  @click="copyLatestTradeAndOrder"
+                >
+                  复制 tradeNo / orderNo
+                </el-button>
+                <el-button
+                  size="small"
+                  type="success"
+                  plain
+                  :disabled="!detailRow"
+                  @click="exportCurrentAfterSalesJson"
+                >
+                  导出售后 JSON
+                </el-button>
+              </el-space>
+            </div>
+            <pre class="cdkey-detail-json">{{
+              formatJson(detailLatestPayment)
+            }}</pre>
+          </div>
+        </div>
+      </template>
+    </el-dialog>
   </JudianPageLayout>
 </template>
 
 <script setup>
-import { computed, h, onMounted, reactive, ref } from "vue";
-import {
-  NButton,
-  NPopconfirm,
-  NProgress,
-  NSpace,
-  NTag,
-  useMessage,
-} from "naive-ui";
+import { computed, onMounted, reactive, ref, watch } from "vue";
+import { ElMessage, ElMessageBox } from "element-plus";
 
 import { judianApi } from "@/api/judian";
 import JudianPageLayout from "@/components/judian/PageLayout.vue";
@@ -211,7 +498,6 @@ const specOptions = [
   maxUses: item.duration * DIAMONDS_PER_DAY,
 }));
 
-const message = useMessage();
 const sectionMeta = getJudianSectionMeta("cdkeys");
 const loading = ref(false);
 const generating = ref(false);
@@ -221,6 +507,11 @@ const lastUpdatedText = ref("");
 const exportSpec = ref("month");
 const filterAccount = ref(null);
 const filterStatus = ref(null);
+const searchKeyword = ref("");
+const usageDetailVisible = ref(false);
+const detailRow = ref(null);
+const currentPage = ref(1);
+const pageSize = ref(20);
 
 const form = reactive({
   accountId: null,
@@ -285,9 +576,23 @@ const filteredRows = computed(() =>
     if (filterAccount.value && item.accountId !== filterAccount.value)
       return false;
     if (filterStatus.value && item.status !== filterStatus.value) return false;
+    if (searchKeyword.value) {
+      const keyword = String(searchKeyword.value).trim().toLowerCase();
+      if (keyword && !buildCdkeySearchText(item).includes(keyword))
+        return false;
+    }
     return true;
   }),
 );
+
+const totalPages = computed(() =>
+  Math.max(1, Math.ceil(filteredRows.value.length / pageSize.value)),
+);
+
+const pagedRows = computed(() => {
+  const start = (currentPage.value - 1) * pageSize.value;
+  return filteredRows.value.slice(start, start + pageSize.value);
+});
 
 const stats = computed(() => {
   const rows = cdkeys.value || [];
@@ -324,143 +629,6 @@ const stats = computed(() => {
     },
   ];
 });
-
-const columns = [
-  {
-    title: "卡密串码",
-    key: "code",
-    width: 180,
-    render: (row) =>
-      h(
-        "span",
-        { style: "font-family: monospace; font-weight: 600" },
-        row.code,
-      ),
-  },
-  {
-    title: "绑定账号",
-    key: "accountId",
-    width: 180,
-    render: (row) => resolveAccountName(row.accountId),
-  },
-  {
-    title: "授权天数",
-    key: "duration",
-    width: 120,
-    render: (row) => {
-      const specLabel = resolveSpecLabel(row.duration);
-      return specLabel
-        ? `${specLabel} · ${row.duration} 天`
-        : `${row.duration} 天`;
-    },
-  },
-  {
-    title: "已使用进度",
-    key: "usage",
-    width: 220,
-    render: (row) => {
-      const usage = resolveUsageProgress(row);
-      if (usage.unlimited) {
-        return h("div", { class: "cdkey-usage-progress" }, [
-          h("div", { class: "cdkey-usage-progress__summary" }, usage.summary),
-          h("div", { class: "cdkey-usage-progress__meta" }, usage.meta),
-        ]);
-      }
-      return h("div", { class: "cdkey-usage-progress" }, [
-        h("div", { class: "cdkey-usage-progress__summary" }, usage.summary),
-        h(NProgress, {
-          type: "line",
-          percentage: usage.percentage,
-          height: 14,
-          borderRadius: 3,
-          showIndicator: false,
-          status: usage.status,
-          railStyle: { background: "rgba(255,255,255,0.08)" },
-        }),
-        h("div", { class: "cdkey-usage-progress__meta" }, usage.meta),
-      ]);
-    },
-  },
-  {
-    title: "状态",
-    key: "status",
-    width: 100,
-    render: (row) =>
-      h(
-        NTag,
-        {
-          type: statusMap[row.status]?.type || "default",
-          bordered: false,
-          size: "small",
-        },
-        { default: () => statusMap[row.status]?.label || "未知" },
-      ),
-  },
-  { title: "创建时间", key: "createdAt", width: 180 },
-  { title: "备注", key: "remark" },
-  {
-    title: "操作",
-    key: "actions",
-    width: 280,
-    render: (row) =>
-      h(
-        NSpace,
-        { justify: "center" },
-        {
-          default: () => [
-            h(
-              NButton,
-              {
-                size: "small",
-                quaternary: true,
-                type: "info",
-                onClick: () => copyCode(row.code),
-              },
-              { default: () => "复制" },
-            ),
-            h(
-              NButton,
-              {
-                size: "small",
-                quaternary: true,
-                type: "primary",
-                onClick: () => copyRedeemUrl(row.code),
-              },
-              { default: () => "兑换链接" },
-            ),
-            h(
-              NButton,
-              {
-                size: "small",
-                quaternary: true,
-                type: "success",
-                onClick: () => previewRedeem(row.code),
-              },
-              { default: () => "打开页面" },
-            ),
-            h(
-              NPopconfirm,
-              { onPositiveClick: () => handleVoid(row) },
-              {
-                trigger: () =>
-                  h(
-                    NButton,
-                    {
-                      size: "small",
-                      quaternary: true,
-                      type: "error",
-                      disabled: row.status === "void",
-                    },
-                    { default: () => "作废" },
-                  ),
-                default: () => `确认作废卡密 ${row.code}？`,
-              },
-            ),
-          ],
-        },
-      ),
-  },
-];
 
 function cleanupLegacyMockStorage() {
   if (typeof window === "undefined") return;
@@ -509,6 +677,17 @@ function resolveSpecLabel(duration) {
   return matched?.label || "";
 }
 
+function resolveDurationText(duration) {
+  const specLabel = resolveSpecLabel(duration);
+  return specLabel ? `${specLabel} · ${duration} 天` : `${duration} 天`;
+}
+
+function resolveStatusType(status) {
+  return statusMap[status]?.type === "default"
+    ? "info"
+    : statusMap[status]?.type || "info";
+}
+
 function matchesSpecPreset(row, spec) {
   return (
     Number(row?.duration || 0) === Number(spec?.duration || 0) &&
@@ -552,8 +731,107 @@ function resolveUsageProgress(row) {
     summary: `${used} / ${maxUses} 钻`,
     meta: `剩余 ${remaining} 钻`,
     status:
-      percentage >= 100 ? "error" : percentage >= 80 ? "warning" : "success",
+      percentage >= 100
+        ? "exception"
+        : percentage >= 80
+          ? "warning"
+          : "success",
   };
+}
+
+function normalizeSearchText(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase();
+}
+
+function extractAfterSalesRecords(row) {
+  const records = Array.isArray(row?.afterSalesRecords)
+    ? row.afterSalesRecords
+    : [];
+  if (records.length) {
+    return [...records].reverse();
+  }
+  if (row?.latestSuccessPayment) {
+    return [
+      {
+        recordKey:
+          row.latestSuccessPayment.tradeNo ||
+          row.latestSuccessPayment.orderNo ||
+          row.code ||
+          "",
+        savedAt: row.latestSuccessPaymentAt || "",
+        sessionId: row.latestSuccessPayment?.cdkeyInfo?.sessionId || "",
+        tradeNo: row.latestSuccessPayment.tradeNo || "",
+        orderNo: row.latestSuccessPayment.orderNo || "",
+        consumedDiamond: Number(row.latestSuccessPayment.consumedDiamond || 0),
+        paymentResult: row.latestSuccessPayment,
+      },
+    ];
+  }
+  return [];
+}
+
+function buildCdkeySearchText(row) {
+  const records = extractAfterSalesRecords(row);
+  const recordTexts = records.flatMap((record) => [
+    record?.recordKey,
+    record?.savedAt,
+    record?.sessionId,
+    record?.tradeNo,
+    record?.orderNo,
+    record?.paymentResult?.scanResult?.message,
+    record?.paymentResult?.remoteUser?.account,
+    record?.paymentResult?.remoteUser?.nickName,
+  ]);
+  return [
+    row?.code,
+    row?.remark,
+    row?.accountId,
+    row?.latestOrderId,
+    row?.latestSessionId,
+    row?.latestSuccessPaymentAt,
+    ...recordTexts,
+  ]
+    .map(normalizeSearchText)
+    .filter(Boolean)
+    .join(" ");
+}
+
+const detailRecords = computed(() => extractAfterSalesRecords(detailRow.value));
+
+const detailLatestPayment = computed(
+  () =>
+    detailRow.value?.latestSuccessPayment ||
+    detailRecords.value[0]?.paymentResult ||
+    null,
+);
+
+const detailLatestRecord = computed(() => detailRecords.value[0] || null);
+
+watch([filterAccount, filterStatus, searchKeyword, pageSize], () => {
+  currentPage.value = 1;
+});
+
+watch(
+  () => filteredRows.value.length,
+  (length) => {
+    const nextTotalPages = Math.max(1, Math.ceil(length / pageSize.value));
+    if (currentPage.value > nextTotalPages) {
+      currentPage.value = nextTotalPages;
+    }
+  },
+);
+
+function formatJson(value) {
+  if (!value) {
+    return "暂无数据";
+  }
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
 }
 
 function downloadTextFile(content, filename) {
@@ -564,6 +842,47 @@ function downloadTextFile(content, filename) {
   anchor.download = filename;
   anchor.click();
   URL.revokeObjectURL(url);
+}
+
+async function copyLatestTradeAndOrder() {
+  const record = detailLatestRecord.value;
+  if (!record) {
+    ElMessage.warning("当前没有可复制的售后记录");
+    return;
+  }
+  const text = [
+    `tradeNo: ${record.tradeNo || "—"}`,
+    `orderNo: ${record.orderNo || "—"}`,
+  ].join("\n");
+  await copyText(text);
+  ElMessage.success("tradeNo / orderNo 已复制");
+}
+
+function buildAfterSalesExportFilename(row) {
+  const code = String(row?.code || "unknown").trim() || "unknown";
+  const dateText = new Date().toLocaleDateString("zh-CN").replace(/\//g, "-");
+  return `聚点卡密售后记录_${code}_${dateText}.json`;
+}
+
+function exportCurrentAfterSalesJson() {
+  if (!detailRow.value) {
+    ElMessage.warning("当前没有可导出的卡密记录");
+    return;
+  }
+  const exportPayload = {
+    code: detailRow.value.code || "",
+    accountId: detailRow.value.accountId || "",
+    latestOrderId: detailRow.value.latestOrderId || "",
+    latestSessionId: detailRow.value.latestSessionId || "",
+    latestSuccessPaymentAt: detailRow.value.latestSuccessPaymentAt || "",
+    latestSuccessPayment: detailRow.value.latestSuccessPayment || null,
+    afterSalesRecords: detailRecords.value,
+  };
+  downloadTextFile(
+    `${formatJson(exportPayload)}\n`,
+    buildAfterSalesExportFilename(detailRow.value),
+  );
+  ElMessage.success("当前卡密售后 JSON 已导出");
 }
 
 function buildExportFilename(spec) {
@@ -579,14 +898,14 @@ function buildRedeemExportFilename(spec) {
 function getUnusedRowsBySpec() {
   const spec = specOptions.find((item) => item.value === exportSpec.value);
   if (!spec) {
-    message.warning("请选择要导出的规格");
+    ElMessage.warning("请选择要导出的规格");
     return null;
   }
   const rows = cdkeys.value.filter(
     (row) => row.status === "unused" && matchesSpecPreset(row, spec),
   );
   if (!rows.length) {
-    message.warning(`暂无可导出的${spec.label}未使用卡密`);
+    ElMessage.warning(`暂无可导出的${spec.label}未使用卡密`);
     return null;
   }
   return { spec, rows };
@@ -627,7 +946,7 @@ async function loadPage() {
       form.accountId = accountOptions.value[0].value;
     }
   } catch (error) {
-    message.error(extractErrorMessage(error));
+    ElMessage.error(extractErrorMessage(error));
   } finally {
     loading.value = false;
   }
@@ -635,7 +954,7 @@ async function loadPage() {
 
 async function handleGenerate() {
   if (!form.accountId) {
-    message.warning("请先选择绑定账号");
+    ElMessage.warning("请先选择绑定账号");
     return;
   }
   generating.value = true;
@@ -649,9 +968,9 @@ async function handleGenerate() {
     });
     await loadPage();
     resetForm();
-    message.success(data?.message || `已生成 ${data?.total || 0} 张聚点卡密`);
+    ElMessage.success(data?.message || `已生成 ${data?.total || 0} 张聚点卡密`);
   } catch (error) {
-    message.error(extractErrorMessage(error));
+    ElMessage.error(extractErrorMessage(error));
   } finally {
     generating.value = false;
   }
@@ -668,7 +987,7 @@ function handleExportUnusedCodesBySpec() {
     .filter(Boolean)
     .join("\n");
   downloadTextFile(content, buildExportFilename(spec));
-  message.success(`已导出 ${rows.length} 张${spec.label}原卡密`);
+  ElMessage.success(`已导出 ${rows.length} 张${spec.label}原卡密`);
 }
 
 function handleExportUnusedRedeemUrlsBySpec() {
@@ -683,30 +1002,46 @@ function handleExportUnusedRedeemUrlsBySpec() {
     .map((code) => resolveRedeemUrl(code))
     .join("\n");
   downloadTextFile(content, buildRedeemExportFilename(spec));
-  message.success(`已导出 ${rows.length} 条${spec.label}访问卡密链接`);
+  ElMessage.success(`已导出 ${rows.length} 条${spec.label}访问卡密链接`);
 }
 
 async function copyCode(code) {
   await copyText(code);
-  message.success("卡密已复制");
+  ElMessage.success("卡密已复制");
 }
 
 async function copyRedeemUrl(code) {
   await copyText(resolveRedeemUrl(code));
-  message.success("兑换链接已复制");
+  ElMessage.success("兑换链接已复制");
 }
 
 async function previewRedeem(code) {
   window.open(resolveRedeemUrl(code), "_blank", "noopener");
 }
 
+function openUsageDetail(row) {
+  detailRow.value = row;
+  usageDetailVisible.value = true;
+}
+
 async function handleVoid(row) {
   try {
     await judianApi.updateCdKey(row.id, { status: "void" });
     await loadPage();
-    message.success("卡密已作废");
+    ElMessage.success("卡密已作废");
   } catch (error) {
-    message.error(extractErrorMessage(error));
+    ElMessage.error(extractErrorMessage(error));
+  }
+}
+
+async function confirmVoid(row) {
+  try {
+    await ElMessageBox.confirm(`确认作废卡密 ${row.code}？`, "作废确认", {
+      type: "warning",
+    });
+    await handleVoid(row);
+  } catch {
+    // User cancelled.
   }
 }
 
@@ -714,9 +1049,26 @@ async function handleCleanInactive() {
   try {
     const { data } = await judianApi.cleanInactiveCdKeys();
     await loadPage();
-    message.success(data?.message || `已清理 ${data?.removed || 0} 张失效卡密`);
+    ElMessage.success(
+      data?.message || `已清理 ${data?.removed || 0} 张失效卡密`,
+    );
   } catch (error) {
-    message.error(extractErrorMessage(error));
+    ElMessage.error(extractErrorMessage(error));
+  }
+}
+
+async function confirmCleanInactive() {
+  try {
+    await ElMessageBox.confirm(
+      "确认要清理所有已过期或已作废的真实卡密吗？",
+      "清理确认",
+      {
+        type: "warning",
+      },
+    );
+    await handleCleanInactive();
+  } catch {
+    // User cancelled.
   }
 }
 
@@ -733,17 +1085,24 @@ onMounted(loadPage);
   margin-bottom: 10px;
 }
 
-.cdkey-generate-card :deep(.n-card__content),
-.cdkey-table-card :deep(.n-card__content) {
+.cdkey-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.cdkey-generate-card :deep(.el-card__body),
+.cdkey-table-card :deep(.el-card__body) {
   padding-top: 12px;
 }
 
-.cdkey-generate-form :deep(.n-form-item) {
+.cdkey-generate-form :deep(.el-form-item) {
   margin-bottom: 0;
 }
 
-.cdkey-generate-form :deep(.n-form-item-label) {
-  padding-bottom: 4px;
+.cdkey-generate-form :deep(.el-form-item__label) {
+  margin-bottom: 4px;
 }
 
 .cdkey-generate-grid {
@@ -771,7 +1130,7 @@ onMounted(loadPage);
 }
 
 .cdkey-spec-picker__hint {
-  color: rgba(255, 255, 255, 0.45);
+  color: #64748b;
   font-size: 11px;
   line-height: 1.4;
 }
@@ -796,14 +1155,14 @@ onMounted(loadPage);
   gap: 6px;
 }
 
-.cdkey-table-card :deep(.n-card-header) {
-  padding-bottom: 10px;
-}
-
-.cdkey-table :deep(.n-data-table-th),
-.cdkey-table :deep(.n-data-table-td) {
+.cdkey-table :deep(.el-table__cell) {
   padding-top: 8px;
   padding-bottom: 8px;
+}
+
+.cdkey-code {
+  font-family: monospace;
+  font-weight: 600;
 }
 
 .cdkey-usage-progress {
@@ -818,20 +1177,147 @@ onMounted(loadPage);
 }
 
 .cdkey-usage-progress__meta {
-  color: rgba(255, 255, 255, 0.45);
+  color: #64748b;
   font-size: 11px;
   line-height: 1.4;
 }
 
-.cdkey-generate-card :deep(.n-button),
-.cdkey-table-card :deep(.n-button) {
+.cdkey-detail-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.cdkey-detail-summary__item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  background: #f8fafc;
+}
+
+.cdkey-detail-summary__label,
+.cdkey-detail-record__label {
+  font-size: 12px;
+  color: #64748b;
+}
+
+.cdkey-detail-summary__value,
+.cdkey-detail-record__value {
+  font-size: 13px;
+  color: #111827;
+  line-height: 1.5;
+  word-break: break-all;
+}
+
+.cdkey-detail-summary__value--mono {
+  font-family: monospace;
+}
+
+.cdkey-detail-empty {
+  margin-bottom: 10px;
+}
+
+.cdkey-detail-content {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.cdkey-detail-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.cdkey-detail-section__title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #111827;
+}
+
+.cdkey-detail-section__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.cdkey-detail-records {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.cdkey-detail-record {
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 12px;
+  background: #fff;
+}
+
+.cdkey-detail-record__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+  font-weight: 600;
+}
+
+.cdkey-detail-record__grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 14px;
+}
+
+.cdkey-detail-record__item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.cdkey-detail-json {
+  margin: 0;
+  padding: 12px;
+  border-radius: 10px;
+  background: #0f172a;
+  color: #e2e8f0;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow: auto;
+  max-height: 420px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.pagination-wrap {
+  margin-top: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.pagination-text {
+  font-size: 12px;
+  color: #64748b;
+}
+
+.cdkey-generate-card :deep(.el-button),
+.cdkey-table-card :deep(.el-button) {
   min-height: 34px;
 }
 
-.cdkey-generate-card :deep(.n-input-number),
-.cdkey-generate-card :deep(.n-base-selection),
-.cdkey-generate-card :deep(.n-input) {
-  --n-height: 36px;
+.cdkey-generate-card :deep(.el-input-number),
+.cdkey-generate-card :deep(.el-select),
+.cdkey-generate-card :deep(.el-input) {
+  width: 100%;
 }
 
 @media (max-width: 1400px) {
@@ -859,13 +1345,13 @@ onMounted(loadPage);
     border-radius: 10px;
   }
 
-  .cdkey-generate-card :deep(.n-card-header),
-  .cdkey-table-card :deep(.n-card-header) {
-    padding-bottom: 8px;
+  .cdkey-card-header {
+    flex-direction: column;
+    align-items: flex-start;
   }
 
-  .cdkey-generate-card :deep(.n-card__content),
-  .cdkey-table-card :deep(.n-card__content) {
+  .cdkey-generate-card :deep(.el-card__body),
+  .cdkey-table-card :deep(.el-card__body) {
     padding-top: 10px;
   }
 
@@ -889,8 +1375,8 @@ onMounted(loadPage);
     gap: 8px;
   }
 
-  .cdkey-generate-actions__inner :deep(.n-button),
-  .cdkey-toolbar :deep(.n-button) {
+  .cdkey-generate-actions__inner :deep(.el-button),
+  .cdkey-toolbar :deep(.el-button) {
     min-height: 34px;
     padding: 0 10px;
   }
@@ -900,18 +1386,23 @@ onMounted(loadPage);
     gap: 6px;
   }
 
-  .cdkey-toolbar :deep(.n-base-selection) {
-    min-height: 34px;
+  .pagination-wrap {
+    align-items: flex-start;
   }
 
-  .cdkey-toolbar :deep(.n-base-selection),
-  .cdkey-toolbar :deep(.n-button),
-  .cdkey-generate-actions__inner :deep(.n-button) {
+  .cdkey-detail-summary,
+  .cdkey-detail-record__grid {
+    grid-template-columns: 1fr;
+  }
+
+  .cdkey-toolbar :deep(.el-select),
+  .cdkey-toolbar :deep(.el-input),
+  .cdkey-toolbar :deep(.el-button),
+  .cdkey-generate-actions__inner :deep(.el-button) {
     width: 100%;
   }
 
-  .cdkey-table :deep(.n-data-table-th),
-  .cdkey-table :deep(.n-data-table-td) {
+  .cdkey-table :deep(.el-table__cell) {
     padding-top: 7px;
     padding-bottom: 7px;
     font-size: 12px;

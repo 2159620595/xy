@@ -847,11 +847,11 @@ def remote_get_public_vip_plans(*, timeout: int | float = REMOTE_SUPPLEMENTAL_TI
         return []
 
     script_root = get_batch_script_root()
-    script_path = os.path.join(script_root, 'test-vip.js')
+    script_path = os.path.join(script_root, 'judian-batch.js')
     if os.path.isfile(script_path):
         try:
             completed = subprocess.run(
-                ['node', 'test-vip.js', 'list'],
+                ['node', 'judian-batch.js', 'list'],
                 cwd=script_root,
                 capture_output=True,
                 text=True,
@@ -1324,6 +1324,10 @@ def generate_cdkey_code(db: Session) -> str:
 
 
 def serialize_cdkey(row: models.JudianCdKey) -> dict[str, Any]:
+    payload = dict_like(row.payload)
+    after_sales_records = payload.get('afterSalesRecords')
+    if not isinstance(after_sales_records, list):
+        after_sales_records = []
     return {
         'id': row.id,
         'code': row.code,
@@ -1340,6 +1344,9 @@ def serialize_cdkey(row: models.JudianCdKey) -> dict[str, Any]:
         'remark': row.remark or '',
         'createdAt': row.created_at or '',
         'updatedAt': row.updated_at or '',
+        'latestSuccessPaymentAt': pick_text(payload.get('latestSuccessPaymentAt')),
+        'latestSuccessPayment': dict_like(payload.get('latestSuccessPayment')),
+        'afterSalesRecords': after_sales_records[-20:],
     }
 
 
@@ -1711,6 +1718,7 @@ def serialize_public_batch_task(row: models.JudianBatchPurchaseTask | None) -> d
     items = result_payload.get('items')
     if not isinstance(items, list):
         items = []
+    canceled_count = sum(1 for item in items if str(dict_like(item).get('status') or '') == 'canceled')
     return {
         'batchId': row.batch_id or '',
         'sessionId': row.session_id or '',
@@ -1721,6 +1729,7 @@ def serialize_public_batch_task(row: models.JudianBatchPurchaseTask | None) -> d
         'successCount': int(row.success_count or 0),
         'failedCount': int(row.failed_count or 0),
         'pendingCount': int(row.pending_count or 0),
+        'canceledCount': int(canceled_count),
         'totalConsumedDiamond': int(row.total_consumed_diamond or 0),
         'currentIndex': int(row.current_index or 0),
         'currentTradeNo': row.current_trade_no or '',
@@ -1831,6 +1840,180 @@ def is_public_batch_item_confirmed_success(value: Any) -> bool:
     if not item:
         return False
     return has_public_unlock_confirmed_success(item)
+
+
+def build_public_unlock_order_info_snapshot(order_row: models.JudianOrder | None) -> dict[str, Any]:
+    if order_row is None:
+        return {}
+    payload = dict_like(order_row.raw_payload)
+    remote_data = dict_like(payload.get('data'))
+    return {
+        'diamond': pick_int(remote_data.get('diamond'), order_row.amount),
+        'status': pick_int(remote_data.get('status'), 1 if str(order_row.order_status or '').lower() == 'completed' else 0),
+        'orderNo': pick_text(remote_data.get('orderNo')),
+        'tradeNo': pick_text(remote_data.get('tradeNo'), order_row.order_id),
+        'remark': pick_text(remote_data.get('remark'), order_row.delivery_content_preview),
+        'createTime': pick_text(remote_data.get('createTime'), order_row.created_at),
+    }
+
+
+def build_public_unlock_success_snapshot(
+    session_row: models.JudianScanSession,
+    cdkey_row: models.JudianCdKey,
+    account: models.JudianAccount,
+    order_row: models.JudianOrder,
+    *,
+    before_diamond: int,
+    after_diamond: int,
+    consumed_diamond: int,
+    pay_payload: dict[str, Any],
+    before_fund_payload: dict[str, Any],
+    after_fund_payload: dict[str, Any],
+    order_payload: dict[str, Any],
+) -> dict[str, Any]:
+    session_payload = dict_like(session_row.payload)
+    pay_payload_dict = dict_like(pay_payload)
+    explicit_pay_success = has_public_unlock_explicit_pay_success({'payPayload': pay_payload_dict})
+    balance_decreased = has_public_unlock_balance_decreased({
+        'beforeDiamond': before_diamond,
+        'afterDiamond': after_diamond,
+        'consumedDiamond': consumed_diamond,
+    })
+    settled_by_polling = pay_payload_dict.get('settledByPolling') is True
+    confirmed_success = balance_decreased and (
+        explicit_pay_success
+        or (pay_payload_dict.get('success') is True and settled_by_polling)
+    )
+    remote_user = dict_like(dict_like(account.payload).get('remote_user_info'))
+    order_payload_dict = dict_like(order_payload)
+    order_data = dict_like(order_payload_dict.get('data'))
+    trade_no = pick_text(order_data.get('tradeNo'), session_row.order_id, order_row.order_id)
+    order_no = pick_text(order_data.get('orderNo'), session_payload.get('orderNo'))
+    snapshot = {
+        'ok': confirmed_success,
+        'pending': False,
+        'settledByPolling': settled_by_polling,
+        'explicitPaySuccess': explicit_pay_success,
+        'balanceDecreased': balance_decreased,
+        'confirmedSuccess': confirmed_success,
+        'tradeNo': trade_no,
+        'orderNo': order_no,
+        'beforeDiamond': max(0, pick_int(before_diamond)),
+        'afterDiamond': max(0, pick_int(after_diamond)),
+        'consumedDiamond': max(0, pick_int(consumed_diamond)),
+        'login': None,
+        'scanResult': dict_like(session_payload.get('scanResult')),
+        'orderInfo': build_public_unlock_order_info_snapshot(order_row),
+        'beforeFund': max(0, pick_int(before_diamond)),
+        'afterFund': max(0, pick_int(after_diamond)),
+        'remoteUser': remote_user or None,
+        'payPayload': pay_payload_dict,
+        'beforeFundPayload': dict_like(before_fund_payload),
+        'afterFundPayload': dict_like(after_fund_payload),
+        'orderPayload': order_payload_dict,
+        'cdkeyInfo': {
+            'id': int(cdkey_row.id or 0),
+            'code': cdkey_row.code or '',
+            'cardId': cdkey_row.card_id,
+            'accountId': pick_text(cdkey_row.account_id, account.account_id),
+            'sessionId': session_row.session_id or '',
+            'tradeNo': trade_no,
+            'orderNo': order_no,
+            'remark': cdkey_row.remark or '',
+        },
+    }
+    return snapshot
+
+
+def save_public_unlock_success_snapshot(
+    session_row: models.JudianScanSession,
+    cdkey_row: models.JudianCdKey,
+    account: models.JudianAccount,
+    order_row: models.JudianOrder,
+    *,
+    rendered_message: str,
+    before_diamond: int,
+    after_diamond: int,
+    consumed_diamond: int,
+    pay_payload: dict[str, Any],
+    before_fund_payload: dict[str, Any],
+    after_fund_payload: dict[str, Any],
+) -> dict[str, Any]:
+    saved_at = now_text()
+    base_order_payload = dict_like(order_row.raw_payload)
+    merged_order_payload = {
+        **base_order_payload,
+        'beforeFundPayload': dict_like(before_fund_payload),
+        'afterFundPayload': dict_like(after_fund_payload),
+        'fundPayload': dict_like(after_fund_payload),
+        'payPayload': dict_like(pay_payload),
+    }
+    success_snapshot = build_public_unlock_success_snapshot(
+        session_row,
+        cdkey_row,
+        account,
+        order_row,
+        before_diamond=before_diamond,
+        after_diamond=after_diamond,
+        consumed_diamond=consumed_diamond,
+        pay_payload=dict_like(pay_payload),
+        before_fund_payload=dict_like(before_fund_payload),
+        after_fund_payload=dict_like(after_fund_payload),
+        order_payload=merged_order_payload,
+    )
+    record_key = pick_text(
+        success_snapshot.get('tradeNo'),
+        success_snapshot.get('orderNo'),
+        session_row.session_id,
+    )
+    cdkey_record = {
+        'recordKey': record_key,
+        'savedAt': saved_at,
+        'sessionId': session_row.session_id or '',
+        'tradeNo': pick_text(success_snapshot.get('tradeNo')),
+        'orderNo': pick_text(success_snapshot.get('orderNo')),
+        'accountId': pick_text(account.account_id, cdkey_row.account_id),
+        'cdkeyCode': cdkey_row.code or '',
+        'cardId': cdkey_row.card_id,
+        'consumedDiamond': max(0, pick_int(success_snapshot.get('consumedDiamond'))),
+        'paymentResult': success_snapshot,
+    }
+    existing_cdkey_payload = dict_like(cdkey_row.payload)
+    existing_records_raw = existing_cdkey_payload.get('afterSalesRecords')
+    existing_records = existing_records_raw if isinstance(existing_records_raw, list) else []
+    filtered_records = [
+        item for item in existing_records
+        if pick_text(dict_like(item).get('recordKey')) != record_key
+    ]
+    filtered_records.append(cdkey_record)
+    cdkey_row.payload = {
+        **existing_cdkey_payload,
+        'latestSuccessPayment': success_snapshot,
+        'latestSuccessPaymentAt': saved_at,
+        'afterSalesRecords': filtered_records[-20:],
+    }
+    order_row.raw_payload = {
+        **merged_order_payload,
+        'successPaymentResult': success_snapshot,
+        'afterSalesSavedAt': saved_at,
+        'cdkeyInfo': dict_like(success_snapshot.get('cdkeyInfo')),
+    }
+    session_row.result_payload = {
+        'rendered_message': rendered_message,
+        **success_snapshot,
+        'fundPayload': dict_like(after_fund_payload),
+        'afterSalesSavedAt': saved_at,
+    }
+    session_row.payload = {
+        **dict_like(session_row.payload),
+        'cdkeyCode': cdkey_row.code,
+        'tradeNo': pick_text(success_snapshot.get('tradeNo'), session_row.order_id),
+        'orderNo': pick_text(success_snapshot.get('orderNo')),
+        'autoPay': True,
+        'latestSuccessPayment': success_snapshot,
+        'afterSalesSavedAt': saved_at,
+    }
+    return success_snapshot
 
 
 def append_unique_text(items: list[str], *values: Any) -> None:
@@ -2317,6 +2500,11 @@ def execute_public_unlock_payment(
         result_payload = existing_result_payload
         rendered_message = pick_text(result_payload.get('rendered_message'), '该订单已完成支付，VIP 已解锁')
         after_diamond = pick_int(result_payload.get('afterDiamond'), result_payload.get('diamondQuantity'), account.diamond_quantity)
+        payment_result = (
+            dict_like(result_payload.get('paymentResult'))
+            or dict_like(result_payload.get('successPaymentResult'))
+            or dict_like(result_payload)
+        )
         return {
             'success': True,
             **serialize_public_cdkey_summary(cdkey_row),
@@ -2328,6 +2516,7 @@ def execute_public_unlock_payment(
             'beforeDiamond': pick_int(result_payload.get('beforeDiamond')),
             'afterDiamond': after_diamond,
             'consumedDiamond': pick_int(result_payload.get('consumedDiamond')),
+            'paymentResult': payment_result,
         }
 
 
@@ -2435,12 +2624,6 @@ def execute_public_unlock_payment(
 
     order_row.order_status = 'completed'
     order_row.updated_at = now_text()
-    order_row.raw_payload = {
-        **dict_like(order_row.raw_payload),
-        'beforeFundPayload': before_fund_payload,
-        'payPayload': pay_payload,
-        'fundPayload': after_fund_payload,
-    }
 
     apply_public_account_diamond_snapshot(account, after_diamond)
     apply_public_cdkey_consumption(cdkey_row, consumed_diamond, latest_order_id=session_row.order_id or '')
@@ -2451,23 +2634,19 @@ def execute_public_unlock_payment(
     session_row.message = '已自动完成扣钻，VIP 已解锁'
     session_row.confirmed_at = session_row.confirmed_at or int(time.time())
     session_row.updated_at = now_text()
-    session_row.result_payload = {
-        'rendered_message': rendered_message,
-        'payPayload': pay_payload,
-        'beforeFundPayload': before_fund_payload,
-        'fundPayload': after_fund_payload,
-        'beforeDiamond': before_diamond,
-        'afterDiamond': after_diamond,
-        'diamondQuantity': after_diamond,
-        'consumedDiamond': consumed_diamond,
-    }
-
-    session_row.payload = {
-        **dict_like(session_row.payload),
-        'cdkeyCode': cdkey_row.code,
-        'tradeNo': session_row.order_id,
-        'autoPay': True,
-    }
+    success_snapshot = save_public_unlock_success_snapshot(
+        session_row,
+        cdkey_row,
+        account,
+        order_row,
+        rendered_message=rendered_message,
+        before_diamond=before_diamond,
+        after_diamond=after_diamond,
+        consumed_diamond=consumed_diamond,
+        pay_payload=dict_like(pay_payload),
+        before_fund_payload=dict_like(before_fund_payload),
+        after_fund_payload=dict_like(after_fund_payload),
+    )
 
     db.commit()
     db.refresh(session_row)
@@ -2485,6 +2664,7 @@ def execute_public_unlock_payment(
         'beforeDiamond': before_diamond,
         'afterDiamond': after_diamond,
         'consumedDiamond': consumed_diamond,
+        'paymentResult': success_snapshot,
     }
 
 
@@ -3003,6 +3183,27 @@ def cancel_public_batch_task(
 ) -> models.JudianBatchPurchaseTask:
     existing_items = dict_like(row.result_payload).get('items')
     items_result = [dict_like(item) for item in existing_items] if isinstance(existing_items, list) else []
+    processed_count = max(0, int(row.processed_count or len(items_result)))
+    total_count = max(0, int(row.total_count or 0))
+    existing_indexes = {
+        max(1, pick_int(item.get('index'), 1))
+        for item in items_result
+        if isinstance(item, dict)
+    }
+    for index in range(1, total_count + 1):
+        if index in existing_indexes:
+            continue
+        items_result.append({
+            'index': index,
+            'status': 'canceled',
+            'tradeNo': '',
+            'orderNo': '',
+            'message': message,
+            'consumedDiamond': 0,
+            'sessionStatus': 'canceled',
+            'orderStatus': 'canceled',
+        })
+    items_result.sort(key=lambda item: max(1, pick_int(dict_like(item).get('index'), 1)))
     total_consumed_diamond = sum(max(0, pick_int(item.get('consumedDiamond'))) for item in items_result)
     row = finalize_public_batch_task(
         db,
@@ -3013,6 +3214,8 @@ def cancel_public_batch_task(
         current_index=pick_int(row.current_index),
         current_trade_no=str(row.current_trade_no or ''),
         total_consumed_diamond=total_consumed_diamond,
+        processed_count_override=min(processed_count, total_count) if total_count > 0 else processed_count,
+        pending_count_override=0,
     )
     row.payload = {
         **dict_like(row.payload),
@@ -3036,7 +3239,7 @@ def get_batch_script_root() -> str:
 
 
 def get_batch_script_path() -> str:
-    return os.path.join(get_batch_script_root(), 'test-vip.js')
+    return os.path.join(get_batch_script_root(), 'judian-batch.js')
 
 
 def get_batch_script_display_path() -> str:
@@ -3077,7 +3280,7 @@ def build_public_batch_script_command(
         raise HTTPException(status_code=500, detail=f'未找到批量下单脚本: {script_path}')
     command = [
         'node',
-        'test-vip.js',
+        'judian-batch.js',
         'batch',
         '--count',
         str(max(1, int(count))),
@@ -3470,13 +3673,23 @@ def finalize_public_batch_task(
     current_index: int | None = None,
     current_trade_no: str | None = None,
     total_consumed_diamond: int | None = None,
+    processed_count_override: int | None = None,
+    pending_count_override: int | None = None,
 ) -> models.JudianBatchPurchaseTask:
     total_count = int(row.total_count or 0)
-    processed_count = len(items_result)
+    processed_count = (
+        max(0, int(processed_count_override))
+        if processed_count_override is not None
+        else len(items_result)
+    )
     success_count = sum(1 for item in items_result if is_public_batch_item_confirmed_success(item))
     failed_count = sum(1 for item in items_result if str(item.get('status') or '') == 'failed')
-    pending_count = max(0, total_count - success_count - failed_count)
-    if status == 'failed' and processed_count == 0:
+    pending_count = (
+        max(0, int(pending_count_override))
+        if pending_count_override is not None
+        else max(0, total_count - success_count - failed_count)
+    )
+    if status == 'failed' and processed_count == 0 and pending_count_override is None:
         pending_count = 0
     computed_consumed = sum(max(0, pick_int(item.get('consumedDiamond'))) for item in items_result)
     row.status = status
@@ -3947,7 +4160,7 @@ def run_public_batch_script_job(
         )
         batch_task_row.payload = {
             **dict_like(batch_task_row.payload),
-            'command': ['node', 'test-vip.js', 'batch', '--count', str(count)],
+            'command': ['node', 'judian-batch.js', 'batch', '--count', str(count)],
             'cwd': script_root,
         }
         batch_task_row.result_payload = {
