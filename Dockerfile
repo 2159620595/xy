@@ -134,7 +134,17 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
             fluxbox \
             # OpenCV运行时依赖
             libgl1 \
-            libglib2.0-0; \
+            libglib2.0-0 \
+            # 中文字体
+            fonts-wqy-zenhei \
+            fonts-wqy-microhei \
+            fonts-noto-cjk \
+            # 其他字体
+            fonts-noto-color-emoji \
+            fonts-unifont \
+            xfonts-scalable \
+            fonts-ipafont-gothic \
+            fonts-freefont-ttf; \
     fi
 
 ENV NODE_PATH=/usr/lib/node_modules
