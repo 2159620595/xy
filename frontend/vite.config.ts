@@ -62,11 +62,15 @@ const legacySpaProxyTargets = [
 ];
 
 const buildProxyMap = () => {
-  const proxy: Record<string, ReturnType<typeof spaRouteProxy> | {
-    target: string;
-    changeOrigin: boolean;
-    rewrite?: (path: string) => string;
-  }> = {
+  const proxy: Record<
+    string,
+    | ReturnType<typeof spaRouteProxy>
+    | {
+        target: string;
+        changeOrigin: boolean;
+        rewrite?: (path: string) => string;
+      }
+  > = {
     "/_proxy": {
       target: backendTarget,
       changeOrigin: true,
@@ -91,10 +95,6 @@ const buildProxyMap = () => {
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [vue()],
-  test: {
-    environment: "jsdom",
-    globals: true,
-  },
   base: buildBase,
   resolve: {
     alias: {
