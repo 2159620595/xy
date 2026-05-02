@@ -153,6 +153,7 @@ class JudianCdKeyGenerateRequest(BaseModel):
 class JudianCdKeyUpdateRequest(BaseModel):
     status: str | None = None
     remark: str | None = None
+    addQuota: int | None = None
 
 
 class JudianCdKeyClaimRequest(BaseModel):
@@ -395,7 +396,7 @@ def upsert_judian_user(db: Session, username: str, *, is_admin: bool, request: R
             allowed_ip=current_ip,
             created_at=now,
             updated_at=now,
-            payload={},
+            payload={'baseMaxUses': max_uses, 'quotaTopUpTotal': 0},
         )
         db.add(row)
         db.commit()
@@ -1689,11 +1690,29 @@ def generate_cdkey_code(db: Session) -> str:
             return code
 
 
+def resolve_cdkey_base_max_uses(row: models.JudianCdKey) -> int:
+    payload = dict_like(row.payload)
+    current_max_uses = max(0, pick_int(row.max_uses))
+    base_max_uses = max(0, pick_int(payload.get('baseMaxUses')))
+    top_up_total = max(0, pick_int(payload.get('quotaTopUpTotal')))
+    if top_up_total <= 0 and base_max_uses > 0 and current_max_uses > base_max_uses:
+        top_up_total = current_max_uses - base_max_uses
+    if top_up_total > 0 and current_max_uses > top_up_total:
+        inferred_base_max_uses = current_max_uses - top_up_total
+        if base_max_uses <= 0 or inferred_base_max_uses < base_max_uses:
+            base_max_uses = inferred_base_max_uses
+    if base_max_uses <= 0:
+        base_max_uses = current_max_uses
+    return max(0, base_max_uses)
+
+
 def serialize_cdkey(row: models.JudianCdKey) -> dict[str, Any]:
     payload = dict_like(row.payload)
     after_sales_records = payload.get('afterSalesRecords')
     if not isinstance(after_sales_records, list):
         after_sales_records = []
+    base_max_uses = resolve_cdkey_base_max_uses(row)
+    current_max_uses = int(row.max_uses or 0)
     return {
         'id': row.id,
         'code': row.code,
@@ -1702,7 +1721,8 @@ def serialize_cdkey(row: models.JudianCdKey) -> dict[str, Any]:
         'cardId': row.card_id,
         'duration': int(row.duration or 0),
         'status': row.status or 'unused',
-        'maxUses': int(row.max_uses or 0),
+        'maxUses': current_max_uses,
+        'baseMaxUses': base_max_uses,
         'useCount': int(row.use_count or 0),
         'expiresAt': row.expires_at or '',
         'latestSessionId': row.latest_session_id or '',
@@ -2041,13 +2061,16 @@ def serialize_public_order(row: models.JudianOrder | None) -> dict[str, Any] | N
 
 def serialize_public_cdkey_summary(row: models.JudianCdKey) -> dict[str, Any]:
     meta = resolve_public_cdkey_runtime_meta(row)
+    current_max_uses = int(row.max_uses or 0)
+    base_max_uses = resolve_cdkey_base_max_uses(row)
     return {
         'code': row.code,
         'status': meta['status'],
         'duration': int(row.duration or 0),
         'expiresAt': int(row.expires_at or 0) if row.expires_at else None,
         'useCount': int(row.use_count or 0),
-        'maxUses': int(row.max_uses or 0),
+        'maxUses': current_max_uses,
+        'baseMaxUses': base_max_uses,
         'remainingQuota': pick_int(meta.get('remainingQuota')),
         'canPay': bool(meta.get('canPay')),
         'invalidReason': pick_text(meta.get('invalidReason')),
@@ -2081,6 +2104,7 @@ def serialize_public_batch_task(row: models.JudianBatchPurchaseTask | None) -> d
         return None
     payload = dict_like(row.payload)
     result_payload = dict_like(row.result_payload)
+    script_result = dict_like(result_payload.get('scriptResult'))
     items = result_payload.get('items')
     if not isinstance(items, list):
         items = []
@@ -2103,7 +2127,18 @@ def serialize_public_batch_task(row: models.JudianBatchPurchaseTask | None) -> d
         'updatedAt': row.updated_at or '',
         'cancelRequested': bool(payload.get('cancelRequested')),
         'cancelRequestedAt': pick_text(payload.get('cancelRequestedAt')),
-        'items': items,
+        'phase': pick_text(script_result.get('phase')),
+        'errorSource': pick_text(
+            result_payload.get('errorSource'),
+            script_result.get('errorSource'),
+        ),
+        'scriptMessage': pick_text(
+            script_result.get('message'),
+            row.message,
+        ),
+        'scriptStdout': pick_text(result_payload.get('stdout')),
+        'scriptStderr': pick_text(result_payload.get('stderr')),
+        'items': [serialize_public_batch_task_item(item) for item in items],
         'payload': payload,
     }
 
@@ -2138,6 +2173,8 @@ def build_public_unlock_response(
     if batch_task_row is None:
         batch_task_row = get_latest_public_batch_task(db, session_row)
     cdkey_meta = resolve_public_cdkey_runtime_meta(cdkey_row)
+    current_max_uses = int(cdkey_row.max_uses or 0)
+    base_max_uses = resolve_cdkey_base_max_uses(cdkey_row)
     return {
         'success': True,
         'code': cdkey_row.code,
@@ -2145,7 +2182,8 @@ def build_public_unlock_response(
         'duration': int(cdkey_row.duration or 0),
         'expiresAt': int(cdkey_row.expires_at or 0) if cdkey_row.expires_at else None,
         'useCount': int(cdkey_row.use_count or 0),
-        'maxUses': int(cdkey_row.max_uses or 0),
+        'maxUses': current_max_uses,
+        'baseMaxUses': base_max_uses,
         'remainingQuota': pick_int(cdkey_meta.get('remainingQuota')),
         'canPay': bool(cdkey_meta.get('canPay')),
         'invalidReason': pick_text(cdkey_meta.get('invalidReason')),
@@ -2831,6 +2869,90 @@ def is_retryable_pay_message(message: str) -> bool:
     if not text:
         return False
     return any(keyword in text for keyword in ('正在登录', '订单已支付', '处理中', '请稍后'))
+
+
+def is_retryable_order_lookup_message(message: str) -> bool:
+    text = str(message or '').strip()
+    if not text:
+        return False
+    if any(keyword in text for keyword in ('二维码已过期', '二维码已失效', '链接已过期', '链接已失效', '余额不足', '钻石不足', '无权访问')):
+        return False
+    return any(
+        keyword in text
+        for keyword in ('订单不存在', '未查询到有效订单', '未查询到订单', '暂无订单', '请稍后', '处理中', '系统繁忙', '网络异常')
+    )
+
+
+def build_public_batch_retry_payload(
+    *,
+    qr_text: str = '',
+    trade_no: str = '',
+    order_no: str = '',
+    source: str = '',
+) -> dict[str, str]:
+    payload = {
+        'qrText': pick_text(qr_text),
+        'tradeNo': pick_text(trade_no),
+        'orderNo': pick_text(order_no),
+        'source': pick_text(source),
+    }
+    return payload if any(payload.values()) else {}
+
+
+def classify_public_batch_item_retry(message: str, retry_payload: dict[str, str]) -> tuple[bool, str]:
+    if not any(str(value or '').strip() for value in retry_payload.values()):
+        return False, '缺少可复用的订单标识'
+
+    text = str(message or '').strip()
+    if not text:
+        return True, '失败原因未知，建议稍后重试'
+
+    if any(keyword in text for keyword in ('二维码已过期', '二维码已失效', '链接已过期', '链接已失效')):
+        return False, '二维码或链接已失效'
+    if any(keyword in text for keyword in ('卡密额度不足', '额度不足', '余额不足', '钻石不足')):
+        return False, '额度或余额不足'
+    if any(keyword in text for keyword in ('无权访问', '缺少', '参数错误')):
+        return False, '缺少必要信息或无权访问'
+    if should_refresh_public_remote_session(text):
+        return True, '登录态失效，可在刷新会话后重试'
+    if is_retryable_pay_message(text):
+        return True, '支付结果可能延迟确认，建议稍后重试'
+    if is_retryable_order_lookup_message(text):
+        return True, '远端订单可能延迟同步，建议稍后重试'
+    if '频繁' in text or '限流' in text:
+        return True, '接口限流，建议稍后重试'
+    return True, '可重试失败，建议稍后重试'
+
+
+def serialize_public_batch_task_item(item: Any) -> dict[str, Any]:
+    item_dict = dict_like(item)
+    retry_payload = dict_like(item_dict.get('retryPayload'))
+    if not retry_payload:
+        retry_payload = build_public_batch_retry_payload(
+            qr_text=pick_text(item_dict.get('qrText'), item_dict.get('scanUrl')),
+            trade_no=pick_text(item_dict.get('tradeNo')),
+            order_no=pick_text(item_dict.get('orderNo')),
+            source=pick_text(item_dict.get('source')),
+        )
+
+    status = pick_text(item_dict.get('status'), 'pending')
+    confirmed_success = bool(item_dict.get('confirmedSuccess'))
+    retryable = False
+    retry_hint = pick_text(item_dict.get('retryHint'))
+    if status == 'failed' and not confirmed_success:
+        computed_retryable, computed_retry_hint = classify_public_batch_item_retry(
+            pick_text(item_dict.get('message')),
+            retry_payload,
+        )
+        retryable = computed_retryable if item_dict.get('retryable') is None else bool(item_dict.get('retryable'))
+        retry_hint = retry_hint or computed_retry_hint
+
+    return {
+        **item_dict,
+        'retryable': retryable,
+        'retryHint': retry_hint,
+        'retryPayload': retry_payload,
+    }
 
 
 
@@ -3714,6 +3836,14 @@ def build_public_batch_script_command(
         str(max(1, int(count))),
         '--confirm-buy',
         '--progress-jsonl',
+        '--query-retry',
+        '4',
+        '--query-interval-ms',
+        '1200',
+        '--settle-attempts',
+        '12',
+        '--settle-interval-ms',
+        '1200',
     ]
     if remote_token:
         command.extend(['--remote-token', remote_token])
@@ -3793,6 +3923,9 @@ def merge_public_batch_progress_items(items_result: list[dict[str, Any]], next_i
         'status': str(next_item.get('status') or 'failed'),
         'tradeNo': pick_text(next_item.get('tradeNo')),
         'orderNo': pick_text(next_item.get('orderNo')),
+        'qrText': pick_text(next_item.get('qrText')),
+        'scanUrl': pick_text(next_item.get('scanUrl')),
+        'source': pick_text(next_item.get('source')),
         'message': pick_text(next_item.get('message')),
         'consumedDiamond': max(0, pick_int(next_item.get('consumedDiamond'))),
         'explicitPaySuccess': bool(next_item.get('explicitPaySuccess')),
@@ -3800,10 +3933,66 @@ def merge_public_batch_progress_items(items_result: list[dict[str, Any]], next_i
         'confirmedSuccess': bool(next_item.get('confirmedSuccess')),
         'sessionStatus': pick_text(next_item.get('sessionStatus')),
         'orderStatus': pick_text(next_item.get('orderStatus')),
+        'retryable': bool(next_item.get('retryable')),
+        'retryHint': pick_text(next_item.get('retryHint')),
+        'retryPayload': dict_like(next_item.get('retryPayload')),
         'rawResponse': dict_like(next_item.get('rawResponse')),
     })
     normalized.sort(key=lambda item: max(1, pick_int(item.get('index'), 1)))
     return normalized
+
+
+def merge_public_batch_script_final_items(
+    existing_items: list[dict[str, Any]],
+    final_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    existing_map = {
+        max(1, pick_int(item.get('index'), 1)): dict_like(item)
+        for item in existing_items
+        if isinstance(item, dict)
+    }
+    final_map = {
+        max(1, pick_int(item.get('index'), 1)): dict_like(item)
+        for item in final_items
+        if isinstance(item, dict)
+    }
+    merged: list[dict[str, Any]] = []
+    all_indexes = sorted(set(existing_map) | set(final_map))
+
+    for index in all_indexes:
+        existing_item = existing_map.get(index, {})
+        final_item = final_map.get(index, {})
+        if not final_item:
+            merged.append(existing_item)
+            continue
+        if not existing_item:
+            merged.append(final_item)
+            continue
+
+        existing_confirmed = is_public_batch_item_confirmed_success(existing_item)
+        final_confirmed = is_public_batch_item_confirmed_success(final_item)
+        final_message = pick_text(final_item.get('message'))
+        final_has_identity = bool(
+            pick_text(final_item.get('tradeNo'), final_item.get('orderNo'), final_item.get('scanUrl'))
+        )
+        existing_has_identity = bool(
+            pick_text(existing_item.get('tradeNo'), existing_item.get('orderNo'), existing_item.get('scanUrl'))
+        )
+        should_keep_existing = (
+            (existing_confirmed and not final_confirmed)
+            or (
+                existing_confirmed
+                and str(final_item.get('status') or '').strip().lower() == 'failed'
+            )
+            or (
+                not final_has_identity
+                and final_message in {'脚本未返回该订单的处理结果', '订单已创建，但未拿到自动支付结果'}
+                and existing_has_identity
+            )
+        )
+        merged.append(existing_item if should_keep_existing else final_item)
+
+    return merged
 
 
 def normalize_public_batch_debug_trace_entry(event: dict[str, Any]) -> dict[str, Any] | None:
@@ -3867,15 +4056,27 @@ def build_public_batch_progress_item_from_script_event(event: dict[str, Any]) ->
     event_type = str(event.get('type') or '').strip().lower()
     index = max(1, pick_int(event.get('index'), 1))
     if event_type == 'buy_item' and event.get('ok') is False:
+        retry_payload = build_public_batch_retry_payload(
+            qr_text=pick_text(event.get('scanUrl')),
+            order_no=pick_text(event.get('orderNo')),
+        )
+        retryable, retry_hint = classify_public_batch_item_retry(
+            pick_text(event.get('error'), '创建订单失败'),
+            retry_payload,
+        )
         return {
             'index': index,
             'status': 'failed',
             'tradeNo': '',
             'orderNo': pick_text(event.get('orderNo')),
             'message': pick_text(event.get('error'), '创建订单失败'),
+            'scanUrl': pick_text(event.get('scanUrl')),
             'consumedDiamond': 0,
             'sessionStatus': 'failed',
             'orderStatus': 'failed',
+            'retryable': retryable,
+            'retryHint': retry_hint,
+            'retryPayload': retry_payload,
         }
     if event_type != 'autopay_item':
         return None
@@ -3894,19 +4095,33 @@ def build_public_batch_progress_item_from_script_event(event: dict[str, Any]) ->
             'sessionStatus': 'completed' if confirmed_success else 'confirmed',
             'orderStatus': 'completed' if confirmed_success else 'confirmed',
             'rawResponse': dict_like(event.get('rawResponse')),
+            'scanUrl': pick_text(event.get('scanUrl')),
         }
+    retry_payload = build_public_batch_retry_payload(
+        qr_text=pick_text(event.get('scanUrl')),
+        trade_no=pick_text(event.get('tradeNo')),
+        order_no=pick_text(event.get('orderNo')),
+    )
+    retryable, retry_hint = classify_public_batch_item_retry(
+        pick_text(event.get('error'), '自动支付失败'),
+        retry_payload,
+    )
     return {
         'index': index,
         'status': 'failed',
         'tradeNo': pick_text(event.get('tradeNo')),
         'orderNo': pick_text(event.get('orderNo')),
         'message': pick_text(event.get('error'), '自动支付失败'),
+        'scanUrl': pick_text(event.get('scanUrl')),
         'consumedDiamond': 0,
         'explicitPaySuccess': False,
         'balanceDecreased': False,
         'confirmedSuccess': False,
         'sessionStatus': 'failed',
         'orderStatus': 'failed',
+        'retryable': retryable,
+        'retryHint': retry_hint,
+        'retryPayload': retry_payload,
     }
 
 
@@ -4042,6 +4257,12 @@ def build_public_batch_items_from_script_result(result_payload: dict[str, Any], 
         explicit_pay_success = bool(pay_result.get('explicitPaySuccess'))
         balance_decreased = bool(pay_result.get('balanceDecreased'))
         confirmed_success = bool(pay_result.get('confirmedSuccess'))
+        scan_url = pick_text(buy_item.get('scanUrl'), create_result.get('scanUrl'))
+        retry_payload = build_public_batch_retry_payload(
+            qr_text=scan_url,
+            trade_no=pick_text(pay_result.get('tradeNo')),
+            order_no=pick_text(pay_result.get('orderNo'), create_result.get('orderNo')),
+        )
         if pay_ok:
             status = 'completed'
             message = (
@@ -4074,11 +4295,13 @@ def build_public_batch_items_from_script_result(result_payload: dict[str, Any], 
             message = '脚本未返回该订单的处理结果'
             session_status = 'failed'
             order_status = ''
+        retryable, retry_hint = classify_public_batch_item_retry(message, retry_payload)
         items_result.append({
             'index': index,
             'status': status,
             'tradeNo': pick_text(pay_result.get('tradeNo'), create_result.get('orderNo')),
             'orderNo': pick_text(pay_result.get('orderNo'), create_result.get('orderNo')),
+            'scanUrl': scan_url,
             'message': message,
             'consumedDiamond': consumed,
             'explicitPaySuccess': explicit_pay_success,
@@ -4086,6 +4309,9 @@ def build_public_batch_items_from_script_result(result_payload: dict[str, Any], 
             'confirmedSuccess': confirmed_success,
             'sessionStatus': session_status,
             'orderStatus': order_status,
+            'retryable': retryable if status == 'failed' else False,
+            'retryHint': retry_hint if status == 'failed' else '',
+            'retryPayload': retry_payload if status == 'failed' else {},
             'rawResponse': pay_result,
         })
     return items_result, total_consumed_diamond
@@ -4306,6 +4532,8 @@ def run_public_batch_purchase(
                 'status': 'completed',
                 'tradeNo': order_row.order_id or str(item.get('tradeNo') or ''),
                 'orderNo': pick_text(dict_like(order_row.raw_payload).get('data', {}).get('orderNo') if isinstance(dict_like(order_row.raw_payload).get('data'), dict) else '', item.get('orderNo')),
+                'qrText': str(item.get('qrText') or ''),
+                'source': str(item.get('source') or ''),
                 'message': (
                     str(
                         payment_result.get('message')
@@ -4321,30 +4549,53 @@ def run_public_batch_purchase(
                 'confirmedSuccess': confirmed_success,
                 'sessionStatus': 'completed' if confirmed_success else 'confirmed',
                 'orderStatus': 'completed' if confirmed_success else 'confirmed',
+                'retryable': False,
+                'retryHint': '',
+                'retryPayload': {},
                 'rawResponse': payment_payload,
             }
         except HTTPException as exc:
+            retry_payload = build_public_batch_retry_payload(
+                qr_text=str(item.get('qrText') or ''),
+                trade_no=str(item.get('tradeNo') or ''),
+                order_no=str(item.get('orderNo') or ''),
+                source=str(item.get('source') or ''),
+            )
+            retryable, retry_hint = classify_public_batch_item_retry(
+                str(exc.detail or '处理失败'),
+                retry_payload,
+            )
             item_result = {
                 'index': index,
                 'status': 'failed',
                 'tradeNo': str(item.get('tradeNo') or ''),
                 'orderNo': str(item.get('orderNo') or ''),
+                'qrText': str(item.get('qrText') or ''),
+                'source': str(item.get('source') or ''),
                 'message': str(exc.detail or '处理失败'),
                 'consumedDiamond': 0,
                 'sessionStatus': session_row.status or '',
                 'orderStatus': '',
+                'retryable': retryable,
+                'retryHint': retry_hint,
+                'retryPayload': retry_payload,
             }
             results.append(item_result)
+            confirmed_count = sum(1 for item in results if is_public_batch_item_confirmed_success(item))
             batch_task_row = finalize_public_batch_task(
                 db,
                 batch_task_row,
-                status='failed',
-                message=f'第 {index} 单处理失败：{item_result["message"]}',
+                status='running',
+                message=(
+                    f'第 {index} 单处理失败：{item_result["message"]}，继续处理后续订单'
+                    if index < len(items)
+                    else f'第 {index} 单处理失败：{item_result["message"]}'
+                ),
                 items_result=results,
                 current_index=index,
                 current_trade_no=item_result['tradeNo'],
             )
-            session_row.status = 'failed'
+            session_row.status = 'confirmed' if confirmed_count > 0 else (session_row.status or 'pending')
             session_row.message = batch_task_row.message
             session_row.updated_at = now_text()
             session_row.result_payload = {
@@ -4354,35 +4605,49 @@ def run_public_batch_purchase(
             }
             db.commit()
             db.refresh(session_row)
-            return build_public_unlock_response(
-                db,
-                cdkey_row,
-                account,
-                session_row,
-                batch_task_row=batch_task_row,
-            ), batch_task_row
+            continue
         except Exception as exc:
+            retry_payload = build_public_batch_retry_payload(
+                qr_text=str(item.get('qrText') or ''),
+                trade_no=str(item.get('tradeNo') or ''),
+                order_no=str(item.get('orderNo') or ''),
+                source=str(item.get('source') or ''),
+            )
+            retryable, retry_hint = classify_public_batch_item_retry(
+                str(exc or '处理失败'),
+                retry_payload,
+            )
             item_result = {
                 'index': index,
                 'status': 'failed',
                 'tradeNo': str(item.get('tradeNo') or ''),
                 'orderNo': str(item.get('orderNo') or ''),
+                'qrText': str(item.get('qrText') or ''),
+                'source': str(item.get('source') or ''),
                 'message': str(exc or '处理失败'),
                 'consumedDiamond': 0,
                 'sessionStatus': session_row.status or '',
                 'orderStatus': '',
+                'retryable': retryable,
+                'retryHint': retry_hint,
+                'retryPayload': retry_payload,
             }
             results.append(item_result)
+            confirmed_count = sum(1 for item in results if is_public_batch_item_confirmed_success(item))
             batch_task_row = finalize_public_batch_task(
                 db,
                 batch_task_row,
-                status='failed',
-                message=f'第 {index} 单处理失败：{item_result["message"]}',
+                status='running',
+                message=(
+                    f'第 {index} 单处理失败：{item_result["message"]}，继续处理后续订单'
+                    if index < len(items)
+                    else f'第 {index} 单处理失败：{item_result["message"]}'
+                ),
                 items_result=results,
                 current_index=index,
                 current_trade_no=item_result['tradeNo'],
             )
-            session_row.status = 'failed'
+            session_row.status = 'confirmed' if confirmed_count > 0 else (session_row.status or 'pending')
             session_row.message = batch_task_row.message
             session_row.updated_at = now_text()
             session_row.result_payload = {
@@ -4392,13 +4657,7 @@ def run_public_batch_purchase(
             }
             db.commit()
             db.refresh(session_row)
-            return build_public_unlock_response(
-                db,
-                cdkey_row,
-                account,
-                session_row,
-                batch_task_row=batch_task_row,
-            ), batch_task_row
+            continue
 
         results.append(item_result)
         confirmed_count = sum(1 for item in results if is_public_batch_item_confirmed_success(item))
@@ -4423,10 +4682,17 @@ def run_public_batch_purchase(
     final_success_count = sum(1 for item in results if is_public_batch_item_confirmed_success(item))
     final_failed_count = sum(1 for item in results if str(item.get('status') or '') == 'failed')
     final_confirmed = len(results) == len(items) and final_success_count == len(items)
+    final_status = (
+        'completed'
+        if final_confirmed
+        else 'partial_success'
+        if final_success_count > 0
+        else 'failed'
+    )
     batch_task_row = finalize_public_batch_task(
         db,
         batch_task_row,
-        status='completed' if final_confirmed else 'failed',
+        status=final_status,
         message=(
             f'批量购买完成，确认成功 {final_success_count}/{len(items)} 单'
             if final_confirmed
@@ -4440,7 +4706,7 @@ def run_public_batch_purchase(
         current_index=len(results),
         current_trade_no=str(results[-1].get('tradeNo') or '') if results else '',
     )
-    session_row.status = 'completed'
+    session_row.status = 'completed' if final_success_count > 0 else 'failed'
     session_row.message = batch_task_row.message
     session_row.updated_at = now_text()
     session_row.result_payload = {
@@ -4676,12 +4942,27 @@ def run_public_batch_script_job(
             lines = [line.strip() for line in stdout_text.splitlines() if line.strip()]
             raise RuntimeError(pick_text(lines[-1] if lines else '', '批量下单脚本执行失败'))
 
+        existing_items = dict_like(batch_task_row.result_payload).get('items')
+        existing_items = [dict_like(item) for item in existing_items] if isinstance(existing_items, list) else []
         items_result, total_consumed_diamond = build_public_batch_items_from_script_result(result_payload, count)
+        if existing_items:
+            items_result = merge_public_batch_script_final_items(existing_items, items_result)
+            total_consumed_diamond = sum(
+                max(0, pick_int(item.get('consumedDiamond')))
+                for item in items_result
+                if isinstance(item, dict)
+            )
         final_success_count = sum(1 for item in items_result if is_public_batch_item_confirmed_success(item))
-        final_ok = (
-            result_payload.get('ok') is True
-            and len(items_result) == count
-            and final_success_count == count
+        all_items_confirmed = len(items_result) == count and final_success_count == count
+        # Progress events may already contain the full successful outcome even when
+        # the script's final JSON summary is truncated or cannot be parsed cleanly.
+        final_ok = all_items_confirmed
+        final_status = (
+            'completed'
+            if final_ok
+            else 'partial_success'
+            if final_success_count > 0
+            else 'failed'
         )
         final_message = (
             pick_text(
@@ -4723,13 +5004,14 @@ def run_public_batch_script_job(
         batch_task_row = finalize_public_batch_task(
             db,
             batch_task_row,
-            status='completed' if final_ok else 'failed',
+            status=final_status,
             message=final_message,
             items_result=items_result,
             current_index=len(items_result),
             current_trade_no=str(items_result[-1].get('tradeNo') or items_result[-1].get('orderNo') or '') if items_result else '',
             total_consumed_diamond=total_consumed_diamond,
         )
+        session_row.status = 'completed' if final_success_count > 0 else 'failed'
         session_row.message = batch_task_row.message
         session_row.updated_at = now_text()
         session_row.result_payload = {
@@ -5311,7 +5593,7 @@ def save_card_from_request(
             owner_username=owner_username,
             created_at=now,
             updated_at=now,
-            payload={},
+            payload={'baseMaxUses': max_uses, 'quotaTopUpTotal': 0},
         )
         db.add(row)
 
@@ -5544,7 +5826,7 @@ def import_cdkeys(
             remark=remark,
             created_at=now,
             updated_at=now,
-            payload={},
+            payload={'baseMaxUses': max_uses, 'quotaTopUpTotal': 0},
         )
         db.add(row)
         items.append(row)
@@ -5803,7 +6085,34 @@ def update_cdkey(
     db: Session = Depends(get_db),
 ):
     row = get_cdkey_or_404(db, user, row_id)
-    payload = dict_like(row.payload)
+    payload = dict(dict_like(row.payload))
+    if body.addQuota is not None:
+        add_quota = int(body.addQuota or 0)
+        if add_quota <= 0:
+            raise HTTPException(status_code=400, detail='补额度必须大于 0')
+        current_max_uses = max(0, pick_int(row.max_uses))
+        current_use_count = max(0, pick_int(row.use_count))
+        expires_at = pick_nullable_int(row.expires_at)
+        time_expired = bool(expires_at and int(time.time()) > int(expires_at))
+        base_max_uses = resolve_cdkey_base_max_uses(row)
+        top_up_total = max(0, pick_int(payload.get('quotaTopUpTotal')))
+        if top_up_total <= 0 and current_max_uses > base_max_uses:
+            top_up_total = current_max_uses - base_max_uses
+        if base_max_uses > 0:
+            payload['baseMaxUses'] = base_max_uses
+        payload['quotaTopUpTotal'] = top_up_total + add_quota
+        row.max_uses = current_max_uses + add_quota
+        normalized_status = str(row.status or '').strip().lower()
+        quota_restored = current_use_count < int(row.max_uses or 0)
+        if (
+            normalized_status == 'expired'
+            and not time_expired
+            and quota_restored
+        ):
+            row.status = 'active' if current_use_count > 0 else 'unused'
+            payload.pop('quotaExhaustedAt', None)
+            payload.pop('expiredAt', None)
+            payload.pop('invalidatedAt', None)
     if body.status is not None:
         next_status = str(body.status or '').strip().lower()
         if next_status not in {'unused', 'active', 'expired', 'void'}:

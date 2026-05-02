@@ -135,6 +135,14 @@
                     {{ batchProgressText }}
                   </div>
                   <button
+                    v-if="canRetryFailedBatchItems"
+                    class="action-button batch-progress-card__action"
+                    :disabled="batchRetrySubmitting"
+                    @click="retryFailedBatchItems"
+                  >
+                    {{ batchRetrySubmitting ? "重试提交中..." : "重试失败单" }}
+                  </button>
+                  <button
                     v-if="canCancelBatchTask"
                     class="action-button action-button--danger batch-progress-card__action"
                     :disabled="batchCancelling"
@@ -147,6 +155,48 @@
               <div class="batch-progress-card__desc">
                 {{ currentBatchTask.message || "等待批量任务开始处理" }}
               </div>
+              <details
+                v-if="batchScriptDebugVisible"
+                class="batch-progress-debug"
+              >
+                <summary class="batch-progress-debug__summary">
+                  查看脚本异常摘要
+                </summary>
+                <div
+                  v-if="batchScriptSummaryLines.length"
+                  class="batch-progress-debug__meta"
+                >
+                  <div
+                    v-for="line in batchScriptSummaryLines"
+                    :key="line"
+                    class="batch-progress-debug__line"
+                  >
+                    {{ line }}
+                  </div>
+                </div>
+                <details
+                  v-if="batchScriptStderr"
+                  class="batch-progress-debug__nested"
+                >
+                  <summary class="batch-progress-debug__summary">
+                    展开 stderr
+                  </summary>
+                  <pre class="batch-progress-debug__raw">{{
+                    batchScriptStderr
+                  }}</pre>
+                </details>
+                <details
+                  v-if="batchScriptStdout"
+                  class="batch-progress-debug__nested"
+                >
+                  <summary class="batch-progress-debug__summary">
+                    展开 stdout
+                  </summary>
+                  <pre class="batch-progress-debug__raw">{{
+                    batchScriptStdout
+                  }}</pre>
+                </details>
+              </details>
               <div class="batch-progress-bar">
                 <div
                   class="batch-progress-bar__inner"
@@ -171,7 +221,13 @@
               >
                 当前单号：{{ currentBatchTask.currentTradeNo }}
               </div>
-              <div v-if="batchItems.length" class="batch-progress-list">
+              <div
+                v-if="batchSummaryFallbackActive"
+                class="batch-progress-summary-warning"
+              >
+                历史批次的逐单明细已丢失，当前按任务汇总统计回显真实结果。
+              </div>
+              <div v-else-if="batchItems.length" class="batch-progress-list">
                 <div
                   v-for="item in batchItems"
                   :key="`${item.index}-${item.tradeNo || item.orderNo || 'empty'}`"
@@ -192,12 +248,27 @@
                   <div class="batch-progress-item__message">
                     {{ item.message || "等待处理" }}
                   </div>
+                  <div
+                    v-if="String(item.status || '') === 'failed'"
+                    class="batch-progress-item__retry"
+                    :class="
+                      item.retryable
+                        ? 'batch-progress-item__retry--retryable'
+                        : 'batch-progress-item__retry--non-retryable'
+                    "
+                  >
+                    {{
+                      item.retryable
+                        ? `可重试：${item.retryHint || "建议稍后重试"}`
+                        : `不可重试：${item.retryHint || "请更换订单或检查额度"}`
+                    }}
+                  </div>
                   <details
                     v-if="item.detailText"
                     class="batch-progress-item__detail"
                   >
                     <summary class="batch-progress-item__detail-summary">
-                      查看成功详情
+                      {{ getBatchItemDetailSummary(item) }}
                     </summary>
                     <pre class="batch-progress-item__raw">{{
                       item.detailText
@@ -730,6 +801,7 @@ const pageRefreshing = ref(false);
 const syncingState = ref(false);
 const scanSubmitting = ref(false);
 const batchSubmitting = ref(false);
+const batchRetrySubmitting = ref(false);
 const batchCancelling = ref(false);
 const confirmSubmitting = ref(false);
 const cameraBusy = ref(false);
@@ -821,11 +893,44 @@ const batchTaskStatus = computed(() =>
   String(currentBatchTask.value?.status || ""),
 );
 const isBatchTerminal = computed(() =>
-  ["completed", "failed", "canceled"].includes(batchTaskStatus.value),
+  ["completed", "partial_success", "failed", "canceled"].includes(
+    batchTaskStatus.value,
+  ),
 );
 const isBatchRunning = computed(() => batchTaskStatus.value === "running");
 const isBatchBusy = computed(
   () => isBatchRunning.value || isBatchCanceling.value,
+);
+const batchErrorSourceText = computed(() =>
+  String(currentBatchTask.value?.errorSource || "").trim(),
+);
+const batchPhaseText = computed(() =>
+  String(currentBatchTask.value?.phase || "").trim(),
+);
+const batchScriptMessage = computed(() =>
+  String(currentBatchTask.value?.scriptMessage || "").trim(),
+);
+const batchScriptStdout = computed(() =>
+  String(currentBatchTask.value?.scriptStdout || "").trim(),
+);
+const batchScriptStderr = computed(() =>
+  String(currentBatchTask.value?.scriptStderr || "").trim(),
+);
+const batchScriptSummaryLines = computed(() => {
+  const lines = [];
+  if (batchScriptMessage.value)
+    lines.push(`异常信息：${batchScriptMessage.value}`);
+  if (batchErrorSourceText.value)
+    lines.push(`异常来源：${batchErrorSourceText.value}`);
+  if (batchPhaseText.value) lines.push(`脚本阶段：${batchPhaseText.value}`);
+  return lines;
+});
+const batchScriptDebugVisible = computed(
+  () =>
+    batchTaskStatus.value === "failed" &&
+    (batchScriptSummaryLines.value.length > 0 ||
+      batchScriptStdout.value ||
+      batchScriptStderr.value),
 );
 const liveBatchConsumedDiamond = computed(() => {
   if (!isBatchRunning.value) return 0;
@@ -876,6 +981,7 @@ const cardStatusText = computed(() => {
 
 const sessionStatusText = computed(() => {
   if (batchTaskStatus.value === "canceled") return "批量任务已取消";
+  if (batchTaskStatus.value === "partial_success") return "批量任务部分成功";
   if (isBatchCanceling.value) return "批量任务取消中";
   if (isBatchRunning.value) return "批量下单中";
   if (isUnlockCompleted.value) return "已完成解锁";
@@ -951,9 +1057,19 @@ const remainingDiamondText = computed(() => {
   return `${left} 钻`;
 });
 
+const quotaDisplayTotal = computed(() => {
+  const maxUses = Number(redeemInfo.value.maxUses || 0);
+  const baseMaxUses = Math.max(
+    0,
+    Number(redeemInfo.value.baseMaxUses || maxUses || 0),
+  );
+  if (maxUses <= 0) return 0;
+  return baseMaxUses > 0 ? baseMaxUses : maxUses;
+});
+
 const totalDiamondText = computed(() => {
   const maxUses = Number(redeemInfo.value.maxUses || 0);
-  return maxUses > 0 ? `${maxUses} 钻` : "不限";
+  return maxUses > 0 ? `${quotaDisplayTotal.value} 钻` : "不限";
 });
 
 const usedDiamondText = computed(() => {
@@ -973,7 +1089,13 @@ const remainingPercent = computed(() => {
     Number(redeemInfo.value.useCount || 0) + liveBatchConsumedDiamond.value;
   if (maxUses <= 0) return 100;
   const left = Math.max(0, maxUses - used);
-  return Math.max(0, Math.min(100, Math.round((left / maxUses) * 100)));
+  return Math.max(
+    0,
+    Math.min(
+      100,
+      Math.round((left / Math.max(1, quotaDisplayTotal.value)) * 100),
+    ),
+  );
 });
 const liveAccountDiamondText = computed(() => {
   const currentDiamond = Number(redeemInfo.value.account?.diamondQuantity || 0);
@@ -999,11 +1121,34 @@ const canConfirmUnlock = computed(
       String(currentSession.value?.status || ""),
     ),
 );
+const batchHasConfirmedSuccess = computed(
+  () =>
+    batchItems.value.some((item) => item?.confirmedSuccess === true) ||
+    Number(currentBatchTask.value?.successCount || 0) > 0,
+);
+const batchSummaryFallbackActive = computed(() => {
+  const taskSuccessCount = Number(currentBatchTask.value?.successCount || 0);
+  const itemSuccessCount = batchItems.value.filter(
+    (item) => item?.confirmedSuccess === true,
+  ).length;
+  const itemFailedCount = batchItems.value.filter(
+    (item) => String(item?.status || "") === "failed",
+  ).length;
+  return (
+    taskSuccessCount > 0 &&
+    batchItems.value.length > 0 &&
+    itemSuccessCount === 0 &&
+    itemFailedCount === batchItems.value.length
+  );
+});
 const batchStatusText = computed(() => {
   const status = batchTaskStatus.value;
   if (status === "canceled") return "批量任务已取消";
   if (isBatchCanceling.value) return "批量任务取消中";
   if (status === "completed") return "批量下单已完成";
+  if (status === "partial_success") return "批量下单部分成功";
+  if (status === "failed" && batchHasConfirmedSuccess.value)
+    return "批量下单部分成功";
   if (status === "failed") return "批量下单失败";
   if (status === "running") return "批量下单进行中";
   return "暂无批量任务";
@@ -1013,6 +1158,8 @@ const batchStatusClass = computed(() => {
   if (status === "canceled") return "warning";
   if (isBatchCanceling.value) return "warning";
   if (status === "completed") return "success";
+  if (status === "partial_success") return "warning";
+  if (status === "failed" && batchHasConfirmedSuccess.value) return "warning";
   if (status === "failed") return "failed";
   return "running";
 });
@@ -1036,14 +1183,16 @@ const batchRequiredDiamond = computed(() =>
 const batchRequiredText = computed(
   () => `${Math.max(0, batchRequiredDiamond.value)} 钻`,
 );
-const batchDisplayedSuccessCount = computed(
-  () =>
-    batchItems.value.filter((item) => item.confirmedSuccess === true).length,
+const batchDisplayedSuccessCount = computed(() =>
+  batchSummaryFallbackActive.value
+    ? Number(currentBatchTask.value?.successCount || 0)
+    : batchItems.value.filter((item) => item.confirmedSuccess === true).length,
 );
-const batchDisplayedFailedCount = computed(
-  () =>
-    batchItems.value.filter((item) => String(item.status || "") === "failed")
-      .length,
+const batchDisplayedFailedCount = computed(() =>
+  batchSummaryFallbackActive.value
+    ? Number(currentBatchTask.value?.failedCount || 0)
+    : batchItems.value.filter((item) => String(item.status || "") === "failed")
+        .length,
 );
 const batchDisplayedCanceledCount = computed(() =>
   Math.max(
@@ -1057,6 +1206,101 @@ const batchDisplayedCanceledCount = computed(() =>
 const batchDisplayedPendingCount = computed(() =>
   Math.max(0, Number(currentBatchTask.value?.pendingCount || 0)),
 );
+function normalizeBatchRetryPayload(payload) {
+  const retryPayload = payload && typeof payload === "object" ? payload : {};
+  return {
+    qrText: String(retryPayload.qrText || "").trim(),
+    tradeNo: String(retryPayload.tradeNo || "").trim(),
+    orderNo: String(retryPayload.orderNo || "").trim(),
+    source: String(retryPayload.source || "").trim(),
+  };
+}
+function hasBatchRetryIdentity(payload) {
+  return Boolean(payload.qrText || payload.tradeNo || payload.orderNo);
+}
+function deriveBatchRetryMeta(item) {
+  const retryPayload = normalizeBatchRetryPayload(item?.retryPayload);
+  const text = String(item?.message || "").trim();
+  if (!hasBatchRetryIdentity(retryPayload)) {
+    return {
+      retryable: false,
+      retryHint: "缺少可复用的订单标识",
+      retryPayload,
+    };
+  }
+  if (
+    ["二维码已过期", "二维码已失效", "链接已过期", "链接已失效"].some(
+      (keyword) => text.includes(keyword),
+    )
+  ) {
+    return {
+      retryable: false,
+      retryHint: "二维码或链接已失效",
+      retryPayload,
+    };
+  }
+  if (
+    ["卡密额度不足", "额度不足", "余额不足", "钻石不足"].some((keyword) =>
+      text.includes(keyword),
+    )
+  ) {
+    return {
+      retryable: false,
+      retryHint: "额度或余额不足",
+      retryPayload,
+    };
+  }
+  if (
+    ["无权访问", "缺少", "参数错误"].some((keyword) => text.includes(keyword))
+  ) {
+    return {
+      retryable: false,
+      retryHint: "缺少必要信息或无权访问",
+      retryPayload,
+    };
+  }
+  if (
+    [
+      "订单不存在",
+      "未查询到有效订单",
+      "未查询到订单",
+      "暂无订单",
+      "请稍后",
+      "处理中",
+      "系统繁忙",
+      "网络异常",
+      "频繁",
+      "限流",
+      "登录失效",
+      "未登录",
+    ].some((keyword) => text.includes(keyword))
+  ) {
+    return {
+      retryable: true,
+      retryHint: "远端状态可能延迟同步，建议稍后重试",
+      retryPayload,
+    };
+  }
+  return {
+    retryable: true,
+    retryHint: "可重试失败，建议稍后重试",
+    retryPayload,
+  };
+}
+const retryableFailedBatchItems = computed(() =>
+  batchItems.value.filter(
+    (item) =>
+      String(item?.status || "") === "failed" && item?.retryable === true,
+  ),
+);
+const canRetryFailedBatchItems = computed(
+  () =>
+    !isCardReadOnly.value &&
+    !isBatchBusy.value &&
+    !batchSubmitting.value &&
+    !batchRetrySubmitting.value &&
+    retryableFailedBatchItems.value.length > 0,
+);
 function getBatchItemDisplayStatus(item) {
   if (String(item?.status || "") === "canceled") return "canceled";
   if (item?.confirmedSuccess === true) return "completed";
@@ -1069,6 +1313,11 @@ function getBatchItemStatusText(item) {
   if (String(item?.status || "") === "failed") return "失败";
   if (String(item?.status || "") === "completed") return "待确认";
   return "处理中";
+}
+function getBatchItemDetailSummary(item) {
+  if (String(item?.status || "") === "failed") return "查看失败详情";
+  if (item?.confirmedSuccess === true) return "查看成功详情";
+  return "查看详情";
 }
 const batchSelectedOption = computed(
   () =>
@@ -1219,6 +1468,7 @@ function createEmptyRedeemInfo() {
     expiresAt: null,
     useCount: 0,
     maxUses: 0,
+    baseMaxUses: 0,
     remainingQuota: -1,
     canPay: true,
     invalidReason: "",
@@ -1358,17 +1608,25 @@ function normalizeBatchTask(batchTask) {
     updatedAt: String(batchTask.updatedAt || ""),
     cancelRequested: batchTask.cancelRequested === true,
     cancelRequestedAt: String(batchTask.cancelRequestedAt || ""),
+    phase: String(batchTask.phase || ""),
+    errorSource: String(batchTask.errorSource || ""),
+    scriptMessage: String(batchTask.scriptMessage || ""),
+    scriptStdout: String(batchTask.scriptStdout || ""),
+    scriptStderr: String(batchTask.scriptStderr || ""),
     requiredDiamond: Number(payload.requiredDiamond || 0),
     beforeDiamond: Number(payload.beforeDiamond ?? -1),
     afterDiamond: Number(payload.afterDiamond ?? -1),
     payload,
     items: items.map((item, index) => ({
+      ...deriveBatchRetryMeta(item),
       rawResponse: item?.rawResponse || {},
       detailText: formatPaymentDetail(item?.rawResponse),
       index: Number(item?.index || index + 1),
       status: String(item?.status || "pending"),
       tradeNo: String(item?.tradeNo || ""),
       orderNo: String(item?.orderNo || ""),
+      qrText: String(item?.qrText || item?.scanUrl || ""),
+      source: String(item?.source || ""),
       message: String(item?.message || ""),
       consumedDiamond: Number(item?.consumedDiamond || 0),
       explicitPaySuccess: item?.explicitPaySuccess === true,
@@ -1376,6 +1634,19 @@ function normalizeBatchTask(batchTask) {
       confirmedSuccess: item?.confirmedSuccess === true,
       sessionStatus: String(item?.sessionStatus || ""),
       orderStatus: String(item?.orderStatus || ""),
+      retryable:
+        item?.retryable === true || deriveBatchRetryMeta(item).retryable,
+      retryHint: String(
+        item?.retryHint || deriveBatchRetryMeta(item).retryHint || "",
+      ),
+      retryPayload: normalizeBatchRetryPayload(
+        item?.retryPayload || {
+          qrText: item?.qrText || item?.scanUrl || "",
+          tradeNo: item?.tradeNo || "",
+          orderNo: item?.orderNo || "",
+          source: item?.source || "",
+        },
+      ),
     })),
   };
 }
@@ -1442,6 +1713,8 @@ function mergeRedeemInfo(partial) {
     next.useCount = Number(partial.useCount ?? next.useCount ?? 0);
   if (partial?.maxUses !== undefined)
     next.maxUses = Number(partial.maxUses ?? next.maxUses ?? 0);
+  if (partial?.baseMaxUses !== undefined)
+    next.baseMaxUses = Number(partial.baseMaxUses ?? next.baseMaxUses ?? 0);
   if (partial?.remainingQuota !== undefined)
     next.remainingQuota = Number(partial.remainingQuota ?? next.remainingQuota);
   if (partial?.canPay !== undefined) next.canPay = partial.canPay !== false;
@@ -2309,6 +2582,57 @@ async function submitBatchOrder() {
   }
 }
 
+async function retryFailedBatchItems() {
+  const sessionId = String(currentSession.value?.sessionId || "");
+  if (!sessionId) {
+    showToast("当前解锁会话不存在，请刷新页面后重试");
+    return;
+  }
+  if (!canRetryFailedBatchItems.value) {
+    showToast("当前没有可重试的失败订单");
+    return;
+  }
+
+  const seen = new Set();
+  const retryItems = retryableFailedBatchItems.value
+    .map((item) => normalizeBatchRetryPayload(item.retryPayload))
+    .filter((payload) => hasBatchRetryIdentity(payload))
+    .filter((payload) => {
+      const key = [
+        payload.qrText,
+        payload.tradeNo,
+        payload.orderNo,
+        payload.source,
+      ].join("|");
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+  if (!retryItems.length) {
+    showToast("可重试失败订单缺少有效标识，无法提交");
+    return;
+  }
+
+  batchRetrySubmitting.value = true;
+  try {
+    const { data } = await judianApi.publicUnlockBatchPurchase(sessionId, {
+      items: retryItems,
+      submitSource: "retry_failed_batch_items",
+    });
+    applyRedeemPayload(data);
+    showToast(`已提交 ${retryItems.length} 单失败订单重试任务`);
+  } catch (error) {
+    try {
+      const { data } = await judianApi.publicUnlockDetail(sessionId);
+      applyRedeemPayload(data);
+    } catch {}
+    showToast(extractErrorMessage(error, "失败订单重试提交失败，请稍后重试"));
+  } finally {
+    batchRetrySubmitting.value = false;
+  }
+}
+
 async function cancelBatchTask() {
   const sessionId = String(currentSession.value?.sessionId || "");
   if (!sessionId) {
@@ -2940,6 +3264,17 @@ function showToast(message) {
   color: #fff;
 }
 
+.batch-progress-summary-warning {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(251, 191, 36, 0.28);
+  background: rgba(120, 53, 15, 0.16);
+  color: #fde68a;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
 .batch-progress-card__meta {
   font-size: 13px;
   font-weight: 700;
@@ -2969,6 +3304,66 @@ function showToast(message) {
 
 .batch-progress-item__detail {
   margin-top: 8px;
+}
+
+.batch-progress-debug {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid rgba(248, 113, 113, 0.2);
+  border-radius: 12px;
+  background: rgba(127, 29, 29, 0.14);
+}
+
+.batch-progress-debug__summary {
+  cursor: pointer;
+  color: #fca5a5;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.batch-progress-debug__meta {
+  margin-top: 8px;
+  display: grid;
+  gap: 6px;
+}
+
+.batch-progress-debug__line {
+  font-size: 12px;
+  line-height: 1.6;
+  color: #fecaca;
+  word-break: break-word;
+}
+
+.batch-progress-debug__nested {
+  margin-top: 10px;
+}
+
+.batch-progress-debug__raw {
+  margin-top: 8px;
+  padding: 10px;
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.9);
+  color: #e2e8f0;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: auto;
+  max-height: 220px;
+}
+
+.batch-progress-item__retry {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.batch-progress-item__retry--retryable {
+  color: #fbbf24;
+}
+
+.batch-progress-item__retry--non-retryable {
+  color: #fca5a5;
 }
 
 .batch-progress-item__detail-summary {

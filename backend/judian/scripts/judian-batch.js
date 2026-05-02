@@ -618,6 +618,36 @@ function isRetryablePayMessage(message) {
   );
 }
 
+function isRetryableOrderLookupMessage(message) {
+  const text = String(message || "").trim();
+  if (!text) {
+    return false;
+  }
+  if (
+    [
+      "二维码已过期",
+      "二维码已失效",
+      "链接已过期",
+      "链接已失效",
+      "余额不足",
+      "钻石不足",
+      "无权访问",
+    ].some((keyword) => text.includes(keyword))
+  ) {
+    return false;
+  }
+  return [
+    "订单不存在",
+    "未查询到有效订单",
+    "未查询到订单",
+    "暂无订单",
+    "请稍后",
+    "处理中",
+    "系统繁忙",
+    "网络异常",
+  ].some((keyword) => text.includes(keyword));
+}
+
 function isPublicOrderPayloadSuccess(payload) {
   const payloadDict = dictLike(payload);
   const orderData = dictLike(payloadDict.data);
@@ -1608,6 +1638,7 @@ async function resolvePublicOrderPayload(
     scanResult = null,
     maxAttemptsPerCandidate = 2,
     sleepMs = 600,
+    eventualConsistencyExtraAttempts = 3,
   },
 ) {
   const candidates = buildPublicOrderQueryCandidates(
@@ -1626,11 +1657,12 @@ async function resolvePublicOrderPayload(
   let lastRemoteError = "";
 
   for (const candidate of candidates) {
-    for (
-      let attemptIndex = 0;
-      attemptIndex < maxAttemptsPerCandidate;
-      attemptIndex += 1
-    ) {
+    let plannedAttempts = Math.max(1, Number(maxAttemptsPerCandidate || 1));
+    const extraAttempts = Math.max(
+      0,
+      Number(eventualConsistencyExtraAttempts || 0),
+    );
+    for (let attemptIndex = 0; attemptIndex < plannedAttempts; attemptIndex += 1) {
       try {
         const payload = await remoteGetOrderInfo(context, candidate);
         const message = pickText(
@@ -1659,6 +1691,12 @@ async function resolvePublicOrderPayload(
         if (message) {
           lastInvalidMessage = message;
         }
+        if (
+          isRetryableOrderLookupMessage(message) &&
+          plannedAttempts < maxAttemptsPerCandidate + extraAttempts
+        ) {
+          plannedAttempts = maxAttemptsPerCandidate + extraAttempts;
+        }
       } catch (error) {
         lastRemoteError = error.message;
         trace.push({
@@ -1669,8 +1707,11 @@ async function resolvePublicOrderPayload(
         });
       }
 
-      if (attemptIndex < maxAttemptsPerCandidate - 1) {
-        await delay(sleepMs);
+      if (attemptIndex < plannedAttempts - 1) {
+        const nextSleepMs = isRetryableOrderLookupMessage(lastInvalidMessage)
+          ? Math.max(1000, sleepMs)
+          : sleepMs;
+        await delay(nextSleepMs);
       }
     }
   }

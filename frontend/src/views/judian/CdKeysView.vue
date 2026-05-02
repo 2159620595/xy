@@ -213,7 +213,7 @@
             {{ resolveDurationText(row.duration) }}
           </template>
         </el-table-column>
-        <el-table-column label="已使用进度" min-width="220">
+        <el-table-column label="额度进度" min-width="220">
           <template #default="{ row }">
             <div class="cdkey-usage-progress">
               <div class="cdkey-usage-progress__summary">
@@ -276,6 +276,15 @@
                 @click="openUsageDetail(row)"
               >
                 使用详情
+              </el-button>
+              <el-button
+                v-if="canTopUpQuota(row)"
+                size="small"
+                text
+                type="warning"
+                @click="openTopUpQuota(row)"
+              >
+                补额度
               </el-button>
               <el-button
                 size="small"
@@ -728,6 +737,13 @@ function extractErrorMessage(error) {
   );
 }
 
+function isMessageBoxCancel(error) {
+  const action = String(error?.action || error || "")
+    .trim()
+    .toLowerCase();
+  return action === "cancel" || action === "close";
+}
+
 async function copyText(text) {
   if (navigator.clipboard?.writeText) {
     await navigator.clipboard.writeText(text);
@@ -796,31 +812,33 @@ function handleDurationChange(value) {
 
 function resolveUsageProgress(row) {
   const maxUses = Math.max(0, Number(row.maxUses || 0));
+  const baseMaxUses = Math.max(0, Number(row.baseMaxUses || maxUses || 0));
   const used = Math.max(0, Number(row.useCount || 0));
   if (maxUses <= 0) {
     return {
       unlimited: true,
-      summary: `已使用 ${used} 钻`,
-      meta: "总额度：不限",
+      summary: `剩余不限`,
+      meta: `已用 ${used} 钻 · 当前可用不限`,
     };
   }
   const remaining = Math.max(0, maxUses - used);
+  const displayTotal = baseMaxUses > 0 ? baseMaxUses : maxUses;
   const percentage = Math.max(
     0,
-    Math.min(100, Math.round((used / maxUses) * 100)),
+    Math.min(100, Math.round((remaining / Math.max(1, displayTotal)) * 100)),
   );
   return {
     unlimited: false,
     percentage,
-    summary: `${used} / ${maxUses} 钻`,
-    meta: `剩余 ${remaining} 钻`,
+    summary: `${remaining} / ${displayTotal} 钻`,
+    meta: `已用 ${used} 钻 · 当前可用 ${remaining} 钻 · 总额度 ${displayTotal} 钻`,
     status:
-      percentage >= 100
-        ? "exception"
-        : percentage >= 80
-          ? "warning"
-          : "success",
+      percentage <= 0 ? "exception" : percentage <= 20 ? "warning" : "success",
   };
+}
+
+function canTopUpQuota(row) {
+  return row?.status !== "void";
 }
 
 function normalizeSearchText(value) {
@@ -991,6 +1009,20 @@ function buildCdkeySearchText(row) {
     .map(normalizeSearchText)
     .filter(Boolean)
     .join(" ");
+}
+
+function applyCdKeyRowUpdate(nextRow) {
+  if (!nextRow?.id) {
+    return;
+  }
+  const targetId = Number(nextRow.id);
+  cdkeys.value = cdkeys.value.map((item) =>
+    Number(item?.id) === targetId ? nextRow : item,
+  );
+  if (Number(detailRow.value?.id) === targetId) {
+    detailRow.value = nextRow;
+  }
+  lastUpdatedText.value = nextRow.updatedAt || lastUpdatedText.value;
 }
 
 const afterSalesSourceLabelMap = {
@@ -1425,6 +1457,63 @@ function openUsageDetail(row) {
   detailRow.value = row;
   detailRecordsExpanded.value = false;
   usageDetailVisible.value = true;
+}
+
+async function openTopUpQuota(row) {
+  const used = Math.max(0, Number(row?.useCount || 0));
+  const maxUses = Math.max(0, Number(row?.maxUses || 0));
+  const baseMaxUses = Math.max(0, Number(row?.baseMaxUses || maxUses || 0));
+  const remaining = maxUses > 0 ? Math.max(0, maxUses - used) : 0;
+  const displayTotal = Math.max(baseMaxUses, remaining);
+  const quotaPromptText =
+    maxUses > 0
+      ? displayTotal > baseMaxUses
+        ? `当前已使用 ${used} 钻，当前可用 ${remaining} 钻，原总额度 ${baseMaxUses} 钻，请输入要补充的额度（钻石）`
+        : `当前已使用 ${used} 钻，当前可用 ${remaining} 钻，请输入要补充的额度（钻石）`
+      : `当前卡密额度不限，请输入要补充的额度（钻石）`;
+  try {
+    const { value } = await ElMessageBox.prompt(
+      quotaPromptText,
+      `补额度 · ${row.code}`,
+      {
+        confirmButtonText: "确认补充",
+        cancelButtonText: "取消",
+        inputValue: "5",
+        inputPattern: /^[1-9]\d*$/,
+        inputErrorMessage: "请输入大于 0 的整数",
+      },
+    );
+    const addQuota = Number(value || 0);
+    if (!Number.isInteger(addQuota) || addQuota <= 0) {
+      ElMessage.warning("请输入大于 0 的整数");
+      return;
+    }
+    const { data } = await judianApi.updateCdKey(row.id, { addQuota });
+    const nextRow = data?.item || null;
+    if (nextRow) {
+      applyCdKeyRowUpdate(nextRow);
+    }
+    const latestUseCount = Math.max(
+      0,
+      Number(nextRow?.useCount ?? row?.useCount ?? 0),
+    );
+    const latestMaxUses = Math.max(
+      0,
+      Number(nextRow?.maxUses ?? row?.maxUses + addQuota ?? 0),
+    );
+    const remainingQuota =
+      latestMaxUses > 0 ? Math.max(0, latestMaxUses - latestUseCount) : null;
+    ElMessage.success(
+      remainingQuota === null
+        ? `已补充 ${addQuota} 钻额度`
+        : `已补充 ${addQuota} 钻额度，当前剩余 ${remainingQuota} 钻`,
+    );
+  } catch (error) {
+    if (isMessageBoxCancel(error)) {
+      return;
+    }
+    ElMessage.error(extractErrorMessage(error));
+  }
 }
 
 async function handleVoid(row) {
