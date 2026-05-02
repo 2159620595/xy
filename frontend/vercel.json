@@ -2,7 +2,7 @@
   "rewrites": [
     {
       "source": "/_proxy/:path*",
-      "destination": "http://8.163.2.179:8080/:path*"
+      "destination": "http://8.163.2.179/:path*"
     },
     {
       "source": "/(.*)",
