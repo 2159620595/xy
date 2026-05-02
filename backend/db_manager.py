@@ -101,6 +101,38 @@ class PostgresCompatConnection:
         return getattr(self._conn, item)
 
 
+class PooledPostgresConnectionProxy:
+    """把 close() 转换为归还连接池，兼容现有调用方的 finally: close()。"""
+
+    def __init__(self, raw_conn, pool):
+        self._conn = raw_conn
+        self._pool = pool
+        self._released = False
+
+    def close(self):
+        if self._released:
+            return None
+        self._released = True
+        try:
+            self._pool.putconn(self._conn)
+        except Exception:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+        return None
+
+    def __enter__(self):
+        self._conn.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._conn.__exit__(exc_type, exc, tb)
+
+    def __getattr__(self, item):
+        return getattr(self._conn, item)
+
+
 class ManagedConnection:
     """为 DBManager 提供可感知关闭和断线自愈的连接代理。"""
 
@@ -177,6 +209,7 @@ class DBManager:
         logger.info(f"主业务数据源: {'PostgreSQL' if self.is_postgres else 'SQLite'}")
         self.lock = threading.RLock()  # 使用可重入锁保护数据库操作
         self._connection = None
+        self._auth_pg_pool = None
         self.conn = ManagedConnection(self)
 
         # SQL日志配置 - 默认关闭，避免启动和高频查询刷屏。
@@ -210,16 +243,58 @@ class DBManager:
                 return value
         return ""
 
-    def _connect_pg_auth(self):
-        """创建用户认证 PostgreSQL 连接。"""
+    def _close_auth_pool_locked(self):
+        pool = self._auth_pg_pool
+        self._auth_pg_pool = None
+        if pool is None:
+            return
+        try:
+            pool.closeall()
+        except Exception as e:
+            logger.debug(f"关闭认证连接池失败，忽略: {e}")
+
+    def _get_auth_pool(self):
         if not self.pg_auth_url:
             return None
-        try:
-            import psycopg2
-            return psycopg2.connect(self.pg_auth_url)
-        except Exception as e:
-            logger.error(f"连接用户认证PostgreSQL失败，回退SQLite: {e}")
+        if self._auth_pg_pool is None:
+            import psycopg2.pool
+
+            maxconn = max(1, int(os.getenv("PG_AUTH_POOL_MAX_SIZE", "5")))
+            self._auth_pg_pool = psycopg2.pool.ThreadedConnectionPool(
+                1,
+                maxconn,
+                self.pg_auth_url,
+                connect_timeout=10,
+            )
+            logger.info(f"认证 PostgreSQL 连接池已初始化: maxconn={maxconn}")
+        return self._auth_pg_pool
+
+    def _connect_pg_auth(self):
+        """从认证 PostgreSQL 连接池借出连接，调用方 close() 时自动归还。"""
+        if not self.pg_auth_url:
             return None
+        last_error = None
+        for attempt in range(2):
+            try:
+                with self.lock:
+                    pool = self._get_auth_pool()
+                raw_conn = pool.getconn()
+                if getattr(raw_conn, "closed", 0):
+                    try:
+                        raw_conn.close()
+                    except Exception:
+                        pass
+                    raw_conn = pool.getconn()
+                return PooledPostgresConnectionProxy(raw_conn, pool)
+            except Exception as e:
+                last_error = e
+                with self.lock:
+                    self._close_auth_pool_locked()
+                if attempt == 0:
+                    logger.warning(f"认证 PostgreSQL 连接池取连接失败，准备重建后重试: {e}")
+                    continue
+        logger.error(f"连接用户认证PostgreSQL失败，回退SQLite: {last_error}")
+        return None
 
     def _create_sqlite_connection(self) -> sqlite3.Connection:
         """创建并初始化 SQLite 连接。"""
@@ -449,6 +524,49 @@ class DBManager:
         """PostgreSQL 模式下仅做远程 schema 校验/补齐，不走本地 SQLite 建库迁移。"""
         create_statements = [
             """
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                nickname TEXT UNIQUE,
+                password_hash TEXT NOT NULL,
+                is_admin BOOLEAN DEFAULT FALSE,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS email_verifications (
+                id SERIAL PRIMARY KEY,
+                email TEXT NOT NULL,
+                code TEXT NOT NULL,
+                type TEXT DEFAULT 'register',
+                expires_at DOUBLE PRECISION NOT NULL,
+                used BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS captcha_codes (
+                id SERIAL PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                code TEXT NOT NULL,
+                expires_at DOUBLE PRECISION NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS auth_sessions (
+                id SERIAL PRIMARY KEY,
+                token_hash TEXT UNIQUE NOT NULL,
+                user_id INTEGER NOT NULL,
+                expires_at DOUBLE PRECISION NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS auto_reply_once_records (
                 id SERIAL PRIMARY KEY,
                 cookie_id TEXT NOT NULL,
@@ -529,6 +647,10 @@ class DBManager:
         self._execute_sql(
             cursor,
             "CREATE INDEX IF NOT EXISTS idx_orders_cookie_created_at ON orders(cookie_id, created_at DESC)",
+        )
+        self._execute_sql(
+            cursor,
+            "CREATE INDEX IF NOT EXISTS idx_auth_sessions_user_expires ON auth_sessions(user_id, expires_at DESC)",
         )
         self._execute_sql(
             cursor,
@@ -736,6 +858,22 @@ class DBManager:
                 expires_at TIMESTAMP NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
+            ''')
+
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS auth_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_hash TEXT UNIQUE NOT NULL,
+                user_id INTEGER NOT NULL,
+                expires_at REAL NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            ''')
+
+            cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_auth_sessions_user_expires
+            ON auth_sessions(user_id, expires_at DESC)
             ''')
 
             # 创建cookies表（添加user_id字段和auto_confirm字段）
@@ -2050,6 +2188,8 @@ class DBManager:
     def close(self):
         """关闭数据库连接"""
         self.conn.close()
+        with self.lock:
+            self._close_auth_pool_locked()
     
     def get_connection(self):
         """获取数据库连接，如果已关闭则重新连接"""
@@ -3732,8 +3872,8 @@ class DBManager:
                     with pg_conn:
                         with pg_conn.cursor() as cursor:
                             cursor.execute('''
-                            INSERT INTO users (username, email, nickname, password_hash, is_admin)
-                            VALUES (%s, %s, %s, %s, FALSE)
+                            INSERT INTO users (username, email, nickname, password_hash)
+                            VALUES (%s, %s, %s, %s)
                             ''', (username, email, nickname, password_hash))
                     logger.info(f"创建用户成功(PostgreSQL): {username} ({email})")
                     return True
@@ -4195,6 +4335,174 @@ class DBManager:
                     return False
             except Exception as e:
                 logger.error(f"验证邮箱验证码失败: {e}")
+                return False
+
+    def save_auth_session(self, token_hash: str, user_id: int, expires_at: float) -> bool:
+        """保存登录会话。"""
+        with self.lock:
+            pg_conn = self._connect_pg_auth()
+            if pg_conn is not None:
+                try:
+                    with pg_conn:
+                        with pg_conn.cursor() as cursor:
+                            cursor.execute(
+                                "DELETE FROM auth_sessions WHERE expires_at <= %s",
+                                (time.time(),),
+                            )
+                            cursor.execute(
+                                """
+                                INSERT INTO auth_sessions (token_hash, user_id, expires_at)
+                                VALUES (%s, %s, %s)
+                                ON CONFLICT (token_hash) DO UPDATE
+                                SET user_id = EXCLUDED.user_id,
+                                    expires_at = EXCLUDED.expires_at,
+                                    created_at = CURRENT_TIMESTAMP
+                                """,
+                                (token_hash, user_id, expires_at),
+                            )
+                    return True
+                except Exception as e:
+                    logger.error(f"保存登录会话失败(PostgreSQL): {e}")
+                    return False
+                finally:
+                    pg_conn.close()
+
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("DELETE FROM auth_sessions WHERE expires_at <= ?", (time.time(),))
+                cursor.execute(
+                    """
+                    INSERT INTO auth_sessions (token_hash, user_id, expires_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(token_hash) DO UPDATE SET
+                        user_id = excluded.user_id,
+                        expires_at = excluded.expires_at,
+                        created_at = CURRENT_TIMESTAMP
+                    """,
+                    (token_hash, user_id, expires_at),
+                )
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"保存登录会话失败: {e}")
+                self._rollback_quietly()
+                return False
+
+    def get_auth_session(self, token_hash: str) -> Optional[Dict[str, Any]]:
+        """按 token hash 获取未过期会话。"""
+        with self.lock:
+            now_ts = time.time()
+            pg_conn = self._connect_pg_auth()
+            if pg_conn is not None:
+                try:
+                    with pg_conn.cursor() as cursor:
+                        cursor.execute(
+                            """
+                            SELECT id, token_hash, user_id, expires_at, created_at
+                            FROM auth_sessions
+                            WHERE token_hash = %s AND expires_at > %s
+                            LIMIT 1
+                            """,
+                            (token_hash, now_ts),
+                        )
+                        row = cursor.fetchone()
+                    if row:
+                        return {
+                            "id": row[0],
+                            "token_hash": row[1],
+                            "user_id": row[2],
+                            "expires_at": row[3],
+                            "created_at": row[4],
+                        }
+                    return None
+                except Exception as e:
+                    logger.error(f"读取登录会话失败(PostgreSQL): {e}")
+                    return None
+                finally:
+                    pg_conn.close()
+
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT id, token_hash, user_id, expires_at, created_at
+                    FROM auth_sessions
+                    WHERE token_hash = ? AND expires_at > ?
+                    LIMIT 1
+                    """,
+                    (token_hash, now_ts),
+                )
+                row = cursor.fetchone()
+                if row:
+                    return {
+                        "id": row[0],
+                        "token_hash": row[1],
+                        "user_id": row[2],
+                        "expires_at": row[3],
+                        "created_at": row[4],
+                    }
+                return None
+            except Exception as e:
+                logger.error(f"读取登录会话失败: {e}")
+                self._rollback_quietly()
+                return None
+
+    def delete_auth_session(self, token_hash: str) -> bool:
+        """删除单个登录会话。"""
+        with self.lock:
+            pg_conn = self._connect_pg_auth()
+            if pg_conn is not None:
+                try:
+                    with pg_conn:
+                        with pg_conn.cursor() as cursor:
+                            cursor.execute(
+                                "DELETE FROM auth_sessions WHERE token_hash = %s",
+                                (token_hash,),
+                            )
+                    return True
+                except Exception as e:
+                    logger.error(f"删除登录会话失败(PostgreSQL): {e}")
+                    return False
+                finally:
+                    pg_conn.close()
+
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (token_hash,))
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"删除登录会话失败: {e}")
+                self._rollback_quietly()
+                return False
+
+    def delete_user_auth_sessions(self, user_id: int) -> bool:
+        """删除指定用户的全部登录会话。"""
+        with self.lock:
+            pg_conn = self._connect_pg_auth()
+            if pg_conn is not None:
+                try:
+                    with pg_conn:
+                        with pg_conn.cursor() as cursor:
+                            cursor.execute(
+                                "DELETE FROM auth_sessions WHERE user_id = %s",
+                                (user_id,),
+                            )
+                    return True
+                except Exception as e:
+                    logger.error(f"删除用户登录会话失败(PostgreSQL): {e}")
+                    return False
+                finally:
+                    pg_conn.close()
+
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("DELETE FROM auth_sessions WHERE user_id = ?", (user_id,))
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"删除用户登录会话失败: {e}")
+                self._rollback_quietly()
                 return False
 
     async def send_verification_email(self, email: str, code: str) -> bool:
