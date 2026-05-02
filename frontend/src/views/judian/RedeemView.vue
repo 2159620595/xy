@@ -192,11 +192,17 @@
                   <div class="batch-progress-item__message">
                     {{ item.message || "等待处理" }}
                   </div>
-                  <pre
-                    v-if="item.rawResponseText"
-                    class="batch-progress-item__raw"
-                    >{{ item.rawResponseText }}</pre
+                  <details
+                    v-if="item.detailText"
+                    class="batch-progress-item__detail"
                   >
+                    <summary class="batch-progress-item__detail-summary">
+                      查看成功详情
+                    </summary>
+                    <pre class="batch-progress-item__raw">{{
+                      item.detailText
+                    }}</pre>
+                  </details>
                   <div
                     v-if="item.consumedDiamond > 0"
                     class="batch-progress-item__message"
@@ -641,9 +647,19 @@
               }}</span>
             </div>
             <div class="pay-result-item">
-              <span class="label">订单号</span
+              <span class="label">支付结果</span
+              ><span class="value">{{ payResultStatusText }}</span>
+            </div>
+            <div class="pay-result-item">
+              <span class="label">支付单号</span
               ><span class="value value--mono">{{
                 currentOrder?.tradeNo || currentOrder?.orderId || "—"
+              }}</span>
+            </div>
+            <div class="pay-result-item">
+              <span class="label">业务单号</span
+              ><span class="value value--mono">{{
+                currentOrder?.orderNo || "—"
               }}</span>
             </div>
             <div class="pay-result-item">
@@ -659,6 +675,16 @@
             <div class="pay-result-item">
               <span class="label">扣后余额</span
               ><span class="value">{{ afterDiamondText }}</span>
+            </div>
+            <div class="pay-result-item">
+              <span class="label">订单时间</span
+              ><span class="value">{{
+                currentOrder?.createTime || currentSession?.confirmedAt || "—"
+              }}</span>
+            </div>
+            <div class="pay-result-item pay-result-item--full">
+              <span class="label">扫码返回</span
+              ><span class="value">{{ scanResultMessage || "—" }}</span>
             </div>
             <div class="pay-result-item pay-result-item--full">
               <span class="label">备注</span
@@ -712,7 +738,7 @@ const clipboardReading = ref(false);
 const showCameraModal = ref(false);
 const showBatchOrderModal = ref(false);
 const showConfirmModal = ref(false);
-const DEFAULT_BATCH_VIP_ID = "8";
+const DEFAULT_BATCH_PACKAGE_TYPE = "day";
 const BATCH_PACKAGE_OPTIONS = [
   { label: "天卡", value: "day", count: 1 },
   { label: "周卡", value: "week", count: 7 },
@@ -759,6 +785,12 @@ const batchItems = computed(() =>
 const resultPayload = computed(() => currentSession.value?.resultPayload || {});
 const resultMessage = computed(
   () => resultPayload.value?.rendered_message || "",
+);
+const scanResultMessage = computed(() =>
+  String(resultPayload.value?.scanResult?.message || ""),
+);
+const payResultStatusText = computed(() =>
+  isConfirmedUnlockSuccess(resultPayload.value) ? "已确认成功" : "处理中",
 );
 function hasExplicitJudianPaySuccess(payPayload) {
   return (
@@ -855,14 +887,12 @@ const sessionStatusText = computed(() => {
   return "等待扫码";
 });
 
-const sessionMessage = computed(
-  () => {
-    if (isCardReadOnly.value) {
-      return `卡密已${cardInvalidReasonText.value}，当前处于 7 天存活期内，仅保留 0 权限展示，无法支付。`;
-    }
-    return currentSession.value?.message || "请先打开摄像头扫码";
-  },
-);
+const sessionMessage = computed(() => {
+  if (isCardReadOnly.value) {
+    return `卡密已${cardInvalidReasonText.value}，当前处于 7 天存活期内，仅保留 0 权限展示，无法支付。`;
+  }
+  return currentSession.value?.message || "请先打开摄像头扫码";
+});
 
 const accountStatusText = computed(() => {
   const account = redeemInfo.value.account || {};
@@ -1224,7 +1254,7 @@ function createEmptyRedeemInfo() {
 
 function createEmptyBatchPreview() {
   return {
-    vipId: DEFAULT_BATCH_VIP_ID,
+    vipId: "",
     count: 1,
     unitDiamond: 0,
     requiredDiamond: 0,
@@ -1282,6 +1312,11 @@ function normalizeSession(session) {
     confirmedAt: String(session?.confirmedAt || ""),
     resultPayload: {
       rendered_message: String(resultPayload.rendered_message || ""),
+      confirmedSuccess: resultPayload.confirmedSuccess === true,
+      explicitPaySuccess: resultPayload.explicitPaySuccess === true,
+      balanceDecreased: resultPayload.balanceDecreased === true,
+      tradeNo: String(resultPayload.tradeNo || ""),
+      orderNo: String(resultPayload.orderNo || ""),
       beforeDiamond: Number(resultPayload.beforeDiamond || 0),
       afterDiamond: Number(
         resultPayload.afterDiamond ?? resultPayload.diamondQuantity ?? 0,
@@ -1290,6 +1325,9 @@ function normalizeSession(session) {
       diamondQuantity: Number(
         resultPayload.diamondQuantity || resultPayload.afterDiamond || 0,
       ),
+      scanResult: {
+        message: String(resultPayload.scanResult?.message || ""),
+      },
       payPayload: resultPayload.payPayload || {},
       beforeFundPayload: resultPayload.beforeFundPayload || {},
       fundPayload: resultPayload.fundPayload || {},
@@ -1326,7 +1364,7 @@ function normalizeBatchTask(batchTask) {
     payload,
     items: items.map((item, index) => ({
       rawResponse: item?.rawResponse || {},
-      rawResponseText: formatRawResponse(item?.rawResponse),
+      detailText: formatPaymentDetail(item?.rawResponse),
       index: Number(item?.index || index + 1),
       status: String(item?.status || "pending"),
       tradeNo: String(item?.tradeNo || ""),
@@ -1352,6 +1390,40 @@ function formatRawResponse(value) {
   }
 }
 
+function formatPaymentDetail(payload) {
+  if (!payload || typeof payload !== "object") return "";
+  const orderInfo = payload?.orderInfo || {};
+  const scanResult = payload?.scanResult || {};
+  const detail = {};
+  const confirmedSuccess = payload?.confirmedSuccess === true;
+  const explicitPaySuccess = payload?.explicitPaySuccess === true;
+  const balanceDecreased = payload?.balanceDecreased === true;
+  const tradeNo = String(payload?.tradeNo || orderInfo?.tradeNo || "").trim();
+  const orderNo = String(payload?.orderNo || orderInfo?.orderNo || "").trim();
+  const consumedDiamond = Number(payload?.consumedDiamond || 0);
+  const beforeDiamond = Number(
+    payload?.beforeDiamond ?? payload?.beforeFund ?? -1,
+  );
+  const afterDiamond = Number(
+    payload?.afterDiamond ?? payload?.afterFund ?? -1,
+  );
+  const scanMessage = String(scanResult?.message || "").trim();
+  const orderRemark = String(orderInfo?.remark || "").trim();
+  const orderCreateTime = String(orderInfo?.createTime || "").trim();
+
+  detail.支付结果 = confirmedSuccess ? "已确认成功" : "待确认";
+  if (consumedDiamond > 0) detail.本次消耗 = `${consumedDiamond} 钻`;
+  if (tradeNo) detail.支付单号 = tradeNo;
+  if (orderNo) detail.业务单号 = orderNo;
+  if (orderCreateTime) detail.订单时间 = orderCreateTime;
+  if (scanMessage) detail.扫码返回 = scanMessage;
+  if (orderRemark) detail.订单备注 = orderRemark;
+  if (explicitPaySuccess) detail.接口确认 = "成功";
+  if (balanceDecreased) detail.余额校验 = "已扣减";
+
+  return formatRawResponse(detail);
+}
+
 function mergeRedeemInfo(partial) {
   const next = { ...redeemInfo.value };
 
@@ -1372,8 +1444,7 @@ function mergeRedeemInfo(partial) {
     next.maxUses = Number(partial.maxUses ?? next.maxUses ?? 0);
   if (partial?.remainingQuota !== undefined)
     next.remainingQuota = Number(partial.remainingQuota ?? next.remainingQuota);
-  if (partial?.canPay !== undefined)
-    next.canPay = partial.canPay !== false;
+  if (partial?.canPay !== undefined) next.canPay = partial.canPay !== false;
   if (partial?.invalidReason !== undefined)
     next.invalidReason = String(partial.invalidReason || "");
   if (partial?.invalidSinceAt !== undefined)
@@ -1713,7 +1784,7 @@ function scanVideoFrame() {
       });
       if (result?.data) {
         closeCamera();
-        submitScan(result.data);
+        submitScan(result.data, "camera_scan");
         return;
       }
     }
@@ -1722,7 +1793,7 @@ function scanVideoFrame() {
   cameraAnimation = window.requestAnimationFrame(scanVideoFrame);
 }
 
-async function submitScan(qrText) {
+async function submitScan(qrText, submitSource = "manual") {
   if (isCardReadOnly.value) {
     showToast(
       `卡密已${cardInvalidReasonText.value}，当前仅保留 7 天存活期，无法支付`,
@@ -1737,7 +1808,10 @@ async function submitScan(qrText) {
 
   scanSubmitting.value = true;
   try {
-    const { data } = await judianApi.publicUnlockScan(sessionId, { qrText });
+    const { data } = await judianApi.publicUnlockScan(sessionId, {
+      qrText,
+      submitSource,
+    });
     applyRedeemPayload(data);
     showConfirmModal.value = false;
     showToast(data?.message || "订单已识别，系统正在自动扣钻");
@@ -1833,18 +1907,18 @@ async function decodeQrFromImageSource(source) {
   return String(result.data || "").trim();
 }
 
-async function processQrText(text) {
+async function processQrText(text, submitSource = "manual") {
   const normalized = String(text || "").trim();
   if (!normalized) {
     throw new Error("未读取到可用的二维码内容");
   }
   pastedQrText.value = normalized;
-  await submitScan(normalized);
+  await submitScan(normalized, submitSource);
 }
 
-async function processQrImageBlob(blob) {
+async function processQrImageBlob(blob, submitSource = "image_upload") {
   const qrText = await decodeQrFromImageSource(blob);
-  await processQrText(qrText);
+  await processQrText(qrText, submitSource);
 }
 
 async function handleQrImageChange(event) {
@@ -1866,7 +1940,7 @@ async function handleQrImageChange(event) {
 
   try {
     scanSubmitting.value = true;
-    await processQrImageBlob(file);
+    await processQrImageBlob(file, "image_upload");
   } catch (error) {
     showToast(error?.message || "图片识别失败");
   } finally {
@@ -1886,7 +1960,7 @@ async function submitPastedQrText() {
     return;
   }
   try {
-    await processQrText(pastedQrText.value);
+    await processQrText(pastedQrText.value, "paste_text");
   } catch (error) {
     showToast(error?.message || "粘贴内容识别失败");
   }
@@ -1912,7 +1986,7 @@ async function handlePasteIntoTextarea(event) {
     }
     try {
       scanSubmitting.value = true;
-      await processQrImageBlob(file);
+      await processQrImageBlob(file, "clipboard_image");
     } catch (error) {
       showToast(error?.message || "剪贴板图片识别失败");
     } finally {
@@ -1926,7 +2000,7 @@ async function handlePasteIntoTextarea(event) {
   event.preventDefault();
   pastedQrText.value = text;
   try {
-    await processQrText(text);
+    await processQrText(text, "clipboard_text");
   } catch (error) {
     showToast(error?.message || "粘贴内容识别失败");
   }
@@ -1960,7 +2034,7 @@ async function handleGlobalPaste(event) {
     event.preventDefault();
     try {
       scanSubmitting.value = true;
-      await processQrImageBlob(file);
+      await processQrImageBlob(file, "clipboard_image");
     } catch (error) {
       showToast(error?.message || "剪贴板图片识别失败");
     } finally {
@@ -1974,7 +2048,7 @@ async function handleGlobalPaste(event) {
   event.preventDefault();
   pastedQrText.value = text;
   try {
-    await processQrText(text);
+    await processQrText(text, "clipboard_text");
   } catch (error) {
     showToast(error?.message || "粘贴内容识别失败");
   }
@@ -2010,7 +2084,7 @@ async function readClipboardPayload() {
         );
         if (imageType) {
           const blob = await item.getType(imageType);
-          await processQrImageBlob(blob);
+          await processQrImageBlob(blob, "clipboard_image");
           return;
         }
       }
@@ -2019,7 +2093,7 @@ async function readClipboardPayload() {
     if (typeof clipboardApi.readText === "function") {
       const text = String((await clipboardApi.readText()) || "").trim();
       if (text) {
-        await processQrText(text);
+        await processQrText(text, "clipboard_text");
         return;
       }
     }
@@ -2122,11 +2196,11 @@ async function refreshBatchPreview() {
   try {
     const { data } = await judianApi.publicUnlockBatchPreview(sessionId, {
       count,
-      vipId: DEFAULT_BATCH_VIP_ID,
+      packageType: DEFAULT_BATCH_PACKAGE_TYPE,
     });
     const preview = data?.preview || {};
     batchPreview.value = {
-      vipId: String(preview.vipId || DEFAULT_BATCH_VIP_ID),
+      vipId: String(preview.vipId || ""),
       count: Number(preview.count || count),
       unitDiamond: Number(preview.unitDiamond || 0),
       requiredDiamond: Number(preview.requiredDiamond || 0),
@@ -2214,7 +2288,9 @@ async function submitBatchOrder() {
       count,
       account,
       password,
-      vipId: DEFAULT_BATCH_VIP_ID,
+      packageType: DEFAULT_BATCH_PACKAGE_TYPE,
+      countPreset: String(batchCountPreset.value || ""),
+      submitSource: "batch_script",
     });
     applyRedeemPayload(data);
     batchOrderPassword.value = "";
@@ -2889,6 +2965,17 @@ function showToast(message) {
   font-size: 13px;
   line-height: 1.65;
   color: #93a1bf;
+}
+
+.batch-progress-item__detail {
+  margin-top: 8px;
+}
+
+.batch-progress-item__detail-summary {
+  cursor: pointer;
+  color: #93c5fd;
+  font-size: 12px;
+  user-select: none;
 }
 
 .batch-progress-item__raw {

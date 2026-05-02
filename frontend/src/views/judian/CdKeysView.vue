@@ -345,9 +345,15 @@
             </span>
           </div>
           <div class="cdkey-detail-summary__item">
-            <span class="cdkey-detail-summary__label">记录条数</span>
+            <span class="cdkey-detail-summary__label">售后批次</span>
             <span class="cdkey-detail-summary__value">
-              {{ detailRecords.length }} 条
+              {{ detailRecords.length }} 批
+            </span>
+          </div>
+          <div class="cdkey-detail-summary__item">
+            <span class="cdkey-detail-summary__label">累计次数</span>
+            <span class="cdkey-detail-summary__value">
+              {{ detailTotalSuccessCount }} 次
             </span>
           </div>
           <div class="cdkey-detail-summary__item">
@@ -369,15 +375,28 @@
 
         <div v-else class="cdkey-detail-content">
           <div class="cdkey-detail-section">
-            <div class="cdkey-detail-section__title">最近售后记录</div>
+            <div class="cdkey-detail-section__header">
+              <div class="cdkey-detail-section__title">最近售后记录</div>
+              <div class="cdkey-detail-section__meta">
+                共 {{ detailRecords.length }} 批 /
+                {{ detailTotalSuccessCount }} 次
+              </div>
+            </div>
             <div class="cdkey-detail-records">
               <div
-                v-for="(record, index) in detailRecords"
+                v-for="(record, index) in detailVisibleRecords"
                 :key="record.recordKey || `${record.tradeNo}-${index}`"
                 class="cdkey-detail-record"
               >
                 <div class="cdkey-detail-record__header">
-                  <span>记录 {{ index + 1 }}</span>
+                  <span>
+                    批次 {{ index + 1 }}
+                    {{
+                      Number(record.successCount || 0) > 1
+                        ? ` · ${Number(record.successCount || 0)}次`
+                        : ""
+                    }}
+                  </span>
                   <el-tag
                     size="small"
                     :type="
@@ -405,7 +424,12 @@
                     <span
                       class="cdkey-detail-record__value cdkey-detail-summary__value--mono"
                     >
-                      {{ record.orderNo || "—" }}
+                      {{
+                        formatAfterSalesIdSummary(
+                          record.orderNo,
+                          record.orderNos,
+                        )
+                      }}
                     </span>
                   </div>
                   <div class="cdkey-detail-record__item">
@@ -413,15 +437,12 @@
                     <span
                       class="cdkey-detail-record__value cdkey-detail-summary__value--mono"
                     >
-                      {{ record.tradeNo || "—" }}
-                    </span>
-                  </div>
-                  <div class="cdkey-detail-record__item">
-                    <span class="cdkey-detail-record__label">会话号</span>
-                    <span
-                      class="cdkey-detail-record__value cdkey-detail-summary__value--mono"
-                    >
-                      {{ record.sessionId || "—" }}
+                      {{
+                        formatAfterSalesIdSummary(
+                          record.tradeNo,
+                          record.tradeNos,
+                        )
+                      }}
                     </span>
                   </div>
                   <div class="cdkey-detail-record__item">
@@ -430,14 +451,69 @@
                       {{ record.consumedDiamond ?? 0 }}
                     </span>
                   </div>
-                  <div class="cdkey-detail-record__item">
-                    <span class="cdkey-detail-record__label">扫码返回</span>
-                    <span class="cdkey-detail-record__value">
-                      {{ record.paymentResult?.scanResult?.message || "—" }}
-                    </span>
-                  </div>
                 </div>
+                <details class="cdkey-detail-record__extra">
+                  <summary class="cdkey-detail-record__json-summary">
+                    查看更多明细
+                  </summary>
+                  <div class="cdkey-detail-record__grid">
+                    <div class="cdkey-detail-record__item">
+                      <span class="cdkey-detail-record__label">会话号</span>
+                      <span
+                        class="cdkey-detail-record__value cdkey-detail-summary__value--mono"
+                      >
+                        {{ record.sessionId || "—" }}
+                      </span>
+                    </div>
+                    <div class="cdkey-detail-record__item">
+                      <span class="cdkey-detail-record__label">提交方式</span>
+                      <span class="cdkey-detail-record__value">
+                        {{ formatAfterSalesSubmitSource(record) }}
+                      </span>
+                    </div>
+                    <div class="cdkey-detail-record__item">
+                      <span class="cdkey-detail-record__label">下单详情</span>
+                      <span class="cdkey-detail-record__value">
+                        {{ formatAfterSalesRequestDetail(record) }}
+                      </span>
+                    </div>
+                    <div class="cdkey-detail-record__item">
+                      <span class="cdkey-detail-record__label">扫码返回</span>
+                      <span class="cdkey-detail-record__value">
+                        {{ record.paymentResult?.scanResult?.message || "—" }}
+                      </span>
+                    </div>
+                  </div>
+                </details>
+                <details class="cdkey-detail-record__json-block">
+                  <summary class="cdkey-detail-record__json-summary">
+                    查看成功 JSON ·
+                    {{ formatAfterSalesJsonSummary(record) }}（{{
+                      Math.max(1, Number(record.successCount || 0))
+                    }}次）
+                  </summary>
+                  <pre class="cdkey-detail-json cdkey-detail-record__json">{{
+                    formatAfterSalesSuccessJson(record)
+                  }}</pre>
+                </details>
               </div>
+            </div>
+            <div
+              v-if="detailRecords.length > DETAIL_RECORDS_PREVIEW_COUNT"
+              class="cdkey-detail-records__actions"
+            >
+              <el-button
+                size="small"
+                text
+                type="primary"
+                @click="detailRecordsExpanded = !detailRecordsExpanded"
+              >
+                {{
+                  detailRecordsExpanded
+                    ? `收起（共 ${detailRecords.length} 批）`
+                    : `查看更多（已展示 ${detailVisibleRecords.length} / 共 ${detailRecords.length} 批）`
+                }}
+              </el-button>
             </div>
           </div>
 
@@ -467,9 +543,15 @@
                 </el-button>
               </el-space>
             </div>
-            <pre class="cdkey-detail-json">{{
-              formatJson(detailLatestPayment)
-            }}</pre>
+            <details class="cdkey-detail-json-block">
+              <summary class="cdkey-detail-record__json-summary">
+                展开原始支付 JSON ·
+                {{ formatAfterSalesPrimarySummary(detailLatestRecord) }}
+              </summary>
+              <pre class="cdkey-detail-json">{{
+                formatJson(detailLatestPayment)
+              }}</pre>
+            </details>
           </div>
         </div>
       </template>
@@ -487,6 +569,7 @@ import { getJudianSectionMeta } from "@/views/judian/shared/page-meta";
 
 const LEGACY_MOCK_STORAGE_KEY = "judian_frontend_mock_state_v1";
 const DIAMONDS_PER_DAY = 5;
+const DETAIL_RECORDS_PREVIEW_COUNT = 1;
 const specOptions = [
   { label: "天卡", value: "day", duration: 1 },
   { label: "周卡", value: "week", duration: 7 },
@@ -510,6 +593,7 @@ const filterStatus = ref(null);
 const searchKeyword = ref("");
 const usageDetailVisible = ref(false);
 const detailRow = ref(null);
+const detailRecordsExpanded = ref(false);
 const currentPage = ref(1);
 const pageSize = ref(20);
 
@@ -745,12 +829,110 @@ function normalizeSearchText(value) {
     .toLowerCase();
 }
 
+function getAfterSalesBatchId(record) {
+  return (
+    record?.batchId ||
+    record?.batchContext?.batchId ||
+    record?.paymentResult?.cdkeyInfo?.batchId ||
+    ""
+  );
+}
+
+function resolveAfterSalesAggregateKey(record, index) {
+  const detail = record?.requestDetail || {};
+  const batchId = getAfterSalesBatchId(record);
+  if (batchId) {
+    return `batch:${batchId}`;
+  }
+
+  const mode = String(detail.mode || "")
+    .trim()
+    .toLowerCase();
+  const itemIndex = Number(detail.itemIndex || 0);
+  if (
+    itemIndex > 0 &&
+    (mode === "script_batch_order" || mode === "item_batch_order")
+  ) {
+    return [
+      "session-batch",
+      record?.sessionId || "",
+      record?.savedAt || "",
+      detail.countPreset || "",
+      detail.packageType || "",
+      detail.vipId || "",
+      detail.count || "",
+    ].join(":");
+  }
+
+  return `single:${record?.recordKey || record?.tradeNo || record?.orderNo || index}`;
+}
+
+function aggregateAfterSalesRecords(records) {
+  const normalizedRecords = Array.isArray(records)
+    ? [...records].reverse()
+    : [];
+  const aggregated = [];
+  const grouped = new Map();
+
+  normalizedRecords.forEach((record, index) => {
+    const detail =
+      record?.requestDetail || record?.paymentResult?.requestDetail || {};
+    const batchContext =
+      record?.batchContext || record?.paymentResult?.batchContext || {};
+    const paymentResult = record?.paymentResult || null;
+    const key = resolveAfterSalesAggregateKey(
+      {
+        ...record,
+        requestDetail: detail,
+        batchContext,
+        paymentResult,
+      },
+      index,
+    );
+
+    if (!grouped.has(key)) {
+      const initialRecord = {
+        ...record,
+        requestDetail: Object.keys(batchContext).length ? batchContext : detail,
+        batchContext,
+        paymentResult,
+        batchId: getAfterSalesBatchId(record),
+        successCount: 1,
+        successRecords: paymentResult ? [paymentResult] : [],
+        tradeNos: record?.tradeNo ? [record.tradeNo] : [],
+        orderNos: record?.orderNo ? [record.orderNo] : [],
+      };
+      grouped.set(key, initialRecord);
+      aggregated.push(initialRecord);
+      return;
+    }
+
+    const current = grouped.get(key);
+    current.successCount += 1;
+    current.consumedDiamond =
+      Number(current.consumedDiamond || 0) +
+      Number(record?.consumedDiamond || 0);
+    if (paymentResult) {
+      current.successRecords.push(paymentResult);
+      current.paymentResult = current.paymentResult || paymentResult;
+    }
+    if (record?.tradeNo && !current.tradeNos.includes(record.tradeNo)) {
+      current.tradeNos.push(record.tradeNo);
+    }
+    if (record?.orderNo && !current.orderNos.includes(record.orderNo)) {
+      current.orderNos.push(record.orderNo);
+    }
+  });
+
+  return aggregated;
+}
+
 function extractAfterSalesRecords(row) {
   const records = Array.isArray(row?.afterSalesRecords)
     ? row.afterSalesRecords
     : [];
   if (records.length) {
-    return [...records].reverse();
+    return aggregateAfterSalesRecords(records);
   }
   if (row?.latestSuccessPayment) {
     return [
@@ -766,6 +948,14 @@ function extractAfterSalesRecords(row) {
         orderNo: row.latestSuccessPayment.orderNo || "",
         consumedDiamond: Number(row.latestSuccessPayment.consumedDiamond || 0),
         paymentResult: row.latestSuccessPayment,
+        successCount: 1,
+        successRecords: [row.latestSuccessPayment],
+        tradeNos: row.latestSuccessPayment.tradeNo
+          ? [row.latestSuccessPayment.tradeNo]
+          : [],
+        orderNos: row.latestSuccessPayment.orderNo
+          ? [row.latestSuccessPayment.orderNo]
+          : [],
       },
     ];
   }
@@ -783,6 +973,11 @@ function buildCdkeySearchText(row) {
     record?.paymentResult?.scanResult?.message,
     record?.paymentResult?.remoteUser?.account,
     record?.paymentResult?.remoteUser?.nickName,
+    record?.submitSourceLabel,
+    record?.requestDetail?.mode,
+    record?.requestDetail?.countPreset,
+    record?.requestDetail?.count,
+    record?.requestDetail?.itemIndex,
   ]);
   return [
     row?.code,
@@ -798,7 +993,202 @@ function buildCdkeySearchText(row) {
     .join(" ");
 }
 
+const afterSalesSourceLabelMap = {
+  manual: "手动提交",
+  camera_scan: "扫码识别",
+  image_upload: "图片上传",
+  paste_text: "粘贴文本",
+  clipboard_image: "剪贴板图片",
+  clipboard_text: "剪贴板文本",
+  batch_items: "批量下单",
+  batch_script: "批量脚本",
+};
+
+const batchCountPresetLabelMap = {
+  day: "天卡",
+  week: "周卡",
+  month: "月卡",
+  quarter: "季卡",
+  year: "年卡",
+  custom: "自定义",
+};
+
+function getAfterSalesRequestDetail(record) {
+  return record?.requestDetail || record?.paymentResult?.requestDetail || {};
+}
+
+function formatAfterSalesSubmitSource(record) {
+  const detail = getAfterSalesRequestDetail(record);
+  const source =
+    record?.submitSource ||
+    record?.paymentResult?.submitSource ||
+    detail?.submitSource ||
+    "";
+  return (
+    record?.submitSourceLabel ||
+    record?.paymentResult?.submitSourceLabel ||
+    afterSalesSourceLabelMap[source] ||
+    "—"
+  );
+}
+
+function formatBatchCountPreset(value) {
+  const key = String(value || "")
+    .trim()
+    .toLowerCase();
+  return batchCountPresetLabelMap[key] || key || "";
+}
+
+function formatAfterSalesPlanLabel(record) {
+  const detail = getAfterSalesRequestDetail(record);
+  const preset = String(detail.countPreset || "")
+    .trim()
+    .toLowerCase();
+  const count = Number(detail.count || 0);
+  const packageType = String(detail.packageType || "")
+    .trim()
+    .toLowerCase();
+
+  if (preset === "custom" && count > 0) {
+    return `${count}天`;
+  }
+
+  if (preset) {
+    return formatBatchCountPreset(preset);
+  }
+
+  if (packageType) {
+    return formatBatchCountPreset(packageType);
+  }
+
+  return "";
+}
+
+function formatAfterSalesRequestDetail(record) {
+  const detail = getAfterSalesRequestDetail(record);
+  if (!detail || typeof detail !== "object") {
+    return "—";
+  }
+  const parts = [];
+  const mode = String(detail.mode || "")
+    .trim()
+    .toLowerCase();
+  if (mode === "script_batch_order") {
+    parts.push("批量脚本");
+  } else if (mode === "item_batch_order") {
+    parts.push("批量逐单");
+  } else if (mode === "single_unlock") {
+    parts.push("普通下单");
+  }
+
+  const planLabel = formatAfterSalesPlanLabel(record);
+  if (planLabel) {
+    parts.push(planLabel);
+  }
+
+  const successCount = Number(record?.successCount || 0);
+  if (successCount > 1) {
+    parts.push(`${successCount}次`);
+  } else {
+    const itemIndex = Number(detail.itemIndex || 0);
+    if (itemIndex > 0) {
+      parts.push(`第 ${itemIndex} 单`);
+    }
+  }
+
+  if (detail.vipId) {
+    parts.push(`VIP ${detail.vipId}`);
+  }
+
+  return parts.join(" · ") || "—";
+}
+
+function formatAfterSalesSuccessJson(record) {
+  if (
+    Array.isArray(record?.successRecords) &&
+    record.successRecords.length > 1
+  ) {
+    return formatJson({
+      successCount: Number(
+        record.successCount || record.successRecords.length || 0,
+      ),
+      consumedDiamond: Number(record.consumedDiamond || 0),
+      tradeNos: record.tradeNos || [],
+      orderNos: record.orderNos || [],
+      records: record.successRecords,
+    });
+  }
+  return formatJson(
+    record?.paymentResult || record?.successRecords?.[0] || record || null,
+  );
+}
+
+function formatAfterSalesIdSummary(primaryValue, values) {
+  const normalizedValues = Array.isArray(values)
+    ? values.map((item) => String(item || "").trim()).filter(Boolean)
+    : [];
+  const firstValue = String(primaryValue || normalizedValues[0] || "").trim();
+  if (!firstValue) {
+    return "—";
+  }
+  if (normalizedValues.length <= 1) {
+    return firstValue;
+  }
+  return `${firstValue} 等 ${normalizedValues.length} 个`;
+}
+
+function formatAfterSalesJsonSummary(record) {
+  const tradeText = formatAfterSalesIdSummary(
+    record?.tradeNo,
+    record?.tradeNos,
+  );
+  const orderText = formatAfterSalesIdSummary(
+    record?.orderNo,
+    record?.orderNos,
+  );
+  if (tradeText === "—" && orderText === "—") {
+    return "暂无编号";
+  }
+  if (tradeText === "—") {
+    return `orderNo ${orderText}`;
+  }
+  if (orderText === "—") {
+    return `tradeNo ${tradeText}`;
+  }
+  return `tradeNo ${tradeText} / orderNo ${orderText}`;
+}
+
+function formatAfterSalesPrimarySummary(record) {
+  const tradeText = formatAfterSalesIdSummary(
+    record?.tradeNo,
+    record?.tradeNos,
+  );
+  if (tradeText !== "—") {
+    return `tradeNo ${tradeText}`;
+  }
+  const orderText = formatAfterSalesIdSummary(
+    record?.orderNo,
+    record?.orderNos,
+  );
+  if (orderText !== "—") {
+    return `orderNo ${orderText}`;
+  }
+  return "暂无编号";
+}
+
 const detailRecords = computed(() => extractAfterSalesRecords(detailRow.value));
+const detailVisibleRecords = computed(() =>
+  detailRecordsExpanded.value
+    ? detailRecords.value
+    : detailRecords.value.slice(0, DETAIL_RECORDS_PREVIEW_COUNT),
+);
+
+const detailTotalSuccessCount = computed(() =>
+  detailRecords.value.reduce(
+    (total, record) => total + Math.max(1, Number(record?.successCount || 0)),
+    0,
+  ),
+);
 
 const detailLatestPayment = computed(
   () =>
@@ -822,6 +1212,10 @@ watch(
     }
   },
 );
+
+watch(detailRow, () => {
+  detailRecordsExpanded.value = false;
+});
 
 function formatJson(value) {
   if (!value) {
@@ -850,9 +1244,17 @@ async function copyLatestTradeAndOrder() {
     ElMessage.warning("当前没有可复制的售后记录");
     return;
   }
+  const tradeNos =
+    Array.isArray(record.tradeNos) && record.tradeNos.length
+      ? record.tradeNos
+      : [record.tradeNo || "—"];
+  const orderNos =
+    Array.isArray(record.orderNos) && record.orderNos.length
+      ? record.orderNos
+      : [record.orderNo || "—"];
   const text = [
-    `tradeNo: ${record.tradeNo || "—"}`,
-    `orderNo: ${record.orderNo || "—"}`,
+    `tradeNo: ${tradeNos.join(", ")}`,
+    `orderNo: ${orderNos.join(", ")}`,
   ].join("\n");
   await copyText(text);
   ElMessage.success("tradeNo / orderNo 已复制");
@@ -1021,6 +1423,7 @@ async function previewRedeem(code) {
 
 function openUsageDetail(row) {
   detailRow.value = row;
+  detailRecordsExpanded.value = false;
   usageDetailVisible.value = true;
 }
 
@@ -1239,6 +1642,11 @@ onMounted(loadPage);
   color: #111827;
 }
 
+.cdkey-detail-section__meta {
+  font-size: 12px;
+  color: #64748b;
+}
+
 .cdkey-detail-section__header {
   display: flex;
   align-items: center;
@@ -1251,6 +1659,13 @@ onMounted(loadPage);
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.cdkey-detail-records__actions {
+  display: flex;
+  justify-content: center;
+  margin-top: 2px;
+  padding-top: 2px;
 }
 
 .cdkey-detail-record {
@@ -1279,6 +1694,39 @@ onMounted(loadPage);
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+.cdkey-detail-record__extra {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed #e5e7eb;
+}
+
+.cdkey-detail-record__json-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.cdkey-detail-record__json-summary {
+  cursor: pointer;
+  color: #2563eb;
+  font-size: 12px;
+  user-select: none;
+}
+
+.cdkey-detail-record__json {
+  max-height: 240px;
+}
+
+.cdkey-detail-json-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 
 .cdkey-detail-json {

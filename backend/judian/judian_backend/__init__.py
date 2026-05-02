@@ -88,12 +88,29 @@ PUBLIC_WEB_PLATFORM = '3'
 PUBLIC_WEB_REQUEST_VERSION = '2024-09-24'
 PUBLIC_WEB_AUTH_KEY = b'ziISjqkXPsGUMRNGyWigxDGtJbfTdcGv'
 PUBLIC_WEB_AUTH_IV = b'WonrnVkxeIxDcFbv'
+PROXY_ENV_KEYS = (
+    'HTTP_PROXY',
+    'HTTPS_PROXY',
+    'ALL_PROXY',
+    'NO_PROXY',
+    'http_proxy',
+    'https_proxy',
+    'all_proxy',
+    'no_proxy',
+)
 
 ACCOUNT_ID_PATTERN = re.compile(r'(\d+)$')
 _JUDIAN_SCHEMA_READY = False
 _PUBLIC_VIP_PLANS_CACHE: list[dict[str, Any]] = []
 _PUBLIC_VIP_PLANS_CACHE_AT = 0.0
 _PUBLIC_WEB_CLIENT_RECEIVE_PEM = ''
+_BATCH_SCRIPT_DEPENDENCY_LOCK = threading.Lock()
+_BATCH_SCRIPT_DEPENDENCIES_READY = False
+BATCH_SCRIPT_REQUIRED_MODULES = (
+    'axios',
+    'crypto-js',
+    'jsencrypt',
+)
 
 
 class JudianRemoteError(RuntimeError):
@@ -209,12 +226,14 @@ class JudianPublicUnlockScanRequest(BaseModel):
     qrText: str | None = ''
     tradeNo: str | None = ''
     orderNo: str | None = ''
+    submitSource: str | None = ''
 
 
 class JudianPublicBatchPurchaseItemRequest(BaseModel):
     qrText: str | None = ''
     tradeNo: str | None = ''
     orderNo: str | None = ''
+    source: str | None = ''
 
 
 class JudianPublicBatchPurchaseRequest(BaseModel):
@@ -224,6 +243,8 @@ class JudianPublicBatchPurchaseRequest(BaseModel):
     password: str | None = None
     vipId: str | None = None
     packageType: str | None = None
+    countPreset: str | None = None
+    submitSource: str | None = ''
 
 
 
@@ -745,6 +766,72 @@ def ensure_remote_json(response: requests.Response) -> dict[str, Any]:
     return payload
 
 
+def build_env_without_proxies() -> dict[str, str]:
+    env = dict(os.environ)
+    for key in PROXY_ENV_KEYS:
+        env.pop(key, None)
+    return env
+
+
+def build_session_without_env_proxies() -> requests.Session:
+    session = requests.Session()
+    session.trust_env = False
+    return session
+
+
+def get_batch_script_npm_command() -> str:
+    return 'npm.cmd' if os.name == 'nt' else 'npm'
+
+
+def has_batch_script_dependencies(script_root: str) -> bool:
+    node_modules_dir = os.path.join(script_root, 'node_modules')
+    if not os.path.isdir(node_modules_dir):
+        return False
+    for module_name in BATCH_SCRIPT_REQUIRED_MODULES:
+        if not os.path.isdir(os.path.join(node_modules_dir, module_name)):
+            return False
+    return True
+
+
+def ensure_batch_script_dependencies_ready(script_root: str) -> None:
+    global _BATCH_SCRIPT_DEPENDENCIES_READY
+    if _BATCH_SCRIPT_DEPENDENCIES_READY and has_batch_script_dependencies(script_root):
+        return
+    with _BATCH_SCRIPT_DEPENDENCY_LOCK:
+        if _BATCH_SCRIPT_DEPENDENCIES_READY and has_batch_script_dependencies(script_root):
+            return
+        if has_batch_script_dependencies(script_root):
+            _BATCH_SCRIPT_DEPENDENCIES_READY = True
+            return
+        package_json_path = os.path.join(script_root, 'package.json')
+        if not os.path.isfile(package_json_path):
+            raise RuntimeError(f'批量下单脚本缺少 package.json：{package_json_path}')
+        install_command = [
+            get_batch_script_npm_command(),
+            'ci' if os.path.isfile(os.path.join(script_root, 'package-lock.json')) else 'install',
+            '--no-fund',
+            '--no-audit',
+        ]
+        completed = subprocess.run(
+            install_command,
+            cwd=script_root,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=300,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+        )
+        if completed.returncode != 0 or not has_batch_script_dependencies(script_root):
+            error_message = pick_text(
+                str(completed.stderr or '').strip(),
+                str(completed.stdout or '').strip(),
+                '批量下单脚本依赖安装失败',
+            )
+            raise RuntimeError(f'批量下单脚本依赖安装失败：{error_message}')
+        _BATCH_SCRIPT_DEPENDENCIES_READY = True
+
+
 def remote_login(login_email: str, login_password: str) -> dict[str, Any]:
     session = requests.Session()
     session.headers.update(build_headers())
@@ -865,9 +952,11 @@ def remote_get_public_vip_plans(*, timeout: int | float = REMOTE_SUPPLEMENTAL_TI
     script_path = os.path.join(script_root, 'judian-batch.js')
     if os.path.isfile(script_path):
         try:
+            ensure_batch_script_dependencies_ready(script_root)
             completed = subprocess.run(
                 ['node', 'judian-batch.js', 'list'],
                 cwd=script_root,
+                env=build_env_without_proxies(),
                 capture_output=True,
                 text=True,
                 encoding='utf-8',
@@ -892,7 +981,7 @@ def remote_get_public_vip_plans(*, timeout: int | float = REMOTE_SUPPLEMENTAL_TI
                 logger.warning('remote_get_public_vip_plans use cached plans after script failure: %s', exc)
                 return cached_plans
 
-    session = requests.Session()
+    session = build_session_without_env_proxies()
     session.headers.update(build_public_web_headers())
     try:
         response = session.get(
@@ -1191,6 +1280,119 @@ def pick_nullable_int(*values: Any) -> int | None:
         except (TypeError, ValueError):
             continue
     return None
+
+
+PUBLIC_USAGE_SOURCE_LABELS = {
+    'manual': '手动提交',
+    'camera_scan': '扫码识别',
+    'image_upload': '图片上传',
+    'paste_text': '粘贴文本',
+    'clipboard_image': '剪贴板图片',
+    'clipboard_text': '剪贴板文本',
+    'batch_items': '批量下单',
+    'batch_script': '批量脚本',
+}
+
+
+def normalize_public_usage_source(value: Any, *, fallback: str = 'manual') -> str:
+    normalized = str(value or '').strip().lower().replace('-', '_')
+    if normalized in PUBLIC_USAGE_SOURCE_LABELS:
+        return normalized
+    return fallback if fallback in PUBLIC_USAGE_SOURCE_LABELS else 'manual'
+
+
+def get_public_usage_source_label(value: Any) -> str:
+    normalized = normalize_public_usage_source(value)
+    return PUBLIC_USAGE_SOURCE_LABELS.get(normalized, PUBLIC_USAGE_SOURCE_LABELS['manual'])
+
+
+def build_public_single_request_detail(
+    *,
+    qr_text: str = '',
+    trade_no: str = '',
+    order_no: str = '',
+    submit_source: str = '',
+    request_detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    detail = {
+        **dict_like(request_detail),
+    }
+    normalized_source = normalize_public_usage_source(
+        submit_source,
+        fallback=pick_text(detail.get('submitSource')) or 'manual',
+    )
+    detail['mode'] = pick_text(detail.get('mode'), 'single_unlock')
+    detail['submitSource'] = normalized_source
+    detail['submitSourceLabel'] = get_public_usage_source_label(normalized_source)
+    if str(qr_text or '').strip():
+        detail['qrTextProvided'] = True
+    if str(trade_no or '').strip():
+        detail['providedTradeNo'] = str(trade_no).strip()
+    if str(order_no or '').strip():
+        detail['providedOrderNo'] = str(order_no).strip()
+    return detail
+
+
+def build_public_batch_request_detail(
+    *,
+    mode: str,
+    count: int,
+    submit_source: str = '',
+    count_preset: str = '',
+    vip_id: str = '',
+    package_type: str = '',
+    account_text: str = '',
+    has_password: bool = False,
+) -> dict[str, Any]:
+    fallback_source = 'batch_script' if mode == 'script_batch_order' else 'batch_items'
+    normalized_source = normalize_public_usage_source(submit_source, fallback=fallback_source)
+    detail = {
+        'mode': mode,
+        'submitSource': normalized_source,
+        'submitSourceLabel': get_public_usage_source_label(normalized_source),
+        'count': max(1, int(count or 1)),
+    }
+    normalized_preset = str(count_preset or '').strip().lower()
+    if normalized_preset:
+        detail['countPreset'] = normalized_preset
+        if normalized_preset == 'custom':
+            detail['isCustomCount'] = True
+    if str(vip_id or '').strip():
+        detail['vipId'] = str(vip_id).strip()
+    if str(package_type or '').strip():
+        detail['packageType'] = str(package_type).strip().lower()
+    if str(account_text or '').strip():
+        detail['account'] = str(account_text).strip()
+    if has_password:
+        detail['hasPassword'] = True
+    return detail
+
+
+def build_public_batch_item_request_detail(
+    batch_request_detail: dict[str, Any] | None,
+    *,
+    index: int,
+    item: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    base = {
+        **dict_like(batch_request_detail),
+        'itemIndex': max(1, int(index or 1)),
+    }
+    item_dict = dict_like(item)
+    item_source = pick_text(item_dict.get('source'))
+    normalized_source = normalize_public_usage_source(
+        item_source,
+        fallback=pick_text(base.get('submitSource')) or 'batch_items',
+    )
+    base['submitSource'] = normalized_source
+    base['submitSourceLabel'] = get_public_usage_source_label(normalized_source)
+    if str(item_dict.get('qrText') or '').strip():
+        base['qrTextProvided'] = True
+    if str(item_dict.get('tradeNo') or '').strip():
+        base['providedTradeNo'] = str(item_dict.get('tradeNo')).strip()
+    if str(item_dict.get('orderNo') or '').strip():
+        base['providedOrderNo'] = str(item_dict.get('orderNo')).strip()
+    return base
 
 
 def resolve_public_cdkey_runtime_meta(
@@ -2043,6 +2245,8 @@ def build_public_unlock_success_snapshot(
     order_payload: dict[str, Any],
 ) -> dict[str, Any]:
     session_payload = dict_like(session_row.payload)
+    request_detail = dict_like(session_payload.get('requestDetail'))
+    batch_context = dict_like(session_payload.get('batchContext'))
     pay_payload_dict = dict_like(pay_payload)
     explicit_pay_success = has_public_unlock_explicit_pay_success({'payPayload': pay_payload_dict})
     balance_decreased = has_public_unlock_balance_decreased({
@@ -2060,6 +2264,10 @@ def build_public_unlock_success_snapshot(
     order_data = dict_like(order_payload_dict.get('data'))
     trade_no = pick_text(order_data.get('tradeNo'), session_row.order_id, order_row.order_id)
     order_no = pick_text(order_data.get('orderNo'), session_payload.get('orderNo'))
+    submit_source = normalize_public_usage_source(
+        pick_text(session_payload.get('submitSource'), request_detail.get('submitSource')),
+        fallback='manual',
+    )
     snapshot = {
         'ok': confirmed_success,
         'pending': False,
@@ -2069,6 +2277,10 @@ def build_public_unlock_success_snapshot(
         'confirmedSuccess': confirmed_success,
         'tradeNo': trade_no,
         'orderNo': order_no,
+        'submitSource': submit_source,
+        'submitSourceLabel': get_public_usage_source_label(submit_source),
+        'requestDetail': request_detail or None,
+        'batchContext': batch_context or None,
         'beforeDiamond': max(0, pick_int(before_diamond)),
         'afterDiamond': max(0, pick_int(after_diamond)),
         'consumedDiamond': max(0, pick_int(consumed_diamond)),
@@ -2143,10 +2355,14 @@ def save_public_unlock_success_snapshot(
         'sessionId': session_row.session_id or '',
         'tradeNo': pick_text(success_snapshot.get('tradeNo')),
         'orderNo': pick_text(success_snapshot.get('orderNo')),
+        'submitSource': pick_text(success_snapshot.get('submitSource')),
+        'submitSourceLabel': pick_text(success_snapshot.get('submitSourceLabel')),
         'accountId': pick_text(account.account_id, cdkey_row.account_id),
         'cdkeyCode': cdkey_row.code or '',
         'cardId': cdkey_row.card_id,
         'consumedDiamond': max(0, pick_int(success_snapshot.get('consumedDiamond'))),
+        'requestDetail': dict_like(success_snapshot.get('requestDetail')) or None,
+        'batchContext': dict_like(success_snapshot.get('batchContext')) or None,
         'paymentResult': success_snapshot,
     }
     existing_cdkey_payload = dict_like(cdkey_row.payload)
@@ -3090,9 +3306,19 @@ def process_public_unlock_scan(
     qr_text: str = '',
     trade_no: str = '',
     order_no: str = '',
+    submit_source: str = '',
+    request_detail: dict[str, Any] | None = None,
+    batch_context: dict[str, Any] | None = None,
 ) -> tuple[models.JudianAccount, requests.Session, models.JudianOrder]:
     ensure_public_cdkey_payment_allowed(cdkey_row)
     trade_candidate, order_candidate, scan_url = extract_public_trade_candidate(qr_text, trade_no, order_no)
+    normalized_request_detail = build_public_single_request_detail(
+        qr_text=qr_text,
+        trade_no=trade_no,
+        order_no=order_no,
+        submit_source=submit_source,
+        request_detail=request_detail,
+    )
 
     def load_scan_order(runtime_session: requests.Session):
         scan_result = remote_scan_qr_notify(runtime_session, order_candidate or trade_candidate, scan_url)
@@ -3131,6 +3357,9 @@ def process_public_unlock_scan(
     session_row.payload = {
         **dict_like(session_row.payload),
         'cdkeyCode': cdkey_row.code,
+        'submitSource': normalized_request_detail.get('submitSource'),
+        'requestDetail': normalized_request_detail,
+        'batchContext': dict_like(batch_context),
         'tradeCandidate': trade_candidate,
         'tradeNo': effective_trade_no,
         'orderNo': pick_text(order_data.get('orderNo'), order_candidate),
@@ -3159,12 +3388,14 @@ def normalize_public_batch_purchase_items(body: JudianPublicBatchPurchaseRequest
         qr_text = str((raw_item.qrText if raw_item else '') or '').strip()
         trade_no = str((raw_item.tradeNo if raw_item else '') or '').strip()
         order_no = str((raw_item.orderNo if raw_item else '') or '').strip()
+        source = str((raw_item.source if raw_item else '') or '').strip()
         if not any([qr_text, trade_no, order_no]):
             continue
         normalized.append({
             'qrText': qr_text,
             'tradeNo': trade_no,
             'orderNo': order_no,
+            'source': source,
         })
     if not normalized:
         raise HTTPException(status_code=400, detail='请至少提供一条可识别的订单数据')
@@ -3188,6 +3419,7 @@ def create_public_batch_purchase_task(
     cdkey_row: models.JudianCdKey,
     account: models.JudianAccount,
     items: list[dict[str, str]],
+    request_detail: dict[str, Any] | None = None,
 ) -> models.JudianBatchPurchaseTask:
     latest_task = get_latest_public_batch_task(db, session_row)
     if latest_task is not None and str(latest_task.status or '') == 'running':
@@ -3210,7 +3442,13 @@ def create_public_batch_purchase_task(
         current_trade_no='',
         message='批量购买进行中',
         result_payload={'items': []},
-        payload={'items': items},
+        payload={
+            'mode': 'item_batch_order',
+            'items': items,
+            'itemCount': len(items),
+            'requestDetail': dict_like(request_detail),
+            'submitSource': pick_text(dict_like(request_detail).get('submitSource')),
+        },
         created_at=now,
         updated_at=now,
     )
@@ -3227,6 +3465,7 @@ def create_public_batch_purchase_task(
         **dict_like(session_row.payload),
         'latestBatchId': row.batch_id,
         'batchMode': True,
+        'batchModeType': 'item_batch_order',
     }
     db.commit()
     db.refresh(row)
@@ -3245,6 +3484,10 @@ def create_public_batch_script_task(
     package_type: str = '',
     unit_diamond: int = 0,
     required_diamond: int = 0,
+    count_preset: str = '',
+    submit_source: str = '',
+    target_account: str = '',
+    has_password: bool = False,
 ) -> models.JudianBatchPurchaseTask:
     latest_task = get_latest_public_batch_task(db, session_row)
     if latest_task is not None and str(latest_task.status or '') == 'running':
@@ -3273,6 +3516,18 @@ def create_public_batch_script_task(
             'scriptPath': get_batch_script_display_path(),
             'vipId': vip_id,
             'packageType': str(package_type or '').strip().lower(),
+            'countPreset': str(count_preset or '').strip().lower(),
+            'submitSource': normalize_public_usage_source(submit_source, fallback='batch_script'),
+            'requestDetail': build_public_batch_request_detail(
+                mode='script_batch_order',
+                count=count,
+                submit_source=submit_source,
+                count_preset=count_preset,
+                vip_id=vip_id,
+                package_type=package_type,
+                account_text=target_account,
+                has_password=has_password,
+            ),
             'unitDiamond': max(0, int(unit_diamond or 0)),
             'requiredDiamond': max(0, int(required_diamond or 0)),
             'beforeDiamond': max(0, resolve_account_diamond_quantity(account)),
@@ -3450,6 +3705,7 @@ def build_public_batch_script_command(
     script_path = get_batch_script_path()
     if not os.path.isfile(script_path):
         raise HTTPException(status_code=500, detail=f'未找到批量下单脚本: {script_path}')
+    ensure_batch_script_dependencies_ready(script_root)
     command = [
         'node',
         'judian-batch.js',
@@ -3883,6 +4139,103 @@ def finalize_public_batch_task(
     return row
 
 
+def save_public_batch_script_success_snapshots(
+    batch_task_row: models.JudianBatchPurchaseTask,
+    cdkey_row: models.JudianCdKey,
+    account: models.JudianAccount,
+    *,
+    items_result: list[dict[str, Any]],
+) -> None:
+    payload = dict_like(batch_task_row.payload)
+    batch_request_detail = dict_like(payload.get('requestDetail'))
+    existing_cdkey_payload = dict_like(cdkey_row.payload)
+    existing_records_raw = existing_cdkey_payload.get('afterSalesRecords')
+    existing_records = existing_records_raw if isinstance(existing_records_raw, list) else []
+    latest_success_snapshot = dict_like(existing_cdkey_payload.get('latestSuccessPayment'))
+    latest_saved_at = pick_text(existing_cdkey_payload.get('latestSuccessPaymentAt'))
+    remote_user = dict_like(dict_like(account.payload).get('remote_user_info'))
+    filtered_records = list(existing_records)
+
+    for item in items_result:
+        if not is_public_batch_item_confirmed_success(item):
+            continue
+        item_dict = dict_like(item)
+        raw_response = dict_like(item_dict.get('rawResponse'))
+        index = max(1, pick_int(item_dict.get('index'), 1))
+        item_request_detail = build_public_batch_item_request_detail(
+            batch_request_detail,
+            index=index,
+            item=item_dict,
+        )
+        submit_source = normalize_public_usage_source(
+            pick_text(item_request_detail.get('submitSource')),
+            fallback='batch_script',
+        )
+        trade_no = pick_text(raw_response.get('tradeNo'), item_dict.get('tradeNo'))
+        order_no = pick_text(raw_response.get('orderNo'), item_dict.get('orderNo'))
+        record_key = pick_text(trade_no, order_no, f'{batch_task_row.batch_id}:{index}')
+        saved_at = pick_text(raw_response.get('timestamp'), now_text())
+        success_snapshot = {
+            **raw_response,
+            'ok': True,
+            'pending': False,
+            'confirmedSuccess': True,
+            'tradeNo': trade_no,
+            'orderNo': order_no,
+            'consumedDiamond': max(0, pick_int(raw_response.get('consumedDiamond'), item_dict.get('consumedDiamond'))),
+            'submitSource': submit_source,
+            'submitSourceLabel': get_public_usage_source_label(submit_source),
+            'requestDetail': item_request_detail,
+            'batchContext': batch_request_detail or None,
+            'remoteUser': remote_user or None,
+            'cdkeyInfo': {
+                'id': int(cdkey_row.id or 0),
+                'code': cdkey_row.code or '',
+                'cardId': cdkey_row.card_id,
+                'accountId': pick_text(cdkey_row.account_id, account.account_id),
+                'sessionId': batch_task_row.session_id or '',
+                'tradeNo': trade_no,
+                'orderNo': order_no,
+                'remark': cdkey_row.remark or '',
+                'batchId': batch_task_row.batch_id or '',
+            },
+        }
+        cdkey_record = {
+            'recordKey': record_key,
+            'savedAt': saved_at,
+            'sessionId': batch_task_row.session_id or '',
+            'tradeNo': trade_no,
+            'orderNo': order_no,
+            'submitSource': submit_source,
+            'submitSourceLabel': get_public_usage_source_label(submit_source),
+            'accountId': pick_text(account.account_id, cdkey_row.account_id),
+            'cdkeyCode': cdkey_row.code or '',
+            'cardId': cdkey_row.card_id,
+            'consumedDiamond': max(0, pick_int(success_snapshot.get('consumedDiamond'))),
+            'requestDetail': item_request_detail,
+            'batchContext': batch_request_detail or None,
+            'paymentResult': success_snapshot,
+        }
+        filtered_records = [
+            existing_item
+            for existing_item in filtered_records
+            if pick_text(dict_like(existing_item).get('recordKey')) != record_key
+        ]
+        filtered_records.append(cdkey_record)
+        latest_success_snapshot = success_snapshot
+        latest_saved_at = saved_at
+
+    if latest_success_snapshot:
+        cdkey_row.payload = {
+            **existing_cdkey_payload,
+            'latestSuccessPayment': latest_success_snapshot,
+            'latestSuccessPaymentAt': latest_saved_at,
+            'afterSalesRecords': filtered_records[-20:],
+        }
+        cdkey_row.latest_session_id = batch_task_row.session_id or cdkey_row.latest_session_id
+        cdkey_row.updated_at = now_text()
+
+
 def run_public_batch_purchase(
     db: Session,
     session_row: models.JudianScanSession,
@@ -3892,6 +4245,7 @@ def run_public_batch_purchase(
 ) -> tuple[dict[str, Any], models.JudianBatchPurchaseTask]:
     source_items = dict_like(batch_task_row.payload).get('items')
     items: list[dict[str, str]] = source_items if isinstance(source_items, list) else []
+    batch_request_detail = dict_like(dict_like(batch_task_row.payload).get('requestDetail'))
     results: list[dict[str, Any]] = []
 
     for index, item in enumerate(items, start=1):
@@ -3926,6 +4280,13 @@ def run_public_batch_purchase(
                 qr_text=str(item.get('qrText') or ''),
                 trade_no=str(item.get('tradeNo') or ''),
                 order_no=str(item.get('orderNo') or ''),
+                submit_source=str(item.get('source') or batch_request_detail.get('submitSource') or ''),
+                request_detail=build_public_batch_item_request_detail(
+                    batch_request_detail,
+                    index=index,
+                    item=item,
+                ),
+                batch_context=batch_request_detail,
             )
             payment_result = execute_public_unlock_payment(
                 db,
@@ -4353,6 +4714,12 @@ def run_public_batch_script_job(
             result_payload=result_payload,
             total_consumed_diamond=total_consumed_diamond,
         )
+        save_public_batch_script_success_snapshots(
+            batch_task_row,
+            cdkey_row,
+            account,
+            items_result=items_result,
+        )
         batch_task_row = finalize_public_batch_task(
             db,
             batch_task_row,
@@ -4473,6 +4840,7 @@ def public_unlock_scan(session_id: str, body: JudianPublicUnlockScanRequest, db:
         qr_text=body.qrText or '',
         trade_no=body.tradeNo or '',
         order_no=body.orderNo or '',
+        submit_source=body.submitSource or '',
     )
     _set_public_unlock_autopay_pending(
         db,
@@ -4500,17 +4868,21 @@ def public_unlock_batch_purchase(session_id: str, body: JudianPublicBatchPurchas
     request_count = body.count
     request_vip_id = pick_text(body.vipId)
     request_package_type = pick_text(body.packageType)
+    request_count_preset = pick_text(body.countPreset)
+    request_submit_source = pick_text(body.submitSource)
     request_account = pick_text(body.account)
     try:
         stage = 'load_session'
         session_row, cdkey_row, account = get_public_unlock_session_or_404(db, session_id)
         logger.info(
-            'public_unlock_batch_purchase start: session_id=%s mode=%s count=%s vipId=%s packageType=%s account=%s has_password=%s',
+            'public_unlock_batch_purchase start: session_id=%s mode=%s count=%s vipId=%s packageType=%s countPreset=%s submitSource=%s account=%s has_password=%s',
             session_id,
             'script' if is_script_mode else 'items',
             request_count,
             request_vip_id,
             request_package_type,
+            request_count_preset,
+            request_submit_source,
             request_account,
             bool(pick_text(body.password)),
         )
@@ -4550,6 +4922,10 @@ def public_unlock_batch_purchase(session_id: str, body: JudianPublicBatchPurchas
                 package_type=package_type,
                 unit_diamond=unit_diamond,
                 required_diamond=required_diamond,
+                count_preset=request_count_preset,
+                submit_source=request_submit_source,
+                target_account=request_account,
+                has_password=bool(pick_text(body.password)),
             )
             logger.info(
                 'public_unlock_batch_purchase task_created: session_id=%s stage=%s batch_id=%s mode=script count=%s vipId=%s packageType=%s',
@@ -4585,7 +4961,23 @@ def public_unlock_batch_purchase(session_id: str, body: JudianPublicBatchPurchas
                 len(items),
             )
             stage = 'create_items_task'
-            batch_task_row = create_public_batch_purchase_task(db, session_row, cdkey_row, account, items)
+            batch_task_row = create_public_batch_purchase_task(
+                db,
+                session_row,
+                cdkey_row,
+                account,
+                items,
+                request_detail=build_public_batch_request_detail(
+                    mode='item_batch_order',
+                    count=len(items),
+                    submit_source=request_submit_source,
+                    count_preset=request_count_preset,
+                    vip_id=request_vip_id,
+                    package_type=request_package_type,
+                    account_text=request_account,
+                    has_password=bool(pick_text(body.password)),
+                ),
+            )
             logger.info(
                 'public_unlock_batch_purchase task_created: session_id=%s stage=%s batch_id=%s mode=items item_count=%s',
                 session_id,
@@ -4612,7 +5004,7 @@ def public_unlock_batch_purchase(session_id: str, body: JudianPublicBatchPurchas
         )
     except HTTPException as exc:
         logger.warning(
-            'public_unlock_batch_purchase rejected: session_id=%s mode=%s stage=%s status=%s detail=%s count=%s vipId=%s packageType=%s account=%s',
+            'public_unlock_batch_purchase rejected: session_id=%s mode=%s stage=%s status=%s detail=%s count=%s vipId=%s packageType=%s countPreset=%s submitSource=%s account=%s',
             session_id,
             'script' if is_script_mode else 'items',
             stage,
@@ -4621,18 +5013,22 @@ def public_unlock_batch_purchase(session_id: str, body: JudianPublicBatchPurchas
             request_count,
             request_vip_id,
             request_package_type,
+            request_count_preset,
+            request_submit_source,
             request_account,
         )
         raise
     except Exception as exc:
         logger.error(
-            'public_unlock_batch_purchase failed: session_id=%s mode=%s stage=%s count=%s vipId=%s packageType=%s account=%s error=%s\n%s',
+            'public_unlock_batch_purchase failed: session_id=%s mode=%s stage=%s count=%s vipId=%s packageType=%s countPreset=%s submitSource=%s account=%s error=%s\n%s',
             session_id,
             'script' if is_script_mode else 'items',
             stage,
             request_count,
             request_vip_id,
             request_package_type,
+            request_count_preset,
+            request_submit_source,
             request_account,
             exc,
             traceback.format_exc(),

@@ -350,6 +350,13 @@ function getRemoteLoginCredentials(args) {
   };
 }
 
+function withDirectProxyBypass(config = {}) {
+  return {
+    ...config,
+    proxy: false,
+  };
+}
+
 function classifyBatchErrorSource(message, fallback = "unknown") {
   const text = String(message || "").trim();
   if (!text) {
@@ -1081,7 +1088,7 @@ function ensureHost(host) {
   return host.endsWith("/") ? host.slice(0, -1) : host;
 }
 
-async function resolveHost(explicitHost) {
+async function resolveHost(explicitHost, disableEnvProxy = false) {
   if (explicitHost) {
     return ensureHost(explicitHost);
   }
@@ -1092,13 +1099,19 @@ async function resolveHost(explicitHost) {
       const ips = await dns.resolve4(seedUrl.hostname);
       for (const ip of ips) {
         const requrl = `${seedUrl.protocol}//${ip}${seedUrl.port ? `:${seedUrl.port}` : ""}`;
-        const response = await axios.get(`${requrl}/app/config/host`, {
+        const requestConfig = {
           timeout: 3900,
           headers: {
             appid: APP_CONFIG.appId,
             requrl,
           },
-        });
+        };
+        const response = await axios.get(
+          `${requrl}/app/config/host`,
+          disableEnvProxy
+            ? withDirectProxyBypass(requestConfig)
+            : requestConfig,
+        );
         const payload = response.data;
         if (payload && payload.code === 20000 && payload.data) {
           const hostConfig = await aesDecryptText(payload.data);
@@ -1114,10 +1127,16 @@ async function resolveHost(explicitHost) {
 
   for (const host of FALLBACK_HOSTS) {
     try {
-      await axios.get(`${host}/pc/vip_price/list`, {
+      const requestConfig = {
         timeout: 3900,
         headers: await buildHeaders(),
-      });
+      };
+      await axios.get(
+        `${host}/pc/vip_price/list`,
+        disableEnvProxy
+          ? withDirectProxyBypass(requestConfig)
+          : requestConfig,
+      );
       return host;
     } catch (_) {
       // Try next fallback host.
@@ -1949,11 +1968,12 @@ async function sendEncryptedRequest({
   method = "GET",
   data,
   token,
+  disableEnvProxy = false,
 }) {
   const headers = await buildHeaders(token);
   const hasBody = data && Object.keys(data).length > 0;
   const url = /^https?:\/\//i.test(path) ? path : `${ensureHost(host)}${path}`;
-  const response = await axios({
+  const requestConfig = {
     url,
     method,
     timeout: 9000,
@@ -1961,7 +1981,10 @@ async function sendEncryptedRequest({
     transformRequest: [(requestData) => requestData],
     headers,
     data: hasBody ? await paramsEncrypt(data) : void 0,
-  });
+  };
+  const response = await axios(
+    disableEnvProxy ? withDirectProxyBypass(requestConfig) : requestConfig,
+  );
 
   if (response.status >= 400) {
     const body =
@@ -3791,10 +3814,12 @@ async function run() {
   const pretty = Boolean(args.pretty);
   const token = args.token;
   const jsonPayload = args.json ? safeJsonParse(args.json, null) : null;
+  const shouldBypassProxyForPlanList =
+    action === "list" || action === "smoke";
   const host =
     action === "help" || action === "autopay"
       ? args.host
-      : await resolveHost(args.host);
+      : await resolveHost(args.host, shouldBypassProxyForPlanList);
 
   if (action === "onepath") {
     const result = await runOnePathFlow(host, args);
@@ -3816,6 +3841,7 @@ async function run() {
         host,
         path: "/pc/vip_price/list",
         method: "GET",
+        disableEnvProxy: true,
       });
     } catch (error) {
       result.ok = false;
@@ -3847,6 +3873,7 @@ async function run() {
       path: "/pc/vip_price/list",
       method: "GET",
       token,
+      disableEnvProxy: true,
     });
     printResult(result, pretty);
     return;
