@@ -528,6 +528,10 @@ class DBManager:
         )
         self._execute_sql(
             cursor,
+            "CREATE INDEX IF NOT EXISTS idx_orders_cookie_created_at ON orders(cookie_id, created_at DESC)",
+        )
+        self._execute_sql(
+            cursor,
             "CREATE INDEX IF NOT EXISTS idx_delivery_records_rule ON delivery_records(rule_id, created_at DESC, id DESC)",
         )
         self._execute_sql(
@@ -865,6 +869,10 @@ class DBManager:
                 FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
             )
             ''')
+            self._execute_sql(
+                cursor,
+                "CREATE INDEX IF NOT EXISTS idx_orders_cookie_created_at ON orders(cookie_id, created_at DESC)"
+            )
 
             # 检查并添加 is_bargain 列（用于标记小刀订单）
             try:
@@ -6792,6 +6800,98 @@ class DBManager:
             except Exception as e:
                 logger.error(f"获取Cookie订单列表失败: {cookie_id} - {e}")
                 return []
+
+    def get_orders_page_by_cookie_ids(
+        self,
+        cookie_ids: List[str],
+        status: str = '',
+        keyword: str = '',
+        page: int = 1,
+        page_size: int = 20,
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """按账号集合分页获取订单列表。"""
+        normalized_cookie_ids = [str(cookie_id or '').strip() for cookie_id in cookie_ids if str(cookie_id or '').strip()]
+        if not normalized_cookie_ids:
+            return [], 0
+
+        normalized_status = str(status or '').strip()
+        normalized_keyword = str(keyword or '').strip().lower()
+        safe_page = max(int(page or 1), 1)
+        safe_page_size = max(int(page_size or 20), 1)
+        offset = (safe_page - 1) * safe_page_size
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                placeholders = ','.join(['?' for _ in normalized_cookie_ids])
+                where_clauses = [f"cookie_id IN ({placeholders})"]
+                params: List[Any] = list(normalized_cookie_ids)
+
+                if normalized_status:
+                    if normalized_status == 'closed':
+                        where_clauses.append("order_status IN (?, ?)")
+                        params.extend(['closed', 'cancelled'])
+                    else:
+                        where_clauses.append("order_status = ?")
+                        params.append(normalized_status)
+
+                if normalized_keyword:
+                    like_keyword = f"%{normalized_keyword}%"
+                    where_clauses.append(
+                        "("
+                        "LOWER(COALESCE(order_id, '')) LIKE ? "
+                        "OR LOWER(COALESCE(item_id, '')) LIKE ? "
+                        "OR LOWER(COALESCE(buyer_id, '')) LIKE ?"
+                        ")"
+                    )
+                    params.extend([like_keyword, like_keyword, like_keyword])
+
+                where_sql = ' AND '.join(where_clauses)
+
+                self._execute_sql(
+                    cursor,
+                    f"SELECT COUNT(*) FROM orders WHERE {where_sql}",
+                    tuple(params),
+                )
+                count_row = cursor.fetchone()
+                total = int(count_row[0]) if count_row and count_row[0] is not None else 0
+
+                query_params = tuple(params + [safe_page_size, offset])
+                self._execute_sql(
+                    cursor,
+                    f'''
+                    SELECT order_id, item_id, buyer_id, spec_name, spec_value,
+                           quantity, amount, order_status, cookie_id, is_bargain, created_at, updated_at
+                    FROM orders
+                    WHERE {where_sql}
+                    ORDER BY created_at DESC
+                    LIMIT ? OFFSET ?
+                    ''',
+                    query_params,
+                )
+
+                orders: List[Dict[str, Any]] = []
+                for row in cursor.fetchall():
+                    orders.append({
+                        'id': row[0],
+                        'order_id': row[0],
+                        'item_id': row[1],
+                        'buyer_id': row[2],
+                        'spec_name': row[3],
+                        'spec_value': row[4],
+                        'quantity': row[5],
+                        'amount': row[6],
+                        'status': row[7],
+                        'cookie_id': row[8],
+                        'is_bargain': bool(row[9]) if row[9] is not None else False,
+                        'created_at': row[10],
+                        'updated_at': row[11],
+                    })
+
+                return orders, total
+            except Exception as e:
+                logger.error(f"分页获取订单列表失败: {e}")
+                return [], 0
 
     def get_all_orders(self, limit: int = 1000):
         """获取所有订单列表"""

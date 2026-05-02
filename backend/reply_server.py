@@ -7421,43 +7421,18 @@ def get_user_orders(
         keyword = (keyword or '').strip().lower()
         normalized_status = (status or '').strip()
 
-        # 获取用户的所有Cookie
         user_cookies = db_manager.get_all_cookies(user_id)
+        target_cookie_ids = list(user_cookies.keys())
+        if cookie_id:
+            target_cookie_ids = [cookie_id] if cookie_id in user_cookies else []
 
-        # 获取所有订单数据
-        all_orders = []
-        for current_cookie_id in user_cookies.keys():
-            if cookie_id and current_cookie_id != cookie_id:
-                continue
-
-            orders = db_manager.get_orders_by_cookie(current_cookie_id, limit=2000)
-            # 为每个订单添加cookie_id信息
-            for order in orders:
-                order['cookie_id'] = current_cookie_id
-                current_status = str(order.get('status') or '').strip()
-                if normalized_status:
-                    if normalized_status == 'closed':
-                        if current_status not in ('closed', 'cancelled'):
-                            continue
-                    elif current_status != normalized_status:
-                        continue
-                if keyword:
-                    search_target = ' '.join([
-                        str(order.get('order_id') or ''),
-                        str(order.get('item_id') or ''),
-                        str(order.get('buyer_id') or ''),
-                    ]).lower()
-                    if keyword not in search_target:
-                        continue
-                all_orders.append(order)
-
-        # 按创建时间倒序排列
-        all_orders.sort(key=lambda x: x.get('created_at', ''), reverse=True)
-
-        total = len(all_orders)
-        start_index = (page - 1) * page_size
-        end_index = start_index + page_size
-        paged_orders = all_orders[start_index:end_index]
+        paged_orders, total = db_manager.get_orders_page_by_cookie_ids(
+            target_cookie_ids,
+            status=normalized_status,
+            keyword=keyword,
+            page=page,
+            page_size=page_size,
+        )
         total_pages = (total + page_size - 1) // page_size if total else 0
 
         log_with_user('info', f"用户订单查询成功，共 {total} 条记录", current_user)
