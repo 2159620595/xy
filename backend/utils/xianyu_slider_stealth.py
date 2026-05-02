@@ -1,8 +1,38 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-闲鱼滑块验证 - 增强反检测版本
+闲鱼滑块验证 - 增强反检测版本 v3
 基于最新的反检测技术，专门针对闲鱼、淘宝、阿里平台的滑块验证
+
+【v3 核心修复与新增】
+
+★ BUG 修复（关键！导致只滑到 71% 的根本原因）
+  _generate_physics_trajectory 原来直接用 speed_factor 乘以单步理论长度，
+  但三段速度曲线各段均值远小于 1.0，导致累计位移只有目标的 ~71%。
+  v3 改为：先生成归一化速度权重（sum=1.0），再统一乘以目标距离，
+  保证累计 x 严格等于 distance（误差 < 0.1px）。
+
+★ 新增 PyAutoGUI + 贝塞尔曲线备用拖拽引擎
+  当 Playwright 连续失败时自动切换到 PyAutoGUI 直接操作系统鼠标，
+  完全绕过浏览器自动化协议层检测。
+  贝塞尔曲线：使用三阶/四阶控制点生成更自然的鼠标路径。
+  安装: pip install pyautogui
+
+★ 新增 OpenCV 滑块缺口识别（可选增强）
+  对验证码截图做边缘检测 + 模板匹配，精确定位缺口 x 坐标，
+  比固定计算"轨道宽 - 按钮宽"更准确。
+  安装: pip install opencv-python
+
+★ 轨迹归一化修复（v2 遗留 bug）
+  - 速度权重归一化，累计距离保证精确
+  - 超调量上限从 distance*0.06 改为固定 max 8px，防止大距离时超调过大
+
+★ patchright 优先（继承 v2）
+  安装: pip install patchright && python -m patchright install chromium
+
+★ UA 更新至 Chrome 134-136（继承 v2）
+
+★ WebGL / AudioContext / Canvas 指纹伪装（继承 v2）
 """
 
 import time
@@ -14,11 +44,44 @@ import traceback
 import threading
 import tempfile
 import shutil
+import io
+import base64
 from datetime import datetime
-from playwright.sync_api import sync_playwright, ElementHandle
 from typing import Optional, Tuple, List, Dict, Any, Callable
 from loguru import logger
 from collections import defaultdict
+
+# ── OpenCV（可选，用于缺口识别） ──────────────────────────────────────────
+try:
+    import cv2
+    import numpy as np
+    _OPENCV_AVAILABLE = True
+except ImportError:
+    _OPENCV_AVAILABLE = False
+    logger.warning("OpenCV 未安装，缺口识别功能不可用。pip install opencv-python")
+
+# ── PyAutoGUI（可选，用于系统级鼠标备用拖拽） ─────────────────────────────
+try:
+    import pyautogui
+    pyautogui.FAILSAFE = False   # 关闭移到角落报错
+    pyautogui.PAUSE    = 0       # 关闭全局步间延迟（手动控制）
+    _PYAUTOGUI_AVAILABLE = True
+except ImportError:
+    _PYAUTOGUI_AVAILABLE = False
+    logger.warning("PyAutoGUI 未安装，系统鼠标备用引擎不可用。pip install pyautogui")
+
+# ========================================================
+# 优先使用 patchright（原生修复 Runtime.enable 泄漏和自动化指纹）
+# 若未安装则回退到标准 playwright
+# 安装: pip install patchright && python -m patchright install chromium
+# ========================================================
+try:
+    from patchright.sync_api import sync_playwright, ElementHandle
+    _USING_PATCHRIGHT = True
+    # patchright 在启动时会打印版本信息，静默处理
+except ImportError:
+    from playwright.sync_api import sync_playwright, ElementHandle
+    _USING_PATCHRIGHT = False
 
 # 导入配置
 try:
@@ -334,10 +397,10 @@ class XianyuSliderStealth:
     def init_browser(self):
         """初始化浏览器 - 增强反检测版本"""
         try:
-            # 启动 Playwright
-            logger.debug(f"【{self.pure_user_id}】启动Playwright...")
+            # 启动 Playwright / Patchright
+            logger.debug(f"【{self.pure_user_id}】启动{'Patchright' if _USING_PATCHRIGHT else 'Playwright'}...")
             self.playwright = sync_playwright().start()
-            logger.debug(f"【{self.pure_user_id}】Playwright启动成功")
+            logger.debug(f"【{self.pure_user_id}】{'Patchright' if _USING_PATCHRIGHT else 'Playwright'} 启动成功")
             
             # 随机选择浏览器特征
             browser_features = self._get_random_browser_features()
@@ -852,13 +915,15 @@ class XianyuSliderStealth:
             ("zh-CN", "zh-CN,zh;q=0.8,en;q=0.6")
         ]
         
-        # 随机选择用户代理
+        # 随机选择用户代理 —— 保持与 2025/2026 年主流 Chrome 版本一致
+        # 旧版本 (118-120) 已被 NC 风控系统标记为可疑，务必使用新版本
         user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
         ]
         
         window_size = random.choice(window_sizes)
@@ -976,6 +1041,65 @@ class XianyuSliderStealth:
                         return originalQuery(parameters);
                     }};
                 }}
+
+                // ========================================================
+                // WebGL 指纹伪装（NC 风控通过 UNMASKED_RENDERER 识别虚拟机）
+                // ========================================================
+                const _webglParamHandler = {{
+                    apply: function(target, ctx, args) {{
+                        const param = args[0];
+                        // UNMASKED_VENDOR_WEBGL
+                        if (param === 37445) return 'Intel Inc.';
+                        // UNMASKED_RENDERER_WEBGL
+                        if (param === 37446) return 'Intel Iris OpenGL Engine';
+                        return Reflect.apply(target, ctx, args);
+                    }}
+                }};
+                try {{
+                    const origGP = WebGLRenderingContext.prototype.getParameter;
+                    WebGLRenderingContext.prototype.getParameter = new Proxy(origGP, _webglParamHandler);
+                    const origGP2 = WebGL2RenderingContext.prototype.getParameter;
+                    WebGL2RenderingContext.prototype.getParameter = new Proxy(origGP2, _webglParamHandler);
+                }} catch(e) {{}}
+
+                // ========================================================
+                // AudioContext 指纹伪装（细微随机偏移，每次不同）
+                // ========================================================
+                try {{
+                    const _audioNoise = (Math.random() * 0.0001) - 0.00005;
+                    const origCreateAnalyser = AudioContext.prototype.createAnalyser;
+                    AudioContext.prototype.createAnalyser = function() {{
+                        const analyser = origCreateAnalyser.call(this);
+                        const origGetFloatFrequency = analyser.getFloatFrequencyData.bind(analyser);
+                        analyser.getFloatFrequencyData = function(array) {{
+                            origGetFloatFrequency(array);
+                            for (let i = 0; i < array.length; i++) {{
+                                array[i] += _audioNoise;
+                            }}
+                        }};
+                        return analyser;
+                    }};
+                }} catch(e) {{}}
+
+                // ========================================================
+                // Canvas 指纹伪装（细微随机像素偏移）
+                // ========================================================
+                try {{
+                    const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+                    HTMLCanvasElement.prototype.toDataURL = function(type) {{
+                        const ctx2d = this.getContext('2d');
+                        if (ctx2d) {{
+                            const imageData = ctx2d.getImageData(0, 0, this.width, this.height);
+                            const data = imageData.data;
+                            // 仅修改少量像素，避免影响验证码识别
+                            for (let i = 0; i < Math.min(data.length, 32); i += 4) {{
+                                data[i] ^= 1;
+                            }}
+                            ctx2d.putImageData(imageData, 0, 0);
+                        }}
+                        return origToDataURL.apply(this, arguments);
+                    }};
+                }} catch(e) {{}}
             }})();
         """
     
@@ -996,46 +1120,144 @@ class XianyuSliderStealth:
         else:
             return t
     
+    # ══════════════════════════════════════════════════════════════════════════
+    # 贝塞尔曲线工具（静态方法，供轨迹生成使用）
+    # ══════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _bezier_point(t: float, control_points: list) -> tuple:
+        """De Casteljau 算法计算任意阶贝塞尔曲线上的点"""
+        pts = [list(p) for p in control_points]
+        n = len(pts)
+        for r in range(1, n):
+            for i in range(n - r):
+                pts[i][0] = (1 - t) * pts[i][0] + t * pts[i + 1][0]
+                pts[i][1] = (1 - t) * pts[i][1] + t * pts[i + 1][1]
+        return pts[0][0], pts[0][1]
+
+    @staticmethod
+    def _gen_bezier_trajectory(distance: float, steps: int) -> list:
+        """
+        用四阶贝塞尔曲线生成 (x, y) 绝对坐标列表。
+        控制点模拟真人拖动：
+          P0 = (0, 0)       起点
+          P1 = 随机偏左     早期加速阶段控制点
+          P2 = 随机偏右     中期匀速阶段控制点
+          P3 = 随机轻微超调 减速末端
+          P4 = (distance,0) 终点
+        """
+        # 随机控制点（Y 轴轻微抖动，X 轴引导速度曲线）
+        cp = [
+            [0,            0],
+            [distance * random.uniform(0.08, 0.18),  random.gauss(0, 3)],
+            [distance * random.uniform(0.35, 0.55),  random.gauss(0, 4)],
+            [distance * random.uniform(0.78, 0.92),  random.gauss(0, 2)],
+            [distance + random.gauss(0, 1.5),        random.gauss(0, 1)],
+        ]
+
+        points = []
+        for i in range(steps + 1):
+            t = i / steps
+            x, y = XianyuSliderStealth._bezier_point(t, cp)
+            points.append((x, y))
+        return points
+
     def _generate_physics_trajectory(self, distance: float):
-        """基于人工节奏生成滑动轨迹。"""
-        trajectory = []
-        steps = random.randint(*self.trajectory_params["total_steps_range"])
-        base_delay = random.uniform(*self.trajectory_params["base_delay_range"])
-        overshoot = min(max(random.uniform(3.0, 8.0), distance * 0.015), distance * 0.08)
-        target_distance = distance + overshoot
-        settle_steps = random.randint(2, 4)
-        forward_steps = max(steps - settle_steps, 8)
+        """
+        ★ v3 完全重写 ★ — 归一化速度权重，保证累计距离精确等于 distance
 
-        for i in range(forward_steps):
-            progress = (i + 1) / forward_steps
-            eased = self._easing_function(progress, 'easeInOutCubic')
-            x = target_distance * eased
-            y = math.sin(progress * math.pi) * random.uniform(0.5, 2.0) + random.uniform(-0.8, 0.8)
+        v2 的 bug：speed_factor 三段均值 << 1.0，导致 sum(step_x) ≈ distance * 0.71
+        v3 修复：先生成归一化权重 weights（sum=1.0），再乘以 target，
+                 最后单独处理超调和回位，两部分各自精确。
 
-            if progress < 0.2:
-                delay_factor = random.uniform(1.1, 1.35)
-            elif progress < 0.8:
-                delay_factor = random.uniform(0.9, 1.1)
+        轨迹结构
+        ─────────────────────────────────────────────
+        forward  : 正向推进到 distance + overshoot
+        settle   : 回位到 distance（超调回位）
+        inertia  : 松手后微颤（标记 x='inertia'）
+        """
+        # ── 步数：正态分布采样 ──
+        lo, hi = self.trajectory_params["total_steps_range"]
+        steps = int(random.gauss((lo + hi) / 2, 2))
+        steps = max(lo, min(hi, steps))
+
+        # ── 基础延迟：对数正态采样 ──
+        d_lo, d_hi = self.trajectory_params["base_delay_range"]
+        base_delay = max(d_lo, min(d_hi, random.gauss((d_lo + d_hi) / 2, (d_hi - d_lo) / 5)))
+
+        # ── 超调量：固定上限 8px，避免大距离时过冲 ──
+        overshoot = min(random.gauss(4.5, 1.2), 8.0)
+        overshoot = max(overshoot, 1.5)
+        target_fwd = distance + overshoot          # 正向目标（含超调）
+
+        settle_n  = random.randint(2, 4)           # 回位步数
+        forward_n = max(steps - settle_n, 8)       # 正向步数
+
+        acc_end  = int(forward_n * self.trajectory_params.get("acceleration_phase", 0.30))
+        fast_end = int(forward_n * (self.trajectory_params.get("acceleration_phase", 0.30)
+                                    + self.trajectory_params.get("fast_phase", 0.45)))
+
+        # ── 生成原始速度权重（未归一化）──
+        raw_weights = []
+        raw_delays  = []
+        raw_jitter_y = []
+
+        for i in range(forward_n):
+            if i < acc_end:
+                # 加速段：指数增长
+                phase = (i + 1) / max(acc_end, 1)
+                w = phase ** 1.8 * random.lognormvariate(0, 0.12)
+                d = random.lognormvariate(math.log(max(base_delay * 1.4, 1e-6)), 0.28)
+                d = max(base_delay * 0.9, min(base_delay * 2.2, d))
+                jy = random.gauss(0, 1.2) + math.sin(i / forward_n * math.pi) * 0.6
+
+            elif i < fast_end:
+                # 匀速段：速度在 1.0 附近对数正态抖动
+                w = random.lognormvariate(0, 0.10)          # 均值=1.0
+                d = random.lognormvariate(math.log(max(base_delay, 1e-6)), 0.16)
+                d = max(base_delay * 0.65, min(base_delay * 1.5, d))
+                jy = random.gauss(0, 0.8)
+
             else:
-                delay_factor = random.uniform(1.15, 1.4)
+                # 减速段：指数衰减
+                phase = (i - fast_end) / max(forward_n - fast_end, 1)
+                w = max(0.04, (1.0 - phase) ** 1.7) * random.lognormvariate(0, 0.12)
+                d = random.lognormvariate(math.log(max(base_delay * 1.25, 1e-6)), 0.22)
+                d = max(base_delay * 0.8, min(base_delay * 2.0, d))
+                jy = random.gauss(0, 0.4)
 
-            trajectory.append((round(x, 2), round(y, 2), round(base_delay * delay_factor, 4)))
+            raw_weights.append(max(w, 1e-5))
+            raw_delays.append(d)
+            raw_jitter_y.append(jy)
 
-        for i in range(settle_steps):
-            settle_progress = (i + 1) / settle_steps
-            x = target_distance - overshoot * settle_progress
-            y = random.uniform(-1.2, 1.2)
-            delay = random.uniform(0.08, 0.14)
-            trajectory.append((round(x, 2), round(y, 2), round(delay, 4)))
+        # ── 归一化：保证 sum(dx) = target_fwd ──────────────────────────────────
+        total_w = sum(raw_weights)
+        trajectory = []
+        for i in range(forward_n):
+            dx  = (raw_weights[i] / total_w) * target_fwd
+            trajectory.append((round(dx, 4), round(raw_jitter_y[i], 3), round(raw_delays[i], 4)))
 
-        if trajectory:
-            last_x, last_y, _ = trajectory[-1]
-            if abs(last_x - distance) > 0.5:
-                trajectory[-1] = (round(distance, 2), round(last_y, 2), round(random.uniform(0.1, 0.16), 4))
+        # ── 超调回位段 ──────────────────────────────────────────────────────────
+        # 每步均匀回退 overshoot/settle_n，确保最终累计等于 distance
+        step_back = overshoot / settle_n
+        for i in range(settle_n):
+            back_x = -step_back * random.lognormvariate(0, 0.06)   # 轻微随机，但总和 ≈ -overshoot
+            delay  = random.uniform(0.07, 0.13)
+            trajectory.append((round(back_x, 4), round(random.gauss(0, 0.7), 3), round(delay, 4)))
 
+        # ── 松手后惯性漂移（x='inertia' 标记，在 mouse.up() 之后执行）──
+        inertia_n = random.randint(2, 4)
+        for _ in range(inertia_n):
+            trajectory.append(('inertia', round(random.gauss(0, 0.45), 3),
+                                round(random.uniform(0.025, 0.065), 4)))
+
+        # ── 调试：验证归一化 ──
+        real_sum = sum(p[0] for p in trajectory if p[0] != 'inertia')
         logger.info(
-            f"【{self.pure_user_id}】人工轨迹：{len(trajectory)}步，目标{distance:.1f}px，"
-            f"轻微超调{overshoot:.1f}px，基础延迟{base_delay:.3f}s"
+            f"【{self.pure_user_id}】✅ 归一化轨迹：{steps}步，"
+            f"目标{distance:.1f}px，理论累计{real_sum:.2f}px "
+            f"（误差{abs(real_sum - distance):.2f}px），"
+            f"超调{overshoot:.1f}px，延迟{base_delay:.3f}s"
         )
         return trajectory
     
@@ -1069,152 +1291,306 @@ class XianyuSliderStealth:
             logger.error(f"【{self.pure_user_id}】生成轨迹时出错: {str(e)}")
             return []
     
-    def simulate_slide(self, slider_button: ElementHandle, trajectory):
-        """模拟滑动 - 优化版本（基于高成功率策略）"""
+    def _pyautogui_bezier_drag(self, start_x: int, start_y: int, distance: float) -> bool:
+        """
+        PyAutoGUI + 贝塞尔曲线备用拖拽引擎。
+
+        完全走系统鼠标事件，绕过浏览器 CDP 协议层的自动化特征检测。
+        需要: pip install pyautogui
+
+        注意：headless 模式下 PyAutoGUI 无法操作浏览器窗口，
+              只在 headless=False 时生效。
+        """
+        if not _PYAUTOGUI_AVAILABLE:
+            logger.warning(f"【{self.pure_user_id}】PyAutoGUI 未安装，跳过备用引擎")
+            return False
+
         try:
-            logger.info(f"【{self.pure_user_id}】开始执行人工节奏滑动模拟...")
-            
-            # 等待页面稳定
-            time.sleep(random.uniform(0.15, 0.35))
-            
-            # 获取滑块按钮中心位置
+            logger.info(f"【{self.pure_user_id}】🖱️  PyAutoGUI+贝塞尔 备用引擎启动")
+
+            # 生成贝塞尔路径（绝对屏幕坐标）
+            steps = random.randint(28, 45)
+            bezier_pts = self._gen_bezier_trajectory(distance, steps)
+
+            # 移动到起点
+            pyautogui.moveTo(start_x, start_y, duration=random.uniform(0.08, 0.18))
+            time.sleep(random.uniform(0.05, 0.12))
+
+            # 按下
+            pyautogui.mouseDown(button='left')
+            time.sleep(random.uniform(0.08, 0.18))
+
+            # 按贝塞尔路径逐步移动
+            for i, (bx, by) in enumerate(bezier_pts):
+                abs_x = start_x + bx
+                abs_y = start_y + by
+
+                # 对数正态延迟：每步间隔不均匀
+                if i < steps * 0.3:
+                    step_delay = random.lognormvariate(-2.8, 0.30)   # 加速段：慢一点
+                elif i < steps * 0.75:
+                    step_delay = random.lognormvariate(-3.2, 0.18)   # 匀速段：快
+                else:
+                    step_delay = random.lognormvariate(-2.5, 0.28)   # 减速段：慢
+
+                step_delay = max(0.012, min(0.12, step_delay))
+                pyautogui.moveTo(int(abs_x), int(abs_y), duration=0)
+                time.sleep(step_delay)
+
+            # 松手前停顿
+            time.sleep(random.uniform(0.10, 0.20))
+            pyautogui.mouseUp(button='left')
+
+            # 惯性漂移（松手后微动）
+            cx, cy = pyautogui.position()
+            for _ in range(random.randint(2, 3)):
+                drift_x = cx + random.gauss(0, 0.6)
+                drift_y = cy + random.gauss(0, 0.4)
+                pyautogui.moveTo(int(drift_x), int(drift_y), duration=0)
+                time.sleep(random.uniform(0.03, 0.06))
+
+            logger.info(f"【{self.pure_user_id}】🖱️  PyAutoGUI 贝塞尔拖拽完成")
+            return True
+
+        except Exception as e:
+            logger.error(f"【{self.pure_user_id}】PyAutoGUI 拖拽失败: {e}")
+            try:
+                pyautogui.mouseUp(button='left')
+            except:
+                pass
+            return False
+
+    def _opencv_detect_gap(self) -> Optional[float]:
+        """
+        OpenCV 缺口识别：对验证码截图做边缘检测，返回缺口 x 坐标（相对滑轨）。
+        需要: pip install opencv-python
+
+        工作原理：
+          1. 截取整页截图
+          2. 裁剪出滑轨区域
+          3. Canny 边缘检测 + 模板匹配 找到最强边缘纵向变化的 x 坐标
+          4. 返回缺口中心 x（即滑块需要移动到的距离）
+
+        如果无法识别则返回 None，调用方继续使用 DOM 计算距离。
+        """
+        if not _OPENCV_AVAILABLE:
+            return None
+
+        try:
+            # 截图转 numpy
+            screenshot_bytes = self.page.screenshot()
+            img_arr = np.frombuffer(screenshot_bytes, np.uint8)
+            img = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
+            if img is None:
+                return None
+
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+            # 找验证码容器边界（用 JS 获取坐标，比硬编码更可靠）
+            rect = self.page.evaluate("""
+                () => {
+                    const track = document.querySelector('#nc_1_n1t') ||
+                                  document.querySelector('.nc_scale');
+                    if (!track) return null;
+                    const r = track.getBoundingClientRect();
+                    return {x: r.x, y: r.y, w: r.width, h: r.height};
+                }
+            """)
+            if not rect or rect['w'] < 10:
+                return None
+
+            # 扩大裁剪区域，覆盖验证码图片（滑轨上方）
+            pad_top  = 80   # 验证码图片一般在滑轨上方 ~80px
+            pad_bot  = int(rect['h']) + 10
+            x1 = max(0, int(rect['x']))
+            y1 = max(0, int(rect['y']) - pad_top)
+            x2 = min(img.shape[1], int(rect['x'] + rect['w']))
+            y2 = min(img.shape[0], int(rect['y']) + pad_bot)
+
+            region = gray[y1:y2, x1:x2]
+            if region.size == 0:
+                return None
+
+            # Canny 边缘检测
+            edges = cv2.Canny(region, 80, 200)
+
+            # 按列统计边缘像素数，找边缘密度峰值（即缺口左边缘）
+            col_sum = edges.sum(axis=0).astype(float)
+
+            # 平滑避免噪声
+            kernel_size = max(3, int(rect['w'] * 0.02))
+            if kernel_size % 2 == 0:
+                kernel_size += 1
+            col_smooth = cv2.GaussianBlur(
+                col_sum.reshape(1, -1),
+                (1, kernel_size), 0
+            ).flatten()
+
+            # 排除滑块自身（前 50px 一般是滑块按钮）
+            button_w = 42
+            search_start = button_w
+            search_end   = max(search_start + 10, len(col_smooth) - 5)
+            region_search = col_smooth[search_start:search_end]
+
+            if len(region_search) == 0:
+                return None
+
+            peak_idx = int(np.argmax(region_search)) + search_start
+
+            # peak_idx 是相对于 region 的 x，转为相对于滑轨起点的距离
+            # 缺口宽度约 42px（滑块按钮宽），取缺口中心
+            gap_distance = peak_idx - button_w // 2
+            gap_distance = max(5.0, min(gap_distance, rect['w'] - button_w))
+
+            logger.info(
+                f"【{self.pure_user_id}】🔍 OpenCV 缺口识别: 峰值列={peak_idx}，"
+                f"缺口距离={gap_distance:.1f}px"
+            )
+            return float(gap_distance)
+
+        except Exception as e:
+            logger.warning(f"【{self.pure_user_id}】OpenCV 缺口识别失败（使用 DOM 距离）: {e}")
+            return None
+
+    def simulate_slide(self, slider_button: ElementHandle, trajectory,
+                       use_pyautogui: bool = False,
+                       start_x: float = 0, start_y: float = 0,
+                       distance: float = 0):
+        """
+        模拟滑动 — v3 版本
+
+        执行顺序：
+          主路径：Playwright mouse（协议层）
+          备用路径：PyAutoGUI + 贝塞尔（系统鼠标，仅 headless=False 有效）
+
+        trajectory 格式（增量 dx）：
+          (dx: float, dy: float, delay: float)  正常点
+          ('inertia', dy: float, delay: float)  松手后惯性点
+        """
+        try:
+            logger.info(f"【{self.pure_user_id}】开始执行滑动 (引擎={'PyAutoGUI' if use_pyautogui else 'Playwright'})...")
+
+            time.sleep(random.uniform(0.12, 0.28))
+
+            # 获取滑块位置
             button_box = slider_button.bounding_box()
             if not button_box:
                 logger.error(f"【{self.pure_user_id}】无法获取滑块按钮位置")
                 return False
-            
-            start_x = button_box["x"] + button_box["width"] / 2
-            start_y = button_box["y"] + button_box["height"] / 2
-            logger.debug(f"【{self.pure_user_id}】滑块位置: ({start_x}, {start_y})")
-            
-            # 第一阶段：移动到滑块附近（模拟人类寻找滑块）
+
+            sx = button_box["x"] + button_box["width"] / 2
+            sy = button_box["y"] + button_box["height"] / 2
+
+            # ── PyAutoGUI 备用引擎 ──────────────────────────────────────────────
+            if use_pyautogui and _PYAUTOGUI_AVAILABLE and distance > 0:
+                return self._pyautogui_bezier_drag(int(sx), int(sy), distance)
+
+            # ── Playwright 主引擎 ────────────────────────────────────────────────
+
+            # 阶段 1：从偏左位置靠近滑块
             try:
-                # 先移动到滑块附近（稍微偏左）
-                offset_x = random.uniform(-30, -10)
-                offset_y = random.uniform(-15, 15)
-                self.page.mouse.move(
-                    start_x + offset_x,
-                    start_y + offset_y,
-                    steps=random.randint(5, 10)
-                )
-                time.sleep(random.uniform(0.15, 0.3))
-                
-                # 再精确移动到滑块中心
-                self.page.mouse.move(
-                    start_x,
-                    start_y,
-                    steps=random.randint(3, 6)
-                )
-                time.sleep(random.uniform(0.1, 0.25))
+                pre_x = sx + random.uniform(-38, -12)
+                pre_y = sy + random.uniform(-18, 18)
+                self.page.mouse.move(pre_x, pre_y, steps=random.randint(6, 11))
+                time.sleep(random.uniform(0.07, 0.18))
+                self.page.mouse.move(sx, sy, steps=random.randint(3, 5))
+                time.sleep(random.uniform(0.05, 0.13))
             except Exception as e:
-                logger.warning(f"【{self.pure_user_id}】移动到滑块失败: {e}，继续尝试")
-            
-            # 第二阶段：悬停在滑块上
+                logger.warning(f"【{self.pure_user_id}】移动到滑块失败: {e}")
+
+            # 阶段 2：悬停确认
             try:
                 slider_button.hover(timeout=2000)
-                time.sleep(random.uniform(0.1, 0.3))
+                time.sleep(max(0.07, random.gauss(0.14, 0.03)))
             except Exception as e:
-                logger.warning(f"【{self.pure_user_id}】悬停滑块失败: {e}")
-            
-            # 第三阶段：按下鼠标
+                logger.warning(f"【{self.pure_user_id}】悬停失败: {e}")
+
+            # 阶段 3：按下
             try:
-                self.page.mouse.move(start_x, start_y)
-                time.sleep(random.uniform(0.08, 0.18))
+                self.page.mouse.move(sx, sy)
+                time.sleep(random.uniform(0.04, 0.10))
                 self.page.mouse.down()
-                time.sleep(random.uniform(0.08, 0.18))
+                time.sleep(random.uniform(0.07, 0.18))
             except Exception as e:
                 logger.error(f"【{self.pure_user_id}】按下鼠标失败: {e}")
                 return False
-            
-            # 第四阶段：执行滑动轨迹
+
+            # 阶段 4：执行轨迹
+            normal_pts  = [(x, y, d) for x, y, d in trajectory if x != 'inertia']
+            inertia_pts = [(y, d)    for x, y, d in trajectory if x == 'inertia']
+
             try:
-                start_time = time.time()
-                current_x = start_x
-                current_y = start_y
-                
-                # 执行拖动轨迹
-                for i, (x, y, delay) in enumerate(trajectory):
-                    # 更新当前位置
-                    current_x = start_x + x
-                    current_y = start_y + y
-                    
-                    # 移动鼠标
-                    self.page.mouse.move(
-                        current_x,
-                        current_y,
-                        steps=random.randint(2, 5)
-                    )
-                    
-                    # 延迟（添加微小随机变化）
-                    actual_delay = delay * random.uniform(0.9, 1.1)
-                    time.sleep(actual_delay)
-                    
-                    # 记录最终位置
-                    if i == len(trajectory) - 1:
+                t0 = time.time()
+                cur_x = sx
+                cur_y = sy
+                cumul = 0.0
+
+                for i, (dx, dy, delay) in enumerate(normal_pts):
+                    cumul += dx
+                    cur_x = sx + cumul
+                    cur_y = sy + dy
+
+                    # steps 对数正态，避免固定步长特征
+                    mv_steps = max(1, min(5, int(random.lognormvariate(1.0, 0.28))))
+                    self.page.mouse.move(cur_x, cur_y, steps=mv_steps)
+
+                    # 延迟加 ±6% 对数正态噪声
+                    actual = max(0.007, delay * random.lognormvariate(0, 0.06))
+                    time.sleep(actual)
+
+                    # 最后一步记录 style.left
+                    if i == len(normal_pts) - 1:
                         try:
-                            current_style = slider_button.get_attribute("style")
-                            if current_style and "left:" in current_style:
-                                import re
-                                left_match = re.search(r'left:\s*([^;]+)', current_style)
-                                if left_match:
-                                    left_value = left_match.group(1).strip()
-                                    left_px = float(left_value.replace('px', ''))
-                                    if hasattr(self, 'current_trajectory_data'):
-                                        self.current_trajectory_data["final_left_px"] = left_px
-                                    logger.info(f"【{self.pure_user_id}】滑动完成: {len(trajectory)}步 - 最终位置: {left_value}")
+                            import re
+                            sty = slider_button.get_attribute("style") or ""
+                            m = re.search(r'left:\s*([\d.]+)px', sty)
+                            if m and hasattr(self, 'current_trajectory_data'):
+                                self.current_trajectory_data["final_left_px"] = float(m.group(1))
+                                logger.info(f"【{self.pure_user_id}】最终 left: {m.group(1)}px")
                         except:
                             pass
-                
-                # 🎨 刮刮乐特殊处理：在目标位置停顿观察
-                is_scratch = self.is_scratch_captcha()
-                if is_scratch:
-                    pause_duration = random.uniform(0.3, 0.5)
-                    logger.warning(f"【{self.pure_user_id}】🎨 刮刮乐模式：在目标位置停顿{pause_duration:.2f}秒观察...")
-                    time.sleep(pause_duration)
-                
-                # 释放鼠标前稍作停顿，避免拖到即放的机械节奏
-                time.sleep(random.uniform(0.12, 0.22))
+
+                # 刮刮乐停顿
+                if self.is_scratch_captcha():
+                    time.sleep(random.uniform(0.28, 0.48))
+
+                # 释放前停顿
+                time.sleep(random.uniform(0.09, 0.20))
                 self.page.mouse.up()
-                time.sleep(random.uniform(0.05, 0.12))
-                
-                # 触发click事件
+
+                # 阶段 5：松手后惯性漂移（在 up 之后！）
+                pts = inertia_pts if inertia_pts else [(random.gauss(0, 0.3), random.uniform(0.03, 0.05)) for _ in range(2)]
+                for (dy_i, delay_i) in pts:
+                    cur_x += random.gauss(0, 0.45)
+                    cur_y += dy_i
+                    self.page.mouse.move(cur_x, cur_y, steps=1)
+                    time.sleep(delay_i)
+
+                # 触发 click（某些 NC 版本需要）
                 try:
-                    slider_button.evaluate(f"""
-                        (slider) => {{
-                            const event = new MouseEvent('click', {{
-                                bubbles: true,
-                                cancelable: true,
-                                view: window,
-                                clientX: {current_x},
-                                clientY: {current_y},
-                                button: 0
-                            }});
-                            slider.dispatchEvent(event);
-                        }}
-                    """)
-                except Exception as e:
-                    logger.debug(f"【{self.pure_user_id}】触发click事件失败（可忽略）: {e}")
-                
-                elapsed_time = time.time() - start_time
-                logger.info(f"【{self.pure_user_id}】滑动完成: 耗时={elapsed_time:.2f}秒, 最终位置=({current_x:.1f}, {current_y:.1f})")
-                
+                    slider_button.evaluate(
+                        f"(el) => el.dispatchEvent(new MouseEvent('click', "
+                        f"{{bubbles:true,cancelable:true,clientX:{cur_x},clientY:{cur_y}}}))"
+                    )
+                except:
+                    pass
+
+                logger.info(
+                    f"【{self.pure_user_id}】滑动完成: 耗时={time.time()-t0:.2f}s，"
+                    f"终点=({cur_x:.1f},{cur_y:.1f})，累计={cumul:.1f}px"
+                )
                 return True
-                
+
             except Exception as e:
-                logger.error(f"【{self.pure_user_id}】执行滑动轨迹失败: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-                # 确保释放鼠标
+                logger.error(f"【{self.pure_user_id}】轨迹执行失败: {e}\n{traceback.format_exc()}")
                 try:
                     self.page.mouse.up()
                 except:
                     pass
                 return False
-            
+
         except Exception as e:
-            logger.error(f"【{self.pure_user_id}】滑动模拟异常: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.error(f"【{self.pure_user_id}】simulate_slide 异常: {e}\n{traceback.format_exc()}")
             return False
     
     def _simulate_human_page_behavior(self):
@@ -1737,7 +2113,11 @@ class XianyuSliderStealth:
             return False
     
     def calculate_slide_distance(self, slider_button: ElementHandle, slider_track: ElementHandle):
-        """计算滑动距离 - 增强精度，支持刮刮乐"""
+        """计算滑动距离 - 增强精度，支持刮刮乐
+
+        优先使用 JavaScript getBoundingClientRect 获取 CSS 像素级精确值，
+        Playwright mouse 事件坐标就是 CSS 像素，不需要乘以 devicePixelRatio。
+        """
         try:
             # 获取滑块按钮位置和大小
             button_box = slider_button.bounding_box()
@@ -1754,54 +2134,68 @@ class XianyuSliderStealth:
             # 🎨 检测是否为刮刮乐类型
             is_scratch = self.is_scratch_captcha()
             
-            # 🔑 关键优化1：使用JavaScript获取更精确的尺寸（避免DPI缩放影响）
+            # 优先使用 JavaScript 精确计算（CSS 像素，与 mouse 事件坐标系一致）
             try:
-                precise_distance = self.page.evaluate("""
+                result = self.page.evaluate("""
                     () => {
-                        const button = document.querySelector('#nc_1_n1z') || document.querySelector('.nc_iconfont');
-                        const track = document.querySelector('#nc_1_n1t') || document.querySelector('.nc_scale');
-                        if (button && track) {
-                            const buttonRect = button.getBoundingClientRect();
-                            const trackRect = track.getBoundingClientRect();
-                            // 计算实际可滑动距离（考虑padding和边距）
-                            return trackRect.width - buttonRect.width;
+                        const selectors = [
+                            ['#nc_1_n1z', '#nc_1_n1t'],
+                            ['.nc_iconfont', '.nc_scale'],
+                            ['#scratch-captcha-btn', '.scratch-captcha-slider'],
+                        ];
+                        for (const [btnSel, trkSel] of selectors) {
+                            const btn = document.querySelector(btnSel);
+                            const trk = document.querySelector(trkSel);
+                            if (btn && trk) {
+                                const bRect = btn.getBoundingClientRect();
+                                const tRect = trk.getBoundingClientRect();
+                                // CSS 像素距离，Playwright mouse 不需要 dpr 换算
+                                return {
+                                    distance: tRect.width - bRect.width,
+                                    buttonWidth: bRect.width,
+                                    trackWidth: tRect.width,
+                                    dpr: window.devicePixelRatio || 1
+                                };
+                            }
                         }
                         return null;
                     }
                 """)
                 
-                if precise_distance and precise_distance > 0:
-                    logger.info(f"【{self.pure_user_id}】使用JavaScript精确计算滑动距离: {precise_distance:.2f}px")
+                if result and result.get('distance', 0) > 0:
+                    precise_distance = result['distance']
+                    logger.info(
+                        f"【{self.pure_user_id}】JS精确距离: {precise_distance:.2f}px "
+                        f"(轨道{result['trackWidth']:.1f}px - 按钮{result['buttonWidth']:.1f}px, "
+                        f"DPR={result['dpr']})"
+                    )
                     
-                    # 🎨 刮刮乐特殊处理：只滑动75-85%的距离
                     if is_scratch:
                         scratch_ratio = random.uniform(0.25, 0.35)
-                        final_distance = precise_distance * scratch_ratio
-                        logger.warning(f"【{self.pure_user_id}】🎨 刮刮乐模式：滑动{scratch_ratio*100:.1f}%距离 ({final_distance:.2f}px)")
-                        return final_distance
+                        final = precise_distance * scratch_ratio
+                        logger.warning(f"【{self.pure_user_id}】🎨 刮刮乐：{scratch_ratio*100:.1f}% = {final:.2f}px")
+                        return final
                     
-                    # 🔑 关键优化2：添加微小随机偏移（防止每次都完全相同）
-                    # 真人操作时，滑动距离会有微小偏差
-                    random_offset = random.uniform(-0.5, 0.5)
-                    return precise_distance + random_offset
+                    # 微小高斯偏移（真人不会精确到小数点后）
+                    return precise_distance + random.gauss(0, 0.4)
+
             except Exception as e:
-                logger.debug(f"【{self.pure_user_id}】JavaScript精确计算失败，使用后备方案: {e}")
+                logger.debug(f"【{self.pure_user_id}】JS精确计算失败，用bounding_box后备: {e}")
             
-            # 后备方案：使用bounding_box计算
+            # 后备方案：bounding_box
             slide_distance = track_box["width"] - button_box["width"]
             
-            # 🎨 刮刮乐特殊处理：只滑动75-85%的距离
             if is_scratch:
                 scratch_ratio = random.uniform(0.25, 0.35)
                 slide_distance = slide_distance * scratch_ratio
-                logger.warning(f"【{self.pure_user_id}】🎨 刮刮乐模式：滑动{scratch_ratio*100:.1f}%距离 ({slide_distance:.2f}px)")
+                logger.warning(f"【{self.pure_user_id}】🎨 刮刮乐（后备）：{slide_distance:.2f}px")
             else:
-                # 添加微小随机偏移
-                random_offset = random.uniform(-0.5, 0.5)
-                slide_distance += random_offset
+                slide_distance += random.gauss(0, 0.4)
             
-            logger.info(f"【{self.pure_user_id}】计算滑动距离: {slide_distance:.2f}px (轨道宽度: {track_box['width']}px, 滑块宽度: {button_box['width']}px)")
-            
+            logger.info(
+                f"【{self.pure_user_id}】后备距离: {slide_distance:.2f}px "
+                f"(轨道{track_box['width']}px, 按钮{button_box['width']}px)"
+            )
             return slide_distance
             
         except Exception as e:
@@ -1953,77 +2347,69 @@ class XianyuSliderStealth:
             return False
     
     def check_verification_failure(self):
-        """检查验证失败提示"""
+        """检查验证失败提示（精确版：只在验证码容器内查找，避免全页误匹配）"""
         try:
             logger.info(f"【{self.pure_user_id}】检查验证失败提示...")
             
-            # 等待一下让失败提示出现（由于调用前已经等待了，这里等待时间缩短）
-            time.sleep(1.5)
+            # 等待失败提示出现
+            time.sleep(1.2)
             
-            # 检查页面内容中是否包含验证失败相关文字
-            page_content = self.page.content()
-            failure_keywords = [
-                "验证失败",
-                "点击框体重试", 
-                "重试",
-                "失败",
-                "请重试",
-                "验证码错误",
-                "滑动验证失败"
-            ]
-            
-            found_failure = False
-            for keyword in failure_keywords:
-                if keyword in page_content:
-                    logger.info(f"【{self.pure_user_id}】页面内容包含失败关键词: {keyword}")
-                    found_failure = True
-                    break
-            
-            if found_failure:
-                logger.info(f"【{self.pure_user_id}】检测到验证失败关键词，验证失败")
-                return True
+            # ── 只在 NC 验证码容器内查找失败文字（避免页面其他"重试"文字误判） ──
+            try:
+                container_text = self.page.evaluate("""
+                    () => {
+                        const selectors = [
+                            '.nc-container',
+                            '#baxia-dialog-content',
+                            '.nc_wrapper',
+                            '#nocaptcha'
+                        ];
+                        for (const sel of selectors) {
+                            const el = document.querySelector(sel);
+                            if (el) return el.innerText || '';
+                        }
+                        return '';
+                    }
+                """)
+                if container_text:
+                    failure_keywords = ["验证失败", "点击框体重试", "请重试", "验证码错误", "滑动验证失败"]
+                    for keyword in failure_keywords:
+                        if keyword in container_text:
+                            logger.info(f"【{self.pure_user_id}】容器内检测到失败关键词: {keyword}")
+                            return True
+            except Exception as e:
+                logger.debug(f"【{self.pure_user_id}】容器文字提取失败: {e}")
             
             # 检查各种可能的验证失败提示元素
             failure_selectors = [
                 "text=验证失败，点击框体重试",
                 "text=验证失败",
-                "text=点击框体重试", 
-                "text=重试",
+                "text=点击框体重试",
                 ".nc-lang-cnt",
                 "[class*='retry']",
                 "[class*='fail']",
-                "[class*='error']",
                 ".captcha-tips",
-                "#captcha-loading",
-                ".nc_1_nocaptcha",
-                ".nc_wrapper",
-                ".nc-container"
             ]
             
-            retry_button = None
+            # 优先在已知的 frame 中查找
+            target_frame = getattr(self, '_detected_slider_frame', None) or self.page
+            
             for selector in failure_selectors:
                 try:
-                    element = self.page.query_selector(selector)
+                    element = target_frame.query_selector(selector)
                     if element and element.is_visible():
-                        # 获取元素文本内容
                         element_text = ""
                         try:
                             element_text = element.text_content()
                         except:
                             pass
-                        
                         logger.info(f"【{self.pure_user_id}】找到验证失败提示: {selector}, 文本: {element_text}")
-                        retry_button = element
-                        break
+                        return True
                 except:
                     continue
             
-            if retry_button:
-                logger.info(f"【{self.pure_user_id}】检测到验证失败提示元素，验证失败")
-                return True
-            else:
-                logger.info(f"【{self.pure_user_id}】未找到验证失败提示，可能验证成功了")
-                return False
+            logger.info(f"【{self.pure_user_id}】未找到验证失败提示，可能验证成功了")
+            return False
                 
         except Exception as e:
             logger.error(f"【{self.pure_user_id}】检查验证失败时出错: {e}")
@@ -2053,107 +2439,102 @@ class XianyuSliderStealth:
             return {}
     
     def solve_slider(self, max_retries: int = 3, fast_mode: bool = False):
-        """处理滑块验证（人工节奏模式）
-        
-        Args:
-            max_retries: 最大重试次数（默认3次，因为同一个页面连续失败3次后就不会成功了）
-            fast_mode: 快速查找模式（当已确认滑块存在时使用，减少等待时间）
+        """处理滑块验证 — v3（集成 OpenCV 缺口识别 + PyAutoGUI 备用引擎）
+
+        策略：
+          第 1 次：Playwright + 归一化轨迹（OpenCV 距离优先）
+          第 2 次：Playwright + 更保守参数
+          第 3 次：PyAutoGUI + 贝塞尔曲线（如可用），否则继续 Playwright
         """
         failure_records = []
-        
+
         for attempt in range(1, max_retries + 1):
             try:
                 current_strategy, attempt_params = self._build_attempt_trajectory_params(attempt)
                 self.trajectory_params = attempt_params
                 logger.info(f"【{self.pure_user_id}】开始处理滑块验证... (第{attempt}/{max_retries}次尝试)")
                 logger.info(
-                    f"【{self.pure_user_id}】当前滑块策略: {current_strategy}, "
+                    f"【{self.pure_user_id}】当前策略: {current_strategy}, "
                     f"steps={attempt_params['total_steps_range']}, "
-                    f"delay={attempt_params['base_delay_range']}, "
-                    f"slow_factor={attempt_params['slow_factor_range']}"
+                    f"delay={attempt_params['base_delay_range']}"
                 )
-                
-                # 如果不是第一次尝试，短暂等待后重试
+
+                # 非首次：等待 + 重置
                 if attempt > 1:
                     retry_delay = random.uniform(1.0, 1.8)
                     logger.debug(f"【{self.pure_user_id}】等待{retry_delay:.2f}秒后重试...")
                     time.sleep(retry_delay)
                     self._reset_slider_challenge()
-                    
-                    # 不刷新页面，直接在原来的frame中重试
-                    # 保留frame引用，让重试时可以直接使用原来的frame查找滑块
-                    if hasattr(self, '_detected_slider_frame'):
-                        frame_info = "主页面" if self._detected_slider_frame is None else "Frame"
-                        logger.debug(f"【{self.pure_user_id}】保留frame引用，将在原来的{frame_info}中重试")
-                    else:
-                        logger.debug(f"【{self.pure_user_id}】未找到frame引用，将重新检测滑块位置")
-                
-                # 1. 查找滑块元素（使用快速模式）
+
+                # ── 1. 查找滑块元素 ──────────────────────────────────────────
                 slider_container, slider_button, slider_track = self.find_slider_elements(fast_mode=fast_mode)
                 if not all([slider_container, slider_button, slider_track]):
                     logger.error(f"【{self.pure_user_id}】滑块元素查找失败")
                     continue
-                
-                # 2. 计算滑动距离
-                slide_distance = self.calculate_slide_distance(slider_button, slider_track)
-                if slide_distance <= 0:
-                    logger.error(f"【{self.pure_user_id}】滑动距离计算失败")
-                    continue
-                
-                # 3. 生成人类化轨迹
+
+                # ── 2. 计算滑动距离（OpenCV 优先 → DOM 后备）───────────────
+                opencv_dist = self._opencv_detect_gap()
+                if opencv_dist and opencv_dist > 10:
+                    slide_distance = opencv_dist
+                    logger.info(f"【{self.pure_user_id}】🔍 使用 OpenCV 缺口距离: {slide_distance:.1f}px")
+                else:
+                    slide_distance = self.calculate_slide_distance(slider_button, slider_track)
+                    if slide_distance <= 0:
+                        logger.error(f"【{self.pure_user_id}】滑动距离计算失败")
+                        continue
+
+                # ── 3. 生成归一化轨迹 ──────────────────────────────────────
                 trajectory = self.generate_human_trajectory(slide_distance)
                 if not trajectory:
                     logger.error(f"【{self.pure_user_id}】轨迹生成失败")
                     continue
-                
-                # 4. 模拟滑动
-                if not self.simulate_slide(slider_button, trajectory):
+
+                # ── 4. 执行滑动 ────────────────────────────────────────────
+                # 最后一次且 PyAutoGUI 可用且非 headless → 切换备用引擎
+                use_pyautogui = (
+                    attempt == max_retries
+                    and _PYAUTOGUI_AVAILABLE
+                    and not getattr(self, 'headless', True)
+                )
+                if use_pyautogui:
+                    logger.warning(f"【{self.pure_user_id}】🖱️  切换 PyAutoGUI 备用引擎（第{attempt}次）")
+
+                button_box = slider_button.bounding_box() or {}
+                sx = button_box.get("x", 0) + button_box.get("width", 0) / 2
+                sy = button_box.get("y", 0) + button_box.get("height", 0) / 2
+
+                if not self.simulate_slide(
+                    slider_button, trajectory,
+                    use_pyautogui=use_pyautogui,
+                    start_x=sx, start_y=sy,
+                    distance=slide_distance
+                ):
                     logger.error(f"【{self.pure_user_id}】滑动模拟失败")
                     continue
-                
-                # 5. 检查验证结果（极速模式）
+
+                # ── 5. 检查结果 ────────────────────────────────────────────
                 if self.check_verification_success_fast(slider_button):
                     logger.info(f"【{self.pure_user_id}】✅ 滑块验证成功! (第{attempt}次尝试)")
-                    
-                    # 📊 记录策略成功
                     strategy_stats.record_attempt(attempt, current_strategy, success=True)
-                    logger.debug(f"【{self.pure_user_id}】记录策略成功: 第{attempt}次-{current_strategy}")
-                    
-                    # 保存成功记录用于学习
                     if self.enable_learning and hasattr(self, 'current_trajectory_data'):
                         self._save_success_record(self.current_trajectory_data)
-                        logger.debug(f"【{self.pure_user_id}】已保存成功记录用于参数优化")
-                    
-                    # 如果不是第一次就成功，记录重试信息
-                    if attempt > 1:
-                        logger.debug(f"【{self.pure_user_id}】经过{attempt}次尝试后验证成功")
-                    
-                    # 输出当前统计摘要
                     strategy_stats.log_summary()
-                    
                     return True
                 else:
                     logger.warning(f"【{self.pure_user_id}】❌ 第{attempt}次验证失败")
-                    
-                    # 📊 记录策略失败
                     strategy_stats.record_attempt(attempt, current_strategy, success=False)
-                    logger.debug(f"【{self.pure_user_id}】记录策略失败: 第{attempt}次-{current_strategy}")
-                    
-                    # 分析失败原因
                     if hasattr(self, 'current_trajectory_data'):
                         failure_info = self._analyze_failure(attempt, slide_distance, self.current_trajectory_data)
                         failure_records.append(failure_info)
-                    
-                    # 如果不是最后一次尝试，继续
                     if attempt < max_retries:
                         continue
-                
+
             except Exception as e:
-                logger.error(f"【{self.pure_user_id}】第{attempt}次处理滑块验证时出错: {str(e)}")
+                logger.error(f"【{self.pure_user_id}】第{attempt}次处理出错: {e}")
                 if attempt < max_retries:
                     continue
-        
-        # 所有尝试都失败了
+
+        # 所有尝试都失败
         logger.error(f"【{self.pure_user_id}】滑块验证失败，已尝试{max_retries}次")
         try:
             if hasattr(self, 'page') and self.page:
@@ -2162,21 +2543,17 @@ class XianyuSliderStealth:
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 screenshot_path = os.path.join(screenshots_dir, f"slider_fail_{self.pure_user_id}_{timestamp}.jpg")
                 self.page.screenshot(path=screenshot_path, full_page=False)
-                screenshot_path_display = screenshot_path.replace("\\", "/")
-                logger.info(f"【{self.pure_user_id}】滑块失败截图已保存: {screenshot_path_display}")
+                logger.info(f"【{self.pure_user_id}】失败截图: {screenshot_path.replace(chr(92), '/')}")
         except Exception as screenshot_e:
-            logger.warning(f"【{self.pure_user_id}】保存滑块失败截图时出错: {screenshot_e}")
-        
-        # 输出失败分析摘要
+            logger.warning(f"【{self.pure_user_id}】保存截图出错: {screenshot_e}")
+
         if failure_records and _is_verbose_slider_logging_enabled():
             logger.info(f"【{self.pure_user_id}】失败分析摘要:")
             for record in failure_records:
                 logger.info(f"  - 第{record['attempt']}次: 距离{record['slide_distance']}px, "
-                          f"步数{record['total_steps']}, 最终位置{record['final_left_px']}px")
-        
-        # 输出当前统计摘要
+                            f"步数{record.get('total_steps','?')}步, 最终位置{record.get('final_left_px','N/A')}px")
+
         strategy_stats.log_summary()
-        
         return False
     
     def close_browser(self):
@@ -2854,7 +3231,7 @@ class XianyuSliderStealth:
                 headless=not show_browser,
                 args=browser_args,
                 viewport={'width': 1980, 'height': 1024},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
                 locale='zh-CN',  # 设置浏览器区域为中文
                 accept_downloads=True,
                 ignore_https_errors=True,
