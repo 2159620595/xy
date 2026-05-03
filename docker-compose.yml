@@ -1,7 +1,9 @@
 services:
   xianyu-app:
-    # 从阿里云 ACR 拉取（国内速度快），不在服务器本地 build
-    image: crpi-pkla7gt01j0vnny1.cn-guangzhou.personal.cr.aliyuncs.com/2159620595_xianyu/xianyu:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: xianyu-local:latest
     container_name: xianyu-auto-reply
     restart: unless-stopped
     user: "0:0"
@@ -69,11 +71,11 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
+      start_period: 60s
     deploy:
       resources:
         limits:
-          memory: ${MEMORY_LIMIT:-2048}M
+          memory: ${MEMORY_LIMIT:-3072}M
           cpus: "${CPU_LIMIT:-2.0}"
         reservations:
           memory: ${MEMORY_RESERVATION:-512}M
