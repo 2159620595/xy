@@ -365,3 +365,6 @@ ENV/
 # order_status_handler.py - 保留，是核心订单处理模块
 php/
 # simple_stats_server.py - 保留，是可选的统计服务器
+
+# 强制包含滑块验证文件，防止被意外忽略
+!backend/utils/xianyu_slider_stealth.py
