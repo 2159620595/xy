@@ -2347,16 +2347,26 @@ class XianyuSliderStealth:
             return False
     
     def check_verification_failure(self):
-        """检查验证失败提示（精确版：只在验证码容器内查找，避免全页误匹配）"""
+        """检查验证失败提示
+
+        核心逻辑：
+          1. 优先在 NC 容器内用 JS 取文字，匹配失败关键词（最精确）
+          2. 备用：用 text= 精确文本选择器（只匹配失败文字，不会误判）
+          3. 不再使用 .nc-lang-cnt 等宽泛选择器！
+             原因：.nc-lang-cnt 同时包含正常指引文字"请按住滑块，拖动到最右边"，
+                   会导致每次滑动后都被误判为失败。
+        """
         try:
             logger.info(f"【{self.pure_user_id}】检查验证失败提示...")
-            
-            # 等待失败提示出现
-            time.sleep(1.2)
-            
-            # ── 只在 NC 验证码容器内查找失败文字（避免页面其他"重试"文字误判） ──
+
+            # 等待失败提示出现（NC 失败动画约 800ms）
+            time.sleep(1.0)
+
+            # ── 方法 1：JS 获取容器文字，精确匹配失败关键词 ──────────────
+            # 在已知 frame 或主页面执行 JS
+            target_frame = getattr(self, '_detected_slider_frame', None) or self.page
             try:
-                container_text = self.page.evaluate("""
+                container_text = target_frame.evaluate("""
                     () => {
                         const selectors = [
                             '.nc-container',
@@ -2372,45 +2382,59 @@ class XianyuSliderStealth:
                     }
                 """)
                 if container_text:
-                    failure_keywords = ["验证失败", "点击框体重试", "请重试", "验证码错误", "滑动验证失败"]
-                    for keyword in failure_keywords:
-                        if keyword in container_text:
-                            logger.info(f"【{self.pure_user_id}】容器内检测到失败关键词: {keyword}")
-                            return True
+                    # 只匹配真正的失败文字，不匹配正常操作提示
+                    failure_keywords = [
+                        "验证失败",
+                        "点击框体重试",
+                        "请重试",
+                        "验证码错误",
+                        "滑动验证失败",
+                        "操作太快",
+                        "网络异常",
+                    ]
+                    # 明确排除正常指引文字（防止误判）
+                    normal_instructions = [
+                        "请按住滑块",
+                        "拖动到最右边",
+                        "向右滑动",
+                        "请拖动滑块",
+                    ]
+                    is_normal = any(n in container_text for n in normal_instructions)
+
+                    if not is_normal:
+                        for kw in failure_keywords:
+                            if kw in container_text:
+                                logger.info(f"【{self.pure_user_id}】容器内检测到失败关键词: [{kw}]，容器文字: {container_text[:60]}")
+                                return True
             except Exception as e:
-                logger.debug(f"【{self.pure_user_id}】容器文字提取失败: {e}")
-            
-            # 检查各种可能的验证失败提示元素
-            failure_selectors = [
+                logger.debug(f"【{self.pure_user_id}】JS容器文字提取失败: {e}")
+
+            # ── 方法 2：精确文本选择器（不使用宽泛的类名） ───────────────
+            # 只匹配确定是失败提示的文字，不匹配 .nc-lang-cnt 这类宽泛选择器
+            precise_failure_selectors = [
                 "text=验证失败，点击框体重试",
                 "text=验证失败",
                 "text=点击框体重试",
-                ".nc-lang-cnt",
-                "[class*='retry']",
-                "[class*='fail']",
-                ".captcha-tips",
+                "text=操作太快，请稍后重试",
+                "text=网络异常，请稍后重试",
             ]
-            
-            # 优先在已知的 frame 中查找
-            target_frame = getattr(self, '_detected_slider_frame', None) or self.page
-            
-            for selector in failure_selectors:
+
+            for selector in precise_failure_selectors:
                 try:
                     element = target_frame.query_selector(selector)
                     if element and element.is_visible():
-                        element_text = ""
                         try:
-                            element_text = element.text_content()
+                            text = element.text_content() or ""
                         except:
-                            pass
-                        logger.info(f"【{self.pure_user_id}】找到验证失败提示: {selector}, 文本: {element_text}")
+                            text = ""
+                        logger.info(f"【{self.pure_user_id}】精确选择器命中失败提示: {selector}，文本: {text[:50]}")
                         return True
                 except:
                     continue
-            
-            logger.info(f"【{self.pure_user_id}】未找到验证失败提示，可能验证成功了")
+
+            logger.info(f"【{self.pure_user_id}】未找到验证失败提示，判定为未失败")
             return False
-                
+
         except Exception as e:
             logger.error(f"【{self.pure_user_id}】检查验证失败时出错: {e}")
             return False
@@ -4756,7 +4780,7 @@ if __name__ == "__main__":
     slider = XianyuSliderStealth("test_user", enable_learning=True, headless=headless)
     try:
         success, cookies = slider.run(url)
-        print(f"验证结果: {'成功' if success else '失败'}")
+        print(f"验证结果: {'成功' if success else '失败'}") 
         if cookies:
             print(f"获取到 {len(cookies)} 个cookies")
     except Exception as e:
