@@ -4505,84 +4505,238 @@ class XianyuSliderStealth:
             except Exception as e:
                 logger.warning(f"【{self.pure_user_id}】关闭浏览器时出错: {e}")
     
+    # ══════════════════════════════════════════════════════════════════════
+    # "挤爆了" 自动恢复
+    # 日志特征: ret=FAIL_SYS_USER_VALIDATE | RGV587_ERROR::SM::哎哟喂,被挤爆啦
+    # 手动步骤: 打开闲鱼网页版 → 点消息 → 过滑块 → 更新 cookie
+    # 自动化:   直接导航到消息页触发滑块 → 过了就取 cookie → 写回调用方
+    # ══════════════════════════════════════════════════════════════════════
+
+    # 挤爆了时尝试的 URL 序列（依次触发 NC 滑块）
+    _JIBAO_RECOVERY_URLS = [
+        "https://www.goofish.com/im",          # 消息页（最可能触发）
+        "https://www.goofish.com/",            # 首页
+        "https://h5api.m.goofish.com/",        # h5 接口（有时直接过）
+    ]
+
+    def _navigate_and_wait_content(self, url: str, timeout: int = 20000) -> str:
+        """导航到 url，返回页面文本内容；失败返回空串"""
+        try:
+            self.page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            time.sleep(random.uniform(0.4, 0.9))
+            return self.page.content()
+        except Exception as e:
+            logger.warning(f"【{self.pure_user_id}】导航 {url} 失败: {e}")
+            return ""
+
+    def _has_captcha(self, content: str = "") -> bool:
+        """判断当前页面是否有滑块验证码"""
+        if not content:
+            try:
+                content = self.page.content()
+            except:
+                return False
+        return any(kw in content for kw in ["验证码", "captcha", "滑块", "slider", "nc_1_n1z", "nocaptcha"])
+
+    def _wait_for_cookies_stable(self, key: str = "x5sec", timeout: float = 8.0) -> dict:
+        """
+        等待验证成功后 cookie 稳定，最多等 timeout 秒。
+        检测到 key 相关 cookie 出现即返回。
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                self.page.wait_for_load_state("networkidle", timeout=3000)
+            except:
+                pass
+            cookies = self.context.cookies()
+            result = {c['name']: c['value'] for c in cookies}
+            if any(key in k.lower() for k in result):
+                return result
+            time.sleep(0.5)
+        # 超时也返回当前所有 cookie
+        return {c['name']: c['value'] for c in self.context.cookies()}
+
+    def _extract_x5_cookies(self, all_cookies: dict) -> dict:
+        """从完整 cookie 字典中提取 x5 相关 cookie"""
+        filtered = {k: v for k, v in all_cookies.items()
+                    if k.lower().startswith('x5') or 'x5sec' in k.lower()}
+        logger.info(f"【{self.pure_user_id}】x5 cookie: {list(filtered.keys())}")
+        return filtered or None
+
+    def handle_jibao_recovery(self, existing_cookies: dict = None) -> tuple:
+        """
+        "挤爆了"自动恢复入口。
+
+        流程：
+          1. 初始化浏览器（注入已有 cookie，保持登录态）
+          2. 依次尝试消息页 / 首页，等待 NC 滑块出现
+          3. 调用 solve_slider() 过验证
+          4. 取回更新后的 cookie（重点：x5sec）
+          5. 返回 (success: bool, cookies: dict)
+
+        调用方式（在 XianyuAutoAsync.refresh_token 的挤爆了分支）：
+            slider = XianyuSliderStealth(user_id, headless=True)
+            ok, new_cookies = slider.handle_jibao_recovery(existing_cookies=current_cookie_dict)
+            if ok and new_cookies:
+                # 写回数据库 / 内存
+                self.update_config_cookies(new_cookies)
+        """
+        logger.warning(f"【{self.pure_user_id}】🚨 挤爆了自动恢复启动")
+        cookies = None
+
+        try:
+            if not self._check_date_validity():
+                return False, None
+
+            self.init_browser()
+
+            # ── 注入已有 cookie，保持登录态（不需要重新登录）──────────────
+            if existing_cookies:
+                try:
+                    cookie_list = []
+                    for name, value in existing_cookies.items():
+                        cookie_list.append({
+                            "name":   name,
+                            "value":  str(value),
+                            "domain": ".goofish.com",
+                            "path":   "/",
+                        })
+                    self.context.add_cookies(cookie_list)
+                    logger.info(f"【{self.pure_user_id}】已注入 {len(cookie_list)} 个已有 cookie")
+                except Exception as e:
+                    logger.warning(f"【{self.pure_user_id}】注入 cookie 失败（继续）: {e}")
+
+            # ── 依次尝试各页面，找到触发滑块的那个 ──────────────────────
+            triggered = False
+            for url in self._JIBAO_RECOVERY_URLS:
+                logger.info(f"【{self.pure_user_id}】尝试导航: {url}")
+                content = self._navigate_and_wait_content(url)
+
+                if self._has_captcha(content):
+                    logger.info(f"【{self.pure_user_id}】✅ 在 {url} 触发了滑块验证")
+                    triggered = True
+                    break
+
+                # 没有验证码但页面正常加载 → 可能已经不需要验证了
+                if "闲鱼" in content or "goofish" in content.lower():
+                    logger.info(f"【{self.pure_user_id}】页面正常，无需验证（挤爆已自动解除？）")
+                    # 取一下 cookie 更新一下
+                    all_cks = self._wait_for_cookies_stable(timeout=3.0)
+                    cookies = self._extract_x5_cookies(all_cks)
+                    return True, cookies
+
+            if not triggered:
+                # 最后兜底：直接打开原始 punish URL 让 NC 弹出来
+                logger.warning(f"【{self.pure_user_id}】常规页面未触发滑块，尝试直接访问 punish 端点")
+                punish_url = (
+                    "https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/"
+                    "_____tmd_____/punish"
+                )
+                content = self._navigate_and_wait_content(punish_url, timeout=15000)
+                if self._has_captcha(content):
+                    triggered = True
+                    logger.info(f"【{self.pure_user_id}】✅ punish 端点触发了滑块验证")
+
+            if not triggered:
+                logger.error(f"【{self.pure_user_id}】所有 URL 均未触发滑块，恢复失败")
+                return False, None
+
+            # ── 人类行为模拟：短暂停顿再做滑块（不要立即开始）──────────
+            time.sleep(random.uniform(0.8, 1.5))
+
+            # ── 执行滑块验证 ────────────────────────────────────────────
+            success = self.solve_slider(max_retries=3)
+
+            if success:
+                logger.info(f"【{self.pure_user_id}】✅ 挤爆了恢复：滑块验证成功")
+                # 等待 cookie 稳定
+                all_cks = self._wait_for_cookies_stable(timeout=8.0)
+                cookies = self._extract_x5_cookies(all_cks)
+                if cookies:
+                    logger.info(f"【{self.pure_user_id}】✅ 获取到新 x5 cookie，共 {len(cookies)} 个")
+                else:
+                    # x5 没拿到也返回全量 cookie，让调用方自行过滤
+                    logger.warning(f"【{self.pure_user_id}】未找到 x5 cookie，返回全量 cookie")
+                    cookies = all_cks
+                return True, cookies
+            else:
+                logger.error(f"【{self.pure_user_id}】挤爆了恢复：滑块验证失败")
+                return False, None
+
+        except Exception as e:
+            logger.error(f"【{self.pure_user_id}】handle_jibao_recovery 异常: {e}\n{traceback.format_exc()}")
+            return False, None
+        finally:
+            self.close_browser()
+
     def run(self, url: str):
-        """运行主流程，返回(成功状态, cookie数据)"""
+        """
+        运行主流程，返回 (成功状态, cookie数据)。
+
+        url 可以是：
+          - 普通验证 URL（原有逻辑）
+          - 'jibao_recovery'（触发挤爆了自动恢复流程）
+        """
+        # ── 特殊指令：挤爆了恢复 ────────────────────────────────────────
+        if url == "jibao_recovery":
+            return self.handle_jibao_recovery()
+
         cookies = None
         try:
-            # 检查日期有效性
             if not self._check_date_validity():
                 logger.error(f"【{self.pure_user_id}】日期验证失败，无法执行")
                 return False, None
-            
-            # 初始化浏览器
+
             self.init_browser()
-            
-            # 导航到目标URL，快速加载
+
             logger.debug(f"【{self.pure_user_id}】导航到URL: {url}")
             try:
                 self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
             except Exception as e:
-                logger.warning(f"【{self.pure_user_id}】页面加载异常，尝试继续: {str(e)}")
-                # 如果页面加载失败，尝试等待一下
+                logger.warning(f"【{self.pure_user_id}】页面加载异常，尝试继续: {e}")
                 time.sleep(2)
-            
-            # 短暂延迟，快速处理
-            delay = random.uniform(0.3, 0.8)
-            logger.debug(f"【{self.pure_user_id}】等待页面加载: {delay:.2f}秒")
-            time.sleep(delay)
-            
-            # 快速滚动（可选）
+
+            time.sleep(random.uniform(0.3, 0.8))
+
+            # 模拟简单人类行为
             self.page.mouse.move(640, 360)
             time.sleep(random.uniform(0.02, 0.05))
             self.page.mouse.wheel(0, random.randint(200, 500))
             time.sleep(random.uniform(0.02, 0.05))
-            
-            # 检查页面标题
+
             page_title = self.page.title()
             logger.debug(f"【{self.pure_user_id}】页面标题: {page_title}")
-            
-            # 检查页面内容
-            page_content = self.page.content()
-            if any(keyword in page_content for keyword in ["验证码", "captcha", "滑块", "slider"]):
+
+            content = self.page.content()
+            if self._has_captcha(content):
                 logger.info(f"【{self.pure_user_id}】检测到验证码页面，开始滑块验证")
-                
-                # 处理滑块验证
                 success = self.solve_slider()
-                
+
                 if success:
                     logger.info(f"【{self.pure_user_id}】滑块验证成功")
-                    
-                    # 等待页面完全加载和跳转，让新的cookie生效（快速模式）
                     try:
-                        logger.debug(f"【{self.pure_user_id}】等待验证成功后的页面稳定...")
-                        time.sleep(1)  # 快速等待，从3秒减少到1秒
-                        
-                        # 等待页面跳转或刷新
                         self.page.wait_for_load_state("networkidle", timeout=10000)
-                        time.sleep(0.5)  # 快速确认，从2秒减少到0.5秒
-                        
-                        logger.debug(f"【{self.pure_user_id}】页面加载完成，开始获取cookie")
+                        time.sleep(0.5)
                     except Exception as e:
-                        logger.warning(f"【{self.pure_user_id}】等待页面加载时出错: {str(e)}")
-                    
-                    # 在关闭浏览器前获取cookie
+                        logger.warning(f"【{self.pure_user_id}】等待页面加载时出错: {e}")
+
                     try:
                         cookies = self._get_cookies_after_success()
                     except Exception as e:
-                        logger.warning(f"【{self.pure_user_id}】获取cookie时出错: {str(e)}")
+                        logger.warning(f"【{self.pure_user_id}】获取cookie时出错: {e}")
                 else:
                     logger.warning(f"【{self.pure_user_id}】滑块验证失败")
-                
+
                 return success, cookies
             else:
-                logger.debug(f"【{self.pure_user_id}】页面内容不包含验证码相关关键词，可能不需要验证")
+                logger.debug(f"【{self.pure_user_id}】页面无验证码，直接返回")
                 return True, None
-                
+
         except Exception as e:
-            logger.error(f"【{self.pure_user_id}】执行过程中出错: {str(e)}")
+            logger.error(f"【{self.pure_user_id}】执行过程中出错: {e}")
             return False, None
         finally:
-            # 关闭浏览器
             self.close_browser()
 
 def get_slider_stats():
