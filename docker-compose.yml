@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: xianyu-local:latest
+    image: crpi-pkla7gt01j0vnny1.cn-guangzhou.personal.cr.aliyuncs.com/2159620595_xianyu/xianyu:latest:latest
     container_name: xianyu-auto-reply
     restart: unless-stopped
     user: "0:0"
