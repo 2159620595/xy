@@ -152,7 +152,7 @@ RUN python -m playwright install --with-deps chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
 # ★ 替换滑块验证文件为 v3（修复：71%距离bug、nc-lang-cnt误判、归一化轨迹）
-COPY xianyu_slider_stealth_v3.py /app/backend/xianyu_slider_stealth.py
+COPY xianyu_slider_stealth.py /app/backend/xianyu_slider_stealth.py
 
 RUN mkdir -p /app/backend/logs /app/backend/data /app/backend/backups \
              /app/backend/static/uploads/images && \
