@@ -2149,26 +2149,55 @@ class XianyuLive:
                 from utils.xianyu_slider_stealth import XianyuSliderStealth
                 logger.debug(f"【{self.cookie_id}】XianyuSliderStealth导入成功，使用滑块验证")
 
-                # 创建独立的滑块验证实例（每个用户独立实例，避免并发冲突）
-                slider_stealth = XianyuSliderStealth(
-                    # user_id=f"{self.cookie_id}_{int(time.time() * 1000)}",  # 使用唯一ID避免冲突
-                    user_id=f"{self.cookie_id}",  # 使用唯一ID避免冲突
-                    enable_learning=True,  # 启用学习功能
-                    headless=True  # 使用无头模式
-                )
+                account_info = db_manager.get_cookie_details(self.cookie_id) or {}
+                requested_show_browser = bool(account_info.get("show_browser", False))
+                show_browser_modes = [requested_show_browser]
+
+                # 本地 Windows 环境下，无头失败后补跑一次有头模式，做最小环境对照
+                if (
+                    not requested_show_browser
+                    and os.name == "nt"
+                    and not _is_container_runtime()
+                ):
+                    show_browser_modes.append(True)
 
                 # 在线程池中执行滑块验证
                 import asyncio
                 import concurrent.futures
 
                 loop = asyncio.get_event_loop()
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    # 执行滑块验证
-                    success, cookies = await loop.run_in_executor(
-                        executor,
-                        slider_stealth.run,
-                        verification_url
+                success = False
+                cookies = None
+
+                for idx, show_browser in enumerate(show_browser_modes, start=1):
+                    browser_mode = "有头" if show_browser else "无头"
+                    logger.info(
+                        f"【{self.cookie_id}】滑块验证环境对照: 第{idx}/{len(show_browser_modes)}次, "
+                        f"browser_mode={browser_mode}"
                     )
+
+                    # 创建独立的滑块验证实例（每个用户独立实例，避免并发冲突）
+                    slider_stealth = XianyuSliderStealth(
+                        user_id=f"{self.cookie_id}",
+                        enable_learning=True,
+                        headless=not show_browser
+                    )
+
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        success, cookies = await loop.run_in_executor(
+                            executor,
+                            slider_stealth.run,
+                            verification_url
+                        )
+
+                    if success and cookies:
+                        break
+
+                    if idx < len(show_browser_modes):
+                        logger.warning(
+                            f"【{self.cookie_id}】滑块验证在{browser_mode}模式下失败，"
+                            f"准备切换到下一环境继续尝试"
+                        )
 
                 if success and cookies:
                     logger.info(f"【{self.cookie_id}】滑块验证成功，获取到新的cookies")

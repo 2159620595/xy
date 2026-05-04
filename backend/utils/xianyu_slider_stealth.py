@@ -772,18 +772,19 @@ class XianyuSliderStealth:
                 min(10, params["slow_factor_range"][1] + 1),
             ]
         elif attempt >= 3:
-            strategy = "slow"
+            # 第三次不要继续明显放慢，否则在有头模式下更容易出现轨迹漂移
+            strategy = "refined"
             params["total_steps_range"] = [
-                min(46, params["total_steps_range"][0] + 8),
-                min(54, params["total_steps_range"][1] + 10),
+                min(36, params["total_steps_range"][0] + 5),
+                min(42, params["total_steps_range"][1] + 7),
             ]
             params["base_delay_range"] = [
-                min(0.18, round(params["base_delay_range"][0] * 1.5 + 0.015, 4)),
-                min(0.22, round(params["base_delay_range"][1] * 1.6 + 0.02, 4)),
+                min(0.14, round(params["base_delay_range"][0] * 1.2 + 0.008, 4)),
+                min(0.17, round(params["base_delay_range"][1] * 1.25 + 0.012, 4)),
             ]
             params["slow_factor_range"] = [
-                max(3, params["slow_factor_range"][0] + 1),
-                min(12, params["slow_factor_range"][1] + 2),
+                max(2, params["slow_factor_range"][0]),
+                min(9, params["slow_factor_range"][1] + 1),
             ]
 
         if params["total_steps_range"][0] >= params["total_steps_range"][1]:
@@ -1360,12 +1361,13 @@ class XianyuSliderStealth:
                 pass
             return False
 
-    def _opencv_detect_gap(self) -> Optional[float]:
+    def _opencv_detect_gap(self, slider_button: Optional[ElementHandle] = None,
+                           slider_track: Optional[ElementHandle] = None) -> Optional[float]:
         """
         OpenCV 缺口识别：对验证码截图做边缘检测，返回缺口 x 坐标（相对滑轨）。
         需要: pip install opencv-python
 
-        工作原理：
+        工作原理
           1. 截取整页截图
           2. 裁剪出滑轨区域
           3. Canny 边缘检测 + 模板匹配 找到最强边缘纵向变化的 x 坐标
@@ -1386,16 +1388,35 @@ class XianyuSliderStealth:
 
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-            # 找验证码容器边界（用 JS 获取坐标，比硬编码更可靠）
-            rect = self.page.evaluate("""
-                () => {
-                    const track = document.querySelector('#nc_1_n1t') ||
-                                  document.querySelector('.nc_scale');
-                    if (!track) return null;
-                    const r = track.getBoundingClientRect();
-                    return {x: r.x, y: r.y, w: r.width, h: r.height};
-                }
-            """)
+            # 优先使用当前已找到的真实滑轨元素坐标，避免主页面 / frame 混淆
+            rect = None
+            button_w = 42.0
+            if slider_track:
+                track_box = slider_track.bounding_box()
+                if track_box:
+                    rect = {
+                        "x": track_box["x"],
+                        "y": track_box["y"],
+                        "w": track_box["width"],
+                        "h": track_box["height"],
+                    }
+            if slider_button:
+                button_box = slider_button.bounding_box()
+                if button_box and button_box.get("width", 0) > 0:
+                    button_w = float(button_box["width"])
+
+            if not rect:
+                # 后备：直接在当前检测到的上下文里取滑轨坐标
+                target_context = getattr(self, "_detected_slider_frame", None) or self.page
+                rect = target_context.evaluate("""
+                    () => {
+                        const track = document.querySelector('#nc_1_n1t') ||
+                                      document.querySelector('.nc_scale');
+                        if (!track) return null;
+                        const r = track.getBoundingClientRect();
+                        return {x: r.x, y: r.y, w: r.width, h: r.height};
+                    }
+                """)
             if not rect or rect['w'] < 10:
                 return None
 
@@ -1426,9 +1447,9 @@ class XianyuSliderStealth:
                 (1, kernel_size), 0
             ).flatten()
 
-            # 排除滑块自身（前 50px 一般是滑块按钮）
-            button_w = 42
-            search_start = button_w
+            # 排除滑块自身（起始区域通常被滑块按钮遮挡）
+            button_w = max(28, int(round(button_w)))
+            search_start = min(button_w, max(0, len(col_smooth) - 10))
             search_end   = max(search_start + 10, len(col_smooth) - 5)
             region_search = col_smooth[search_start:search_end]
 
@@ -1437,9 +1458,17 @@ class XianyuSliderStealth:
 
             peak_idx = int(np.argmax(region_search)) + search_start
 
+            # 如果峰值直接卡在搜索起点附近，通常是裁剪错区域或噪声，不使用该结果
+            if peak_idx <= search_start + 2:
+                logger.warning(
+                    f"【{self.pure_user_id}】OpenCV 峰值落在搜索起点附近 "
+                    f"(peak={peak_idx}, start={search_start})，忽略本次识别"
+                )
+                return None
+
             # peak_idx 是相对于 region 的 x，转为相对于滑轨起点的距离
-            # 缺口宽度约 42px（滑块按钮宽），取缺口中心
-            gap_distance = peak_idx - button_w // 2
+            # 缺口宽度约等于按钮宽度，取缺口中心
+            gap_distance = peak_idx - button_w / 2
             gap_distance = max(5.0, min(gap_distance, rect['w'] - button_w))
 
             logger.info(
@@ -1486,6 +1515,16 @@ class XianyuSliderStealth:
                 return self._pyautogui_bezier_drag(int(sx), int(sy), distance)
 
             # ── Playwright 主引擎 ────────────────────────────────────────────────
+            def read_slider_left_px() -> Optional[float]:
+                try:
+                    import re
+                    sty = slider_button.get_attribute("style") or ""
+                    m = re.search(r'left:\s*([\d.]+)px', sty)
+                    if m:
+                        return float(m.group(1))
+                except Exception:
+                    pass
+                return None
 
             # 阶段 1：从偏左位置靠近滑块
             try:
@@ -1500,7 +1539,11 @@ class XianyuSliderStealth:
 
             # 阶段 2：悬停确认
             try:
-                slider_button.hover(timeout=2000)
+                self.page.mouse.move(
+                    sx + random.uniform(-1.2, 1.2),
+                    sy + random.uniform(-0.8, 0.8),
+                    steps=random.randint(1, 3)
+                )
                 time.sleep(max(0.07, random.gauss(0.14, 0.03)))
             except Exception as e:
                 logger.warning(f"【{self.pure_user_id}】悬停失败: {e}")
@@ -1541,14 +1584,43 @@ class XianyuSliderStealth:
                     # 最后一步记录 style.left
                     if i == len(normal_pts) - 1:
                         try:
-                            import re
-                            sty = slider_button.get_attribute("style") or ""
-                            m = re.search(r'left:\s*([\d.]+)px', sty)
-                            if m and hasattr(self, 'current_trajectory_data'):
-                                self.current_trajectory_data["final_left_px"] = float(m.group(1))
-                                logger.info(f"【{self.pure_user_id}】最终 left: {m.group(1)}px")
-                        except:
+                            final_left = read_slider_left_px()
+                            if final_left is not None and hasattr(self, 'current_trajectory_data'):
+                                self.current_trajectory_data["final_left_px"] = final_left
+                                logger.info(f"【{self.pure_user_id}】最终 left: {final_left:.1f}px")
+                        except Exception:
                             pass
+
+                # 松手前按真实 left 做一次小范围校准，专门修正 1~4px 的稳定偏差
+                if distance > 0:
+                    final_left = read_slider_left_px()
+                    if final_left is not None:
+                        if hasattr(self, 'current_trajectory_data'):
+                            self.current_trajectory_data["final_left_px"] = final_left
+
+                        correction = distance - final_left
+                        if 0.8 <= abs(correction) <= 4.0:
+                            correction_steps = 1 if abs(correction) < 1.8 else 2
+                            logger.info(
+                                f"【{self.pure_user_id}】松手前微调: 目标={distance:.1f}px, "
+                                f"当前={final_left:.1f}px, 修正={correction:.2f}px"
+                            )
+
+                            for step_idx in range(correction_steps):
+                                step_dx = correction / (correction_steps - step_idx)
+                                cur_x += step_dx
+                                cur_y = sy + random.gauss(0, 0.35)
+                                self.page.mouse.move(cur_x, cur_y, steps=1)
+                                time.sleep(random.uniform(0.035, 0.075))
+                                correction -= step_dx
+
+                            adjusted_left = read_slider_left_px()
+                            if adjusted_left is not None:
+                                if hasattr(self, 'current_trajectory_data'):
+                                    self.current_trajectory_data["final_left_px"] = adjusted_left
+                                    self.current_trajectory_data["completion_used"] = True
+                                    self.current_trajectory_data["completion_steps"] = correction_steps
+                                logger.info(f"【{self.pure_user_id}】微调后 left: {adjusted_left:.1f}px")
 
                 # 刮刮乐停顿
                 if self.is_scratch_captcha():
@@ -1566,14 +1638,15 @@ class XianyuSliderStealth:
                     self.page.mouse.move(cur_x, cur_y, steps=1)
                     time.sleep(delay_i)
 
-                # 触发 click（某些 NC 版本需要）
-                try:
-                    slider_button.evaluate(
-                        f"(el) => el.dispatchEvent(new MouseEvent('click', "
-                        f"{{bubbles:true,cancelable:true,clientX:{cur_x},clientY:{cur_y}}}))"
-                    )
-                except:
-                    pass
+                # 标准滑块在 mouse.up() 后通常会自行提交，额外 click 容易引入异常事件序列
+                if self.is_scratch_captcha():
+                    try:
+                        slider_button.evaluate(
+                            f"(el) => el.dispatchEvent(new MouseEvent('click', "
+                            f"{{bubbles:true,cancelable:true,clientX:{cur_x},clientY:{cur_y}}}))"
+                        )
+                    except Exception:
+                        pass
 
                 logger.info(
                     f"【{self.pure_user_id}】滑动完成: 耗时={time.time()-t0:.2f}s，"
@@ -2497,10 +2570,15 @@ class XianyuSliderStealth:
                     continue
 
                 # ── 2. 计算滑动距离（OpenCV 优先 → DOM 后备）───────────────
-                opencv_dist = self._opencv_detect_gap()
+                opencv_dist = self._opencv_detect_gap(slider_button=slider_button, slider_track=slider_track)
                 if opencv_dist and opencv_dist > 10:
-                    slide_distance = opencv_dist
-                    logger.info(f"【{self.pure_user_id}】🔍 使用 OpenCV 缺口距离: {slide_distance:.1f}px")
+                    # 第三次重试避免继续加大偏移，优先收敛到前两次附近
+                    opencv_offset_px = 0.5 if attempt >= 3 else 2.0
+                    slide_distance = opencv_dist + opencv_offset_px
+                    logger.info(
+                        f"【{self.pure_user_id}】🔍 使用 OpenCV 缺口距离: 原始{opencv_dist:.1f}px, "
+                        f"调试偏移+{opencv_offset_px:.1f}px, 最终{slide_distance:.1f}px"
+                    )
                 else:
                     slide_distance = self.calculate_slide_distance(slider_button, slider_track)
                     if slide_distance <= 0:
