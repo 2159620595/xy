@@ -38,7 +38,7 @@ import {
 } from "@/api/accounts";
 import {
   getDefaultReply,
-  getKeywords,
+  getKeywordCounts,
   updateDefaultReply,
 } from "@/api/keywords";
 import type { AccountDetail } from "@/types";
@@ -271,37 +271,22 @@ const closeModal = () => {
 const loadAccounts = async () => {
   loading.value = true;
   try {
-    const [accountDetails, aiSettingsMap] = await Promise.all([
+    const [accountDetails, aiSettingsMap, keywordCounts] = await Promise.all([
       getAccountDetails(),
       getAllAIReplySettings().catch(
         () => ({}) as Record<string, AIReplySettings>,
       ),
+      getKeywordCounts().catch(() => ({} as Record<string, number>)),
     ]);
 
-    const enriched = await Promise.all(
-      accountDetails.map(async (account) => {
-        try {
-          const keywords = await getKeywords(account.id);
-          return {
-            ...account,
-            keywordCount: keywords.length,
-            aiEnabled:
-              aiSettingsMap[account.id]?.ai_enabled ??
-              aiSettingsMap[account.id]?.enabled ??
-              false,
-          };
-        } catch {
-          return {
-            ...account,
-            keywordCount: 0,
-            aiEnabled:
-              aiSettingsMap[account.id]?.ai_enabled ??
-              aiSettingsMap[account.id]?.enabled ??
-              false,
-          };
-        }
-      }),
-    );
+    const enriched = accountDetails.map((account) => ({
+      ...account,
+      keywordCount: keywordCounts[account.id] || 0,
+      aiEnabled:
+        aiSettingsMap[account.id]?.ai_enabled ??
+        aiSettingsMap[account.id]?.enabled ??
+        false,
+    }));
 
     accounts.value = enriched;
   } catch {

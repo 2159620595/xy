@@ -6,6 +6,10 @@ export const getKeywords = (cookieId: string): Promise<Keyword[]> => {
   return get(`/keywords-with-item-id/${cookieId}`);
 };
 
+export const getKeywordCounts = (): Promise<Record<string, number>> => {
+  return get("/keywords-counts");
+};
+
 export const saveKeywords = (
   cookieId: string,
   keywords: Keyword[],

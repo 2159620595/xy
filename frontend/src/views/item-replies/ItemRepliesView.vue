@@ -280,6 +280,11 @@ const loadItems = async (cookieId?: string) => {
   }
 };
 
+const loadPageData = async (cookieId?: string) => {
+  await loadReplies();
+  await loadItems(cookieId);
+};
+
 const handleFetchItems = async () => {
   if (!selectedAccount.value) {
     ElMessage.warning("请先选择账号");
@@ -600,7 +605,7 @@ const handleBatchDelete = async (options?: { closeDialog?: boolean }) => {
 
 watch(selectedAccount, async (value) => {
   clearSelection();
-  await Promise.all([loadReplies(), loadItems(value || undefined)]);
+  await loadPageData(value || undefined);
 });
 
 watch(replyStatusFilter, () => {
@@ -608,7 +613,8 @@ watch(replyStatusFilter, () => {
 });
 
 onMounted(async () => {
-  await Promise.all([loadAccounts(), loadReplies(), loadItems()]);
+  await loadAccounts();
+  await loadPageData(selectedAccount.value || undefined);
 });
 </script>
 

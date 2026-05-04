@@ -4,7 +4,7 @@ import { Promotion, RefreshRight, User } from "@element-plus/icons-vue";
 import { ElMessage } from "element-plus";
 import { getAdminStats } from "@/api/admin";
 import { getAccountDetails } from "@/api/accounts";
-import { getKeywords } from "@/api/keywords";
+import { getKeywordCounts } from "@/api/keywords";
 import { getOrders } from "@/api/orders";
 import { useAuthStore } from "@/stores/auth";
 import type { AccountDetail, AdminStats, DashboardStats } from "@/types";
@@ -24,23 +24,14 @@ const stats = ref<DashboardStats>({
 const loadDashboard = async () => {
   loading.value = true;
   try {
-    const accountsData = await getAccountDetails();
-    const accountsWithKeywords = await Promise.all(
-      accountsData.map(async (account) => {
-        try {
-          const keywords = await getKeywords(account.id);
-          return {
-            ...account,
-            keywordCount: keywords.length,
-          };
-        } catch {
-          return {
-            ...account,
-            keywordCount: 0,
-          };
-        }
-      }),
-    );
+    const [accountsData, keywordCounts] = await Promise.all([
+      getAccountDetails(),
+      getKeywordCounts().catch(() => ({} as Record<string, number>)),
+    ]);
+    const accountsWithKeywords = accountsData.map((account) => ({
+      ...account,
+      keywordCount: keywordCounts[account.id] || 0,
+    }));
 
     let totalKeywords = 0;
     let activeAccounts = 0;

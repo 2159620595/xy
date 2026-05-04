@@ -3732,16 +3732,20 @@ def get_keywords_with_item_id(cid: str, current_user: Dict[str, Any] = Depends(g
     if cookie_manager.manager is None:
         raise HTTPException(status_code=500, detail="CookieManager 未就绪")
 
+    start_time = time.perf_counter()
+
     # 检查cookie是否属于当前用户
     user_id = current_user['user_id']
     from db_manager import db_manager
     user_cookies = db_manager.get_all_cookies(user_id)
+    cookies_lookup_time = time.perf_counter()
 
     if cid not in user_cookies:
         raise HTTPException(status_code=403, detail="无权限访问该Cookie")
 
     # 获取包含类型信息的关键词
     keywords = db_manager.get_keywords_with_type(cid)
+    keywords_query_time = time.perf_counter()
 
     # 转换为前端需要的格式
     result = []
@@ -3754,7 +3758,34 @@ def get_keywords_with_item_id(cid: str, current_user: Dict[str, Any] = Depends(g
             "image_url": keyword_data['image_url']
         })
 
+    total_time = time.perf_counter() - start_time
+    log_with_user(
+        "info",
+        (
+            f"关键词列表耗时 cid={cid}: "
+            f"cookies={cookies_lookup_time - start_time:.3f}s, "
+            f"query={keywords_query_time - cookies_lookup_time:.3f}s, "
+            f"format={total_time - (keywords_query_time - start_time):.3f}s, "
+            f"total={total_time:.3f}s, count={len(result)}"
+        ),
+        current_user,
+    )
+
     return result
+
+
+@app.get("/keywords-counts")
+def get_keyword_counts(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """批量获取当前用户各账号的关键词数量。"""
+    user_id = current_user['user_id']
+    from db_manager import db_manager
+
+    user_cookies = db_manager.get_all_cookies(user_id)
+    counts = db_manager.get_keyword_counts_by_cookie_ids(list(user_cookies.keys()))
+    return {
+        cookie_id: counts.get(cookie_id, 0)
+        for cookie_id in user_cookies.keys()
+    }
 
 
 @app.post("/keywords/{cid}")
@@ -4882,15 +4913,30 @@ async def search_multiple_pages(
 def get_items_by_cookie(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取指定Cookie的商品信息"""
     try:
+        start_time = time.perf_counter()
+
         # 检查cookie是否属于当前用户
         user_id = current_user['user_id']
         from db_manager import db_manager
         user_cookies = db_manager.get_all_cookies(user_id)
+        cookies_lookup_time = time.perf_counter()
 
         if cookie_id not in user_cookies:
             raise HTTPException(status_code=403, detail="无权限访问该Cookie")
 
         items = db_manager.get_items_by_cookie(cookie_id)
+        items_query_time = time.perf_counter()
+        total_time = items_query_time - start_time
+        log_with_user(
+            "info",
+            (
+                f"商品列表耗时 cid={cookie_id}: "
+                f"cookies={cookies_lookup_time - start_time:.3f}s, "
+                f"query={items_query_time - cookies_lookup_time:.3f}s, "
+                f"total={total_time:.3f}s, count={len(items)}"
+            ),
+            current_user,
+        )
         return {"items": items}
     except HTTPException:
         raise

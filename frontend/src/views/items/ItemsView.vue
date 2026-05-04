@@ -102,10 +102,40 @@ const statusTabs: Array<{ label: string; value: StatusFilter }> = [
   { label: "草稿", value: "draft" },
 ];
 
+const getRawStatusValue = (item: Item) => {
+  const parsed = item.item_detail_parsed;
+  const candidates = [
+    item.item_status,
+    parsed?.item_status,
+    parsed?.itemStatus,
+    parsed?.status,
+    parsed?.auctionStatus,
+    parsed?.saleStatus,
+  ];
+
+  for (const candidate of candidates) {
+    if (candidate === undefined || candidate === null) continue;
+    const value = String(candidate).trim();
+    if (value) return value;
+  }
+
+  return "";
+};
+
+const hasExplicitParsedStatus = (item: Item) => {
+  const parsed = item.item_detail_parsed;
+  if (!parsed || typeof parsed !== "object") return false;
+
+  return ["item_status", "itemStatus", "status", "auctionStatus", "saleStatus"]
+    .some((key) => {
+      const value = parsed[key as keyof typeof parsed];
+      return value !== undefined && value !== null && String(value).trim() !== "";
+    });
+};
+
 const normalizeStatus = (item: Item) => {
-  const rawStatus = String(
-    item.item_status || item.item_detail_parsed?.item_status || "",
-  ).trim();
+  const rawStatus = getRawStatusValue(item);
+  if (rawStatus === "0" && !hasExplicitParsedStatus(item)) return "";
   if (rawStatus === "0" || rawStatus === "on_sale") return "on_sale";
   if (rawStatus === "1" || rawStatus === "draft") return "draft";
   if (rawStatus === "2" || rawStatus === "sold" || rawStatus === "sold_out")
@@ -485,9 +515,7 @@ const openEditDialog = (item: Item) => {
     price: item.item_price || item.price || "",
     category:
       getItemCategoryText(item) === "-" ? "" : getItemCategoryText(item),
-    status: String(
-      item.item_status || item.item_detail_parsed?.item_status || "",
-    ),
+    status: getRawStatusValue(item),
     detail: getItemDescription(item),
     primaryImage: getItemPrimaryImage(item),
     autoRelist: Boolean(item.auto_relist_enabled),
@@ -1060,7 +1088,8 @@ watch(selectedAccount, async () => {
 });
 
 onMounted(async () => {
-  await Promise.all([loadAccounts(), loadItems()]);
+  await loadAccounts();
+  await loadItems();
 });
 </script>
 

@@ -129,6 +129,19 @@ const loadKeywords = async () => {
   }
 }
 
+const loadPageData = async () => {
+  if (!selectedAccount.value) {
+    items.value = []
+    keywords.value = []
+    loading.value = false
+    return
+  }
+
+  // 优先加载关键词，避免与商品列表并发竞争后端数据库锁。
+  await loadKeywords()
+  await loadItems()
+}
+
 const openAddTextDialog = () => {
   if (!selectedAccount.value) {
     ElMessage.warning('请先选择账号')
@@ -352,14 +365,12 @@ type ApiLikeImportResult = {
 }
 
 watch(selectedAccount, async () => {
-  await Promise.all([loadItems(), loadKeywords()])
+  await loadPageData()
 })
 
 onMounted(async () => {
   await loadAccounts()
-  if (selectedAccount.value) {
-    await Promise.all([loadItems(), loadKeywords()])
-  } else {
+  if (!selectedAccount.value) {
     loading.value = false
   }
 })

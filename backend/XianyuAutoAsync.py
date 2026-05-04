@@ -3307,7 +3307,7 @@ class XianyuLive:
                     'category_id': item.get('category_id', ''),
                     'category_name': item.get('category_name', ''),
                     'auction_type': item.get('auction_type', ''),
-                    'item_status': item.get('item_status', 0),
+                    'item_status': item.get('item_status', ''),
                     'detail_url': item.get('detail_url', ''),
                     'pic_info': item.get('pic_info', {}),
                     'detail_params': item.get('detail_params', {}),
@@ -9033,7 +9033,7 @@ class XianyuLive:
                                     or ''
                                 ),
                                 'auction_type': card_data.get('auctionType', ''),
-                                'item_status': card_data.get('itemStatus', 0),
+                                'item_status': card_data.get('itemStatus', ''),
                                 'detail_url': card_data.get('detailUrl', ''),
                                 'pic_info': card_data.get('picInfo', {}),
                                 'detail_params': card_data.get('detailParams', {}),

@@ -2397,6 +2397,47 @@ class DBManager:
                 self._rollback_quietly()
                 return None
 
+    def get_cookie_details_by_user(self, user_id: int) -> Dict[str, Dict[str, any]]:
+        """批量获取指定用户全部账号详情，避免列表页逐账号重复查库。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    """
+                    SELECT id, value, user_id, auto_confirm, auto_reply_once_per_customer,
+                           remark, pause_duration, username, password, show_browser,
+                           xianyu_nickname, xianyu_avatar_url, created_at
+                    FROM cookies
+                    WHERE user_id = ?
+                    """,
+                    (user_id,),
+                )
+
+                result: Dict[str, Dict[str, any]] = {}
+                for row in cursor.fetchall():
+                    result[row[0]] = {
+                        'id': row[0],
+                        'value': row[1],
+                        'user_id': row[2],
+                        'auto_confirm': bool(row[3]),
+                        'auto_reply_once_per_customer': bool(row[4]),
+                        'remark': row[5] or '',
+                        'pause_duration': row[6] if row[6] is not None else 10,
+                        'username': row[7] or '',
+                        'password': row[8] or '',
+                        'show_browser': bool(row[9]) if row[9] is not None else False,
+                        'xianyu_nickname': row[10] or '',
+                        'xianyu_avatar_url': row[11] or '',
+                        'created_at': row[12],
+                    }
+
+                return result
+            except Exception as e:
+                logger.error(f"批量获取Cookie详细信息失败: {e}")
+                self._rollback_quietly()
+                return {}
+
     def update_auto_confirm(self, cookie_id: str, auto_confirm: bool) -> bool:
         """更新Cookie的自动确认发货设置"""
         with self.lock:
@@ -2799,6 +2840,35 @@ class DBManager:
                 logger.error(f"获取关键字失败: {e}")
                 self._rollback_quietly()
                 return []
+
+    def get_keyword_counts_by_cookie_ids(self, cookie_ids: List[str]) -> Dict[str, int]:
+        """批量获取多个账号的关键词数量。"""
+        if not cookie_ids:
+            return {}
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                placeholders = ",".join(["?"] * len(cookie_ids))
+                self._execute_sql(
+                    cursor,
+                    f"""
+                    SELECT cookie_id, COUNT(*)
+                    FROM keywords
+                    WHERE cookie_id IN ({placeholders})
+                    GROUP BY cookie_id
+                    """,
+                    tuple(cookie_ids),
+                )
+                return {
+                    str(row[0]): int(row[1] or 0)
+                    for row in cursor.fetchall()
+                    if row and row[0] is not None
+                }
+            except Exception as e:
+                logger.error(f"批量获取关键词数量失败: {e}")
+                self._rollback_quietly()
+                return {}
 
     def update_keyword_image_url(self, cookie_id: str, keyword: str, new_image_url: str) -> bool:
         """更新关键词的图片URL"""
@@ -5959,6 +6029,49 @@ class DBManager:
                 logger.error(f"获取商品图片失败: {e}")
                 return []
 
+    def _get_item_images_map(
+        self,
+        cursor,
+        cookie_id: Optional[str] = None,
+    ) -> Dict[Any, List[Dict[str, Any]]]:
+        """批量加载商品图片，避免列表接口逐商品查询造成 N+1。"""
+        if cookie_id is not None:
+            self._execute_sql(
+                cursor,
+                """
+                SELECT id, cookie_id, item_id, image_url, thumbnail_url, sort_order, is_primary, created_at, updated_at
+                FROM item_images
+                WHERE cookie_id = ?
+                ORDER BY cookie_id ASC, item_id ASC, is_primary DESC, sort_order ASC, id ASC
+                """,
+                (cookie_id,),
+            )
+        else:
+            self._execute_sql(
+                cursor,
+                """
+                SELECT id, cookie_id, item_id, image_url, thumbnail_url, sort_order, is_primary, created_at, updated_at
+                FROM item_images
+                ORDER BY cookie_id ASC, item_id ASC, is_primary DESC, sort_order ASC, id ASC
+                """,
+            )
+
+        images_map: Dict[Any, List[Dict[str, Any]]] = {}
+        for row in cursor.fetchall():
+            image = {
+                'id': row[0],
+                'image_url': row[3],
+                'thumbnail_url': row[4],
+                'sort_order': row[5],
+                'is_primary': bool(row[6]),
+                'created_at': row[7],
+                'updated_at': row[8],
+            }
+            map_key: Any = row[2] if cookie_id is not None else (row[1], row[2])
+            images_map.setdefault(map_key, []).append(image)
+
+        return images_map
+
     def _populate_item_view_fields(self, item_info: Dict[str, Any]) -> Dict[str, Any]:
         """补充前端展示所需的派生字段"""
         images = item_info.get('images') or []
@@ -6032,22 +6145,28 @@ class DBManager:
                     sort_order = self.get_next_item_image_sort_order(cookie_id, item_id)
 
                 if is_primary:
-                    cursor.execute(
-                        "UPDATE item_images SET is_primary = 0, updated_at = CURRENT_TIMESTAMP WHERE cookie_id = ? AND item_id = ?",
-                        (cookie_id, item_id)
+                    self._execute_sql(
+                        cursor,
+                        "UPDATE item_images SET is_primary = ? , updated_at = CURRENT_TIMESTAMP WHERE cookie_id = ? AND item_id = ?",
+                        (False, cookie_id, item_id)
                     )
                 else:
-                    cursor.execute(
+                    self._execute_sql(
+                        cursor,
                         "SELECT COUNT(*) FROM item_images WHERE cookie_id = ? AND item_id = ?",
                         (cookie_id, item_id)
                     )
                     count_row = cursor.fetchone()
                     is_primary = not count_row or count_row[0] == 0
 
-                cursor.execute('''
-                INSERT OR IGNORE INTO item_images (cookie_id, item_id, image_url, sort_order, is_primary, updated_at)
-                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ''', (cookie_id, item_id, image_url, sort_order, int(is_primary)))
+                self._execute_sql(
+                    cursor,
+                    '''
+                    INSERT OR IGNORE INTO item_images (cookie_id, item_id, image_url, sort_order, is_primary, updated_at)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ''',
+                    (cookie_id, item_id, image_url, sort_order, bool(is_primary))
+                )
                 self.conn.commit()
 
                 images = self.get_item_images(cookie_id, item_id)
@@ -6089,15 +6208,20 @@ class DBManager:
         try:
             with self.lock:
                 cursor = self.conn.cursor()
-                cursor.execute(
+                self._execute_sql(
+                    cursor,
                     "DELETE FROM item_images WHERE cookie_id = ? AND item_id = ?",
                     (cookie_id, item_id)
                 )
                 for index, image_url in enumerate(normalized_urls):
-                    cursor.execute('''
-                    INSERT INTO item_images (cookie_id, item_id, image_url, thumbnail_url, sort_order, is_primary, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                    ''', (cookie_id, item_id, image_url, image_url, index, 1 if index == 0 else 0))
+                    self._execute_sql(
+                        cursor,
+                        '''
+                        INSERT INTO item_images (cookie_id, item_id, image_url, thumbnail_url, sort_order, is_primary, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                        ''',
+                        (cookie_id, item_id, image_url, image_url, index, index == 0)
+                    )
                 self.conn.commit()
                 return True
         except Exception as e:
@@ -6228,16 +6352,22 @@ class DBManager:
         try:
             with self.lock:
                 cursor = self.conn.cursor()
-                cursor.execute('''
-                SELECT * FROM item_info
-                WHERE cookie_id = ?
-                ORDER BY updated_at DESC
-                ''', (cookie_id,))
-
+                self._execute_sql(
+                    cursor,
+                    '''
+                    SELECT * FROM item_info
+                    WHERE cookie_id = ?
+                    ORDER BY updated_at DESC
+                    ''',
+                    (cookie_id,),
+                )
                 columns = [description[0] for description in cursor.description]
+                item_rows = cursor.fetchall()
+
+                images_map = self._get_item_images_map(cursor, cookie_id)
                 items = []
 
-                for row in cursor.fetchall():
+                for row in item_rows:
                     item_info = dict(zip(columns, row))
 
                     # 解析item_detail JSON
@@ -6246,7 +6376,7 @@ class DBManager:
                             item_info['item_detail_parsed'] = json.loads(item_info['item_detail'])
                         except:
                             item_info['item_detail_parsed'] = {}
-                    item_info['images'] = self.get_item_images(cookie_id, item_info['item_id'])
+                    item_info['images'] = images_map.get(item_info['item_id'], [])
                     item_info = self._populate_item_view_fields(item_info)
 
                     items.append(item_info)
@@ -6266,15 +6396,20 @@ class DBManager:
         try:
             with self.lock:
                 cursor = self.conn.cursor()
-                cursor.execute('''
-                SELECT * FROM item_info
-                ORDER BY updated_at DESC
-                ''')
-
+                self._execute_sql(
+                    cursor,
+                    '''
+                    SELECT * FROM item_info
+                    ORDER BY updated_at DESC
+                    ''',
+                )
                 columns = [description[0] for description in cursor.description]
+                item_rows = cursor.fetchall()
+
+                images_map = self._get_item_images_map(cursor)
                 items = []
 
-                for row in cursor.fetchall():
+                for row in item_rows:
                     item_info = dict(zip(columns, row))
 
                     # 解析item_detail JSON
@@ -6283,7 +6418,10 @@ class DBManager:
                             item_info['item_detail_parsed'] = json.loads(item_info['item_detail'])
                         except:
                             item_info['item_detail_parsed'] = {}
-                    item_info['images'] = self.get_item_images(item_info['cookie_id'], item_info['item_id'])
+                    item_info['images'] = images_map.get(
+                        (item_info['cookie_id'], item_info['item_id']),
+                        [],
+                    )
                     item_info = self._populate_item_view_fields(item_info)
 
                     items.append(item_info)

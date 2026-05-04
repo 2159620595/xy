@@ -20,18 +20,17 @@ def get_cookies_details(
     fetch_profile: Callable[[str], tuple[str, str]],
 ) -> list[Dict[str, Any]]:
     user_id = current_user["user_id"]
-    user_cookies = db_manager.get_all_cookies(user_id)
+    cookie_details_map = db_manager.get_cookie_details_by_user(user_id)
     manager = cookie_manager.manager
 
     result = []
-    for cookie_id, cookie_value in user_cookies.items():
+    for cookie_id, cookie_details in cookie_details_map.items():
+        cookie_value = cookie_details.get("value", "")
         cookie_enabled = (
             manager.get_cookie_status(cookie_id)
             if manager is not None
             else db_manager.get_cookie_status(cookie_id)
         )
-        auto_confirm = db_manager.get_auto_confirm(cookie_id)
-        cookie_details = db_manager.get_cookie_details(cookie_id)
         remark = cookie_details.get("remark", "") if cookie_details else ""
         xianyu_nickname = cookie_details.get("xianyu_nickname", "") if cookie_details else ""
         xianyu_avatar_url = cookie_details.get("xianyu_avatar_url", "") if cookie_details else ""
@@ -62,7 +61,7 @@ def get_cookies_details(
                 "id": cookie_id,
                 "value": cookie_value,
                 "enabled": cookie_enabled,
-                "auto_confirm": auto_confirm,
+                "auto_confirm": cookie_details.get("auto_confirm", True),
                 "auto_reply_once_per_customer": cookie_details.get("auto_reply_once_per_customer", False)
                 if cookie_details
                 else False,
