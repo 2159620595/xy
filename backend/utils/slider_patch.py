@@ -9,6 +9,97 @@ import time
 import random
 
 
+def _bezier_point(t: float, control_points: list) -> tuple:
+    """使用 De Casteljau 算法计算贝塞尔曲线点。"""
+    points = [list(point) for point in control_points]
+    for level in range(1, len(points)):
+        for idx in range(len(points) - level):
+            points[idx][0] = (1 - t) * points[idx][0] + t * points[idx + 1][0]
+            points[idx][1] = (1 - t) * points[idx][1] + t * points[idx + 1][1]
+    return points[0][0], points[0][1]
+
+
+def _generate_slow_bezier_drag_path(distance: float) -> list:
+    """
+    生成更慢的人手拖拽路径。
+
+    返回值中的每个点为:
+        {'dx': x增量, 'dy': y增量, 'delay': 每步停顿秒数, 'pause': 额外停顿毫秒数}
+    """
+    safe_distance = max(float(distance or 0), 30.0)
+    steps = random.randint(38, 56)
+    overshoot = min(max(random.gauss(3.8, 1.0), 1.5), 6.0)
+    forward_target = safe_distance + overshoot
+
+    control_points = [
+        [0.0, 0.0],
+        [forward_target * random.uniform(0.10, 0.18), random.gauss(0, 2.2)],
+        [forward_target * random.uniform(0.38, 0.52), random.gauss(0, 3.0)],
+        [forward_target * random.uniform(0.70, 0.84), random.gauss(0, 2.0)],
+        [forward_target, random.gauss(0, 0.8)],
+    ]
+
+    trajectory = []
+    previous_x = 0.0
+    previous_y = 0.0
+
+    for step_idx in range(1, steps + 1):
+        t = step_idx / steps
+        current_x, current_y = _bezier_point(t, control_points)
+        dx = current_x - previous_x
+        dy = current_y - previous_y
+
+        if step_idx <= steps * 0.25:
+            delay = random.uniform(0.018, 0.032)
+        elif step_idx <= steps * 0.75:
+            delay = random.uniform(0.010, 0.021)
+        else:
+            delay = random.uniform(0.020, 0.038)
+
+        pause = 0
+        if step_idx in {int(steps * 0.22), int(steps * 0.58)}:
+            pause = random.randint(35, 95)
+
+        trajectory.append(
+            {
+                "dx": dx,
+                "dy": dy,
+                "delay": delay,
+                "pause": pause,
+            }
+        )
+        previous_x = current_x
+        previous_y = current_y
+
+    settle_steps = random.randint(2, 4)
+    remaining_back = forward_target - safe_distance
+    for step_idx in range(settle_steps):
+        step_back = remaining_back / max(settle_steps - step_idx, 1)
+        trajectory.append(
+            {
+                "dx": -step_back,
+                "dy": random.gauss(0, 0.35),
+                "delay": random.uniform(0.035, 0.075),
+                "pause": random.randint(15, 45) if step_idx == 0 else 0,
+            }
+        )
+        remaining_back -= step_back
+
+    total_dx = sum(point["dx"] for point in trajectory)
+    correction = safe_distance - total_dx
+    if abs(correction) > 0.01:
+        trajectory.append(
+            {
+                "dx": correction,
+                "dy": random.gauss(0, 0.2),
+                "delay": random.uniform(0.030, 0.055),
+                "pause": 0,
+            }
+        )
+
+    return trajectory
+
+
 def send_notification(user_id: str, title: str, message: str, notification_type: str = "info"):
     """
     发送通知的公共方法（支持多种通知渠道）
@@ -780,81 +871,6 @@ def _execute_slider_drag(page, slider_element, distance, user_id="unknown"):
         
         logger.debug(f"【{user_id}】page 类型: {type(page).__name__}, mouse_page 类型: {type(mouse_page).__name__}")
         
-        # 生成优化的轨迹
-        def generate_optimized_trajectory(distance: float) -> list:
-            """
-            生成优化的人类滑动轨迹（基于高成功率JS代码逻辑）
-            :param distance: 目标滑动距离
-            :return: 轨迹点列表，每个点包含 {'dx': x移动, 'dy': y移动, 'pause': 可选停顿时间}
-            """
-            trajectory = []
-            covered_distance = 0.0
-            
-            # 第一阶段：加速阶段（前30%）
-            accel_steps = random.randint(12, 18)
-            for i in range(accel_steps):
-                progress = (i + 1) / accel_steps
-                # 速度从2到10像素逐步增加
-                speed = 2 + progress * 8
-                dx = speed
-                # Y轴微小抖动
-                dy = random.uniform(-1.0, 1.0)
-                
-                trajectory.append({'dx': dx, 'dy': dy})
-                covered_distance += dx
-                
-                # 如果已经超过30%，提前结束加速阶段
-                if covered_distance >= distance * 0.3:
-                    break
-            
-            # 第二阶段：匀速阶段（中间40%，直到70%）
-            while covered_distance < distance * 0.7:
-                dx = random.uniform(8.0, 12.0)
-                dy = random.uniform(-1.5, 1.5)
-                
-                # 随机犹豫（10%概率）
-                pause = 0
-                if random.random() < 0.1:
-                    pause = random.randint(30, 80)  # 毫秒
-                
-                trajectory.append({'dx': dx, 'dy': dy, 'pause': pause})
-                covered_distance += dx
-                
-                # 防止超出太多
-                if covered_distance >= distance * 0.75:
-                    break
-            
-            # 第三阶段：减速阶段（最后30%）
-            remaining_distance = distance - covered_distance
-            decel_steps = random.randint(18, 25)
-            
-            for i in range(decel_steps):
-                progress = (i + 1) / decel_steps
-                # 速度逐渐减小
-                speed = (remaining_distance / decel_steps) * (1 - progress * 0.5)
-                dx = max(speed, 0.5)  # 最小0.5像素
-                dy = random.uniform(-0.8, 0.8)
-                
-                trajectory.append({'dx': dx, 'dy': dy})
-                covered_distance += dx
-                
-                if covered_distance >= distance:
-                    break
-            
-            # 第四阶段：超调回退（模拟人类修正行为）
-            if covered_distance < distance:
-                # 如果还没到目标，继续前进一点
-                final_push = distance - covered_distance
-                trajectory.append({'dx': final_push, 'dy': random.uniform(-0.5, 0.5)})
-                covered_distance = distance
-            
-            # 超调：超出一点再回退（模拟人的修正行为）
-            overshoot = random.randint(5, 15)
-            trajectory.append({'dx': overshoot, 'dy': random.uniform(-0.5, 0.5)})
-            trajectory.append({'dx': -overshoot * 0.5, 'dy': 0})
-            
-            return trajectory
-        
         # 获取滑块位置
         try:
             box = slider_element.bounding_box()
@@ -911,7 +927,7 @@ def _execute_slider_drag(page, slider_element, distance, user_id="unknown"):
         # 第四阶段：执行滑动轨迹
         try:
             # 生成优化的轨迹
-            optimized_trajectory = generate_optimized_trajectory(distance)
+            optimized_trajectory = _generate_slow_bezier_drag_path(distance)
             logger.info(f"【{user_id}】生成优化轨迹: 距离={distance:.1f}px, 点数={len(optimized_trajectory)}")
             
             # 执行滑动
@@ -924,6 +940,7 @@ def _execute_slider_drag(page, slider_element, distance, user_id="unknown"):
                 dx = point.get('dx', 0)
                 dy = point.get('dy', 0)
                 pause = point.get('pause', 0)
+                delay = point.get('delay', random.uniform(0.012, 0.028))
                 
                 # 更新当前位置
                 current_x += dx
@@ -933,21 +950,18 @@ def _execute_slider_drag(page, slider_element, distance, user_id="unknown"):
                 mouse_page.mouse.move(
                     current_x,
                     current_y,
-                    steps=random.randint(1, 3)
+                    steps=random.randint(2, 4)
                 )
                 
                 # 延迟（根据是否有停顿）
                 if pause > 0:
-                    # 有停顿，使用停顿时间
                     time.sleep(pause / 1000.0)
-                else:
-                    # 正常延迟（1-3毫秒）
-                    time.sleep(random.uniform(0.001, 0.003))
+                time.sleep(delay)
             
             # 释放鼠标
-            time.sleep(random.uniform(0.02, 0.05))
+            time.sleep(random.uniform(0.08, 0.16))
             mouse_page.mouse.up()
-            time.sleep(random.uniform(0.01, 0.03))
+            time.sleep(random.uniform(0.03, 0.07))
             
             # 触发click事件
             try:
@@ -1015,80 +1029,6 @@ def patch_simulate_slide():
         
         # 保存原始方法（如果需要）
         original_method = XianyuSliderStealth.simulate_slide
-        
-        def generate_optimized_trajectory(distance: float) -> list:
-            """
-            生成优化的人类滑动轨迹（基于高成功率JS代码逻辑）
-            :param distance: 目标滑动距离
-            :return: 轨迹点列表，每个点包含 {'dx': x移动, 'dy': y移动, 'pause': 可选停顿时间}
-            """
-            trajectory = []
-            covered_distance = 0.0
-            
-            # 第一阶段：加速阶段（前30%）
-            accel_steps = random.randint(12, 18)
-            for i in range(accel_steps):
-                progress = (i + 1) / accel_steps
-                # 速度从2到10像素逐步增加
-                speed = 2 + progress * 8
-                dx = speed
-                # Y轴微小抖动
-                dy = random.uniform(-1.0, 1.0)
-                
-                trajectory.append({'dx': dx, 'dy': dy})
-                covered_distance += dx
-                
-                # 如果已经超过30%，提前结束加速阶段
-                if covered_distance >= distance * 0.3:
-                    break
-            
-            # 第二阶段：匀速阶段（中间40%，直到70%）
-            while covered_distance < distance * 0.7:
-                dx = random.uniform(8.0, 12.0)
-                dy = random.uniform(-1.5, 1.5)
-                
-                # 随机犹豫（10%概率）
-                pause = 0
-                if random.random() < 0.1:
-                    pause = random.randint(30, 80)  # 毫秒
-                
-                trajectory.append({'dx': dx, 'dy': dy, 'pause': pause})
-                covered_distance += dx
-                
-                # 防止超出太多
-                if covered_distance >= distance * 0.75:
-                    break
-            
-            # 第三阶段：减速阶段（最后30%）
-            remaining_distance = distance - covered_distance
-            decel_steps = random.randint(18, 25)
-            
-            for i in range(decel_steps):
-                progress = (i + 1) / decel_steps
-                # 速度逐渐减小
-                speed = (remaining_distance / decel_steps) * (1 - progress * 0.5)
-                dx = max(speed, 0.5)  # 最小0.5像素
-                dy = random.uniform(-0.8, 0.8)
-                
-                trajectory.append({'dx': dx, 'dy': dy})
-                covered_distance += dx
-                
-                if covered_distance >= distance:
-                    break
-            
-            # 第四阶段：超调回退（模拟人类修正行为）
-            if covered_distance < distance:
-                # 如果还没到目标，继续前进一点
-                final_push = distance - covered_distance
-                trajectory.append({'dx': final_push, 'dy': random.uniform(-0.5, 0.5)})
-                covered_distance = distance
-            
-            # 超调：超出一点再回退（模拟人的修正行为）
-            overshoot = random.randint(5, 15)
-            trajectory.append({'dx': overshoot, 'dy': random.uniform(-0.5, 0.5)})
-            trajectory.append({'dx': -overshoot * 0.5, 'dy': 0})
-            
-            return trajectory
         
         def patched_simulate_slide(self, slider_button: ElementHandle, trajectory: Any) -> Any:
             """
@@ -1245,7 +1185,7 @@ def patch_simulate_slide():
                     logger.info(f"【{user_id}】滑动距离: {total_distance:.1f}px")
                     
                     # 生成优化的轨迹（基于高成功率JS代码逻辑）
-                    optimized_trajectory = generate_optimized_trajectory(total_distance)
+                    optimized_trajectory = _generate_slow_bezier_drag_path(total_distance)
                     logger.info(f"【{user_id}】生成优化轨迹: 距离={total_distance:.1f}px, 点数={len(optimized_trajectory)}")
                     
                     # 执行滑动（模拟JS代码的执行方式）
@@ -1264,6 +1204,7 @@ def patch_simulate_slide():
                         dx = point.get('dx', 0)
                         dy = point.get('dy', 0)
                         pause = point.get('pause', 0)
+                        delay = point.get('delay', random.uniform(0.012, 0.028))
                         
                         # 更新当前位置
                         current_x += dx
@@ -1273,21 +1214,18 @@ def patch_simulate_slide():
                         self.page.mouse.move(
                             current_x,
                             current_y,
-                            steps=random.randint(1, 3)
+                            steps=random.randint(2, 4)
                         )
                         
                         # 延迟（根据是否有停顿）
                         if pause > 0:
-                            # 有停顿，使用停顿时间
                             time.sleep(pause / 1000.0)
-                        else:
-                            # 正常延迟（1-3毫秒，模拟JS代码）
-                            time.sleep(random.uniform(0.001, 0.003))
+                        time.sleep(delay)
                     
                     # 释放鼠标（模拟mouseup和click）
-                    time.sleep(random.uniform(0.02, 0.05))
+                    time.sleep(random.uniform(0.08, 0.16))
                     self.page.mouse.up()
-                    time.sleep(random.uniform(0.01, 0.03))
+                    time.sleep(random.uniform(0.03, 0.07))
                     
                     # 触发click事件（通过JavaScript，更接近真实行为）
                     try:
@@ -2200,4 +2138,3 @@ if __name__ != "__main__":
         apply_patches()
     except:
         pass  # 如果导入失败，忽略错误
-
